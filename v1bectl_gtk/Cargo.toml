@@ -1,0 +1,36 @@
+[package]
+name = "v1bectl_gtk"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "v1bectl GTK4 desktop application"
+
+[[bin]]
+name = "v1bectl_gtk"
+path = "src/main.rs"
+
+[dependencies]
+gtk4 = "0.9"
+libadwaita = { version = "0.7", features = ["v1_4"] }
+glib = "0.20"
+gtk4-layer-shell = "0.4"
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+v1bectl_sync = { path = "../lib/v1bectl_sync" }
+
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+kdl = "6"
+ksni = "0.2"
+dirs = "5.0"

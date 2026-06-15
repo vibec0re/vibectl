@@ -1,0 +1,30 @@
+[package]
+name = "v1bectl_cli"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "v1bectl command-line client"
+
+[[bin]]
+name = "v1bectl_cli"
+path = "src/main.rs"
+
+[dependencies]
+v1bectl_sync = { path = "../lib/v1bectl_sync" }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+ciborium = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+tabled = "0.15"

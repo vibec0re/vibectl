@@ -1,0 +1,163 @@
+// 🔥 VIBEC0RE STYLES - PURE SCSS POWER! 🔥
+
+// Custom variables
+$vibec0re-red: #ff0000;
+$vibec0re-orange: #ff6600;
+$vibec0re-yellow: #ffcc00;
+$vibec0re-dark: #0a0a0a;
+$vibec0re-darker: #050505;
+
+// Override Bootstrap variables before import
+$primary: $vibec0re-orange;
+$danger: $vibec0re-red;
+$warning: $vibec0re-yellow;
+$dark: $vibec0re-dark;
+
+// VIBEC0RE Custom styles
+body {
+    font-family: 'Courier New', monospace;
+    background-color: $vibec0re-darker;
+    color: #ffffff;
+}
+
+// Glowing text effect
+.glow {
+    text-shadow: 
+        0 0 10px $vibec0re-red,
+        0 0 20px $vibec0re-red,
+        0 0 30px $vibec0re-red,
+        0 0 40px $vibec0re-orange;
+}
+
+// Elite badge animation
+@keyframes pulse {
+    0% {
+        box-shadow: 0 0 0 0 rgba(255, 0, 0, 0.7);
+    }
+    70% {
+        box-shadow: 0 0 0 10px rgba(255, 0, 0, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(255, 0, 0, 0);
+    }
+}
+
+.badge-pulse {
+    animation: pulse 2s infinite;
+}
+
+// VIBEC0RE Button styles
+.btn-vibec0re {
+    background: linear-gradient(45deg, $vibec0re-red, $vibec0re-orange);
+    border: none;
+    color: white;
+    font-weight: bold;
+    text-transform: uppercase;
+    transition: all 0.3s ease;
+    
+    &:hover {
+        transform: scale(1.05);
+        box-shadow: 0 5px 15px rgba(255, 0, 0, 0.4);
+        color: white;
+    }
+}
+
+// Code block styles
+pre {
+    font-family: 'Courier New', monospace;
+    font-size: 0.85rem;
+    
+    code {
+        color: #00ff00;
+    }
+}
+
+// Background for code
+.bg-black {
+    background-color: #000000;
+}
+
+// Min height for full viewport
+.min-vh-100 {
+    min-height: 100vh;
+}
+
+// Sensor card styles
+.sensor-data {
+    .progress {
+        background-color: rgba(255, 255, 255, 0.1);
+    }
+    
+    .progress-bar {
+        transition: width 0.3s ease;
+    }
+}
+
+// Card styles for devices
+.card {
+    transition: all 0.3s ease;
+    border-width: 2px;
+    
+    &:hover {
+        transform: translateY(-5px);
+        box-shadow: 0 10px 20px rgba(255, 0, 0, 0.2);
+    }
+    
+    &.border-success {
+        border-color: $vibec0re-yellow !important;
+        box-shadow: 0 0 10px rgba(255, 204, 0, 0.3);
+    }
+}
+
+// Spinner customization
+.spinner-border {
+    width: 3rem;
+    height: 3rem;
+    border-width: 0.3em;
+}
+
+// Light card styles
+.light-controls {
+    .form-range {
+        cursor: pointer;
+        
+        &::-webkit-slider-thumb {
+            background: $vibec0re-yellow;
+            border: 2px solid $vibec0re-orange;
+        }
+        
+        &::-moz-range-thumb {
+            background: $vibec0re-yellow;
+            border: 2px solid $vibec0re-orange;
+        }
+    }
+    
+    .color-temp-slider {
+        &::-webkit-slider-track {
+            background: linear-gradient(to right, #ffcc66, #ffffff, #99ccff);
+        }
+        
+        &::-moz-range-track {
+            background: linear-gradient(to right, #ffcc66, #ffffff, #99ccff);
+        }
+    }
+}
+
+.form-switch .form-check-input {
+    width: 3em;
+    height: 1.5em;
+    
+    &:checked {
+        background-color: $vibec0re-yellow;
+        border-color: $vibec0re-orange;
+    }
+    
+    &:focus {
+        box-shadow: 0 0 0 0.25rem rgba(255, 204, 0, 0.25);
+    }
+}
+
+.light-icon {
+    user-select: none;
+    transition: all 0.3s ease;
+}

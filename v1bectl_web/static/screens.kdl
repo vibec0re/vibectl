@@ -1,0 +1,68 @@
+// 🔥 VIBEC0RE SCREEN CONFIG 💖
+
+screen "living_room" {
+    title "Living Room"
+    group {
+        block {
+            light "Accent" {
+                device "Accent"
+                switch true
+                slider false
+            }
+            sensor {
+                device "Living Room"
+                show-temp true
+                show-humidity true
+            }
+        }
+        light "MAIN" {
+            device "Shelf Light"
+            switch true
+            slider true
+        }
+    }
+
+    group {
+        block {
+            light "Decke" {
+                device "Ceiling Light"
+                switch true
+                slider false
+            }
+
+            sensor {
+                device "Bedroom Sensor"
+                show-temp true
+                show-humidity true
+            }
+        }
+
+        light "Soft" {
+            device "Office Light"
+            switch true
+            slider true
+        }
+        light "Nest" {
+            device "Office Lamp"
+            switch true
+            slider true
+        }
+    }
+}
+
+screen "bedroom" {
+    title "Bedroom"
+
+    group {
+        light "DECKE" {
+            device-id "demo-light-3"
+            switch true
+            slider true
+        }
+        light "BETT" {
+            device-id "demo-light-4"
+            switch true
+            slider true
+        }
+    }
+}

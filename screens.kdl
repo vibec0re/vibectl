@@ -1,0 +1,68 @@
+// 🔥 VIBEC0RE SCREEN CONFIG 💖
+
+server "localhost" 31337
+
+window width=420 height=800
+
+screen "living_room" {
+    title "Living Room"
+    group {
+        sensor {
+            device "Living Room"
+            show-temp true
+            show-humidity true
+        }
+        block {
+            light "Accent" {
+                device "Accent"
+                switch true
+                slider false
+            }
+            light "ACC" {
+                device "Accent Light"
+                switch true
+                slider false
+            }
+        }
+        light "MAIN" {
+            device "Shelf Light"
+            switch true
+            slider true
+        }
+        block {
+            light "ADD" {
+                device "Door Light"
+                switch true
+                slider true
+            }
+        }
+    }
+
+    group {
+        block {
+            light "Decke" {
+                device "Ceiling Light"
+                switch true
+                slider false
+            }
+
+            sensor {
+                device "Bedroom Sensor"
+                show-temp true
+                show-humidity true
+            }
+        }
+
+        light "Soft" {
+            device "Office Light"
+            switch true
+            slider true
+        }
+        light "Nest" {
+            device "Office Lamp"
+            switch true
+            slider true
+        }
+    }
+}
+

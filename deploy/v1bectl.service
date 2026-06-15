@@ -1,0 +1,53 @@
+# 🔥 VIBEC0RE SYSTEMD SERVICE 💖
+#
+# Install:
+#   sudo cp v1bectl.service /etc/systemd/system/
+#   sudo cp v1bectl_server /usr/local/bin/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now v1bectl
+#
+# Logs:
+#   journalctl -u v1bectl -f
+
+[Unit]
+Description=v1bectl Home Automation Server
+Documentation=https://github.com/vibec0re/vibectl
+After=network.target
+
+[Service]
+Type=simple
+User=v1bectl
+Group=v1bectl
+DynamicUser=yes
+
+# 🔥 DIRIGERA MODE 💖
+# ExecStart=/usr/local/bin/v1bectl_server dirigera --host gw2-xxxxx.local --port 31337
+
+# 🔥 DUMMY MODE (for testing) 💖
+ExecStart=/usr/local/bin/v1bectl_server dummy --port 31337
+
+# Environment
+Environment=RUST_LOG=info
+# Environment=V1BECTL_ACCESS_TOKEN=your-token-here
+
+# Restart policy
+Restart=always
+RestartSec=5
+
+# 🔥 HARDENING 💖
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,4 @@
+# VIBEC0RE App ignores
+dist/
+target/
+Cargo.lock

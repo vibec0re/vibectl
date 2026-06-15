@@ -1,0 +1,56 @@
+[workspace]
+members = [
+    "v1bectl_server",
+    "v1bectl_cli", 
+    "v1bectl_tui",
+    "v1bectl_web",
+    "v1bectl_gtk",
+    "lib/v1bectl_state",
+    "lib/v1bectl_sync",
+    "lib/v1bectl_gateway",
+    "lib/v1bectl_virtual",
+    "lib/v1bectl_api",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["the v1bectl authors"]
+repository = "https://github.com/vibec0re/vibectl"
+homepage = "https://github.com/vibec0re/vibectl"
+description = "High-performance home automation control for IKEA Dirigera"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.0", features = ["full"] }
+tokio-tungstenite = "0.21"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ciborium = "0.2" # CBOR encoding
+
+# Networking
+reqwest = { version = "0.11", features = ["json"] }
+uuid = { version = "1.0", features = ["v4"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+hyper = { version = "1.0", features = ["full"] }
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Utilities
+anyhow = "1.0"
+thiserror = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+rand = "0.8"
+
+# Testing
+mockall = "0.12"

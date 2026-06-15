@@ -1,0 +1,25 @@
+[package]
+name = "v1bectl_virtual"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Virtual devices and dummy gateway for v1bectl"
+
+[dependencies]
+v1bectl_sync = { path = "../v1bectl_sync" }
+v1bectl_gateway = { path = "../v1bectl_gateway" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+anyhow = { workspace = true }
+toml = "0.8"  # 🔥 FOR PARSING VIRTUAL DEVICE CONFIGS! 💖
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }

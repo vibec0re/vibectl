@@ -1,0 +1,19 @@
+# 🔥 TRUNK CONFIG - VIBEC0RE DEV SERVER! 🔥
+
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "assets", "index.html"]
+
+[serve]
+# ELITE PORT FOR WEB APP!
+port = 8080
+# Open browser automatically
+open = true
+
+[[proxy]]
+# Proxy API calls to our ELITE backend
+rewrite = "/api/"
+backend = "http://localhost:3317/"

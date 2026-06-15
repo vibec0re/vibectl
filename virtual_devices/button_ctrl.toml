@@ -1,0 +1,27 @@
+# 🔥 LIGHT GROUP - VIBEC0RE VIRTUAL DEVICE! 💖
+
+type = "button_controller"
+device_id = "ctrl_lightgroup_bed"
+name = "Bedroom Lights Controller"
+
+# Button (example device ID — replace with your own)
+button = "44444444-4444-4444-4444-444444444444_1"
+
+press_on = ["on", "virtual_bedroom_lights"]
+press_on_long = ["inc", "virtual_bedroom_lights", 10]
+press_off =["off", "virtual_bedroom_lights"]
+press_off_long = ["dec", "virtual_bedroom_lights", 10]
+
+
+# press_on_long = 
+# press_off_long = 
+
+# VirtualDevice LightCtrl implements inc, dec, set, on, off
+# inc t.ex. get bright from device ID -> next value -> set bright to device id
+#  [ cmd, deviceid, .... opt values params]
+
+# Controller must spawn internally and subscribe to events
+# need to react so can bind and set state of output device id :))
+
+
+

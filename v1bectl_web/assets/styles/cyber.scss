@@ -1,0 +1,1103 @@
+// 🔥 VIBEC0RE CYBER THEME - MAINFRAME EDITION! 💖
+// FULL CYBER AESTHETIC - SCANLINES, TECH BORDERS, NEON EVERYTHING!
+
+// ═══════════════════════════════════════════════════════════════
+// 🎨 COLOR PALETTE - CYBER NEON VIBES
+// ═══════════════════════════════════════════════════════════════
+
+$cyber-bg: #050508;
+$cyber-surface: #0a0a10;
+$cyber-surface-light: #101018;
+$cyber-border: #1a1a2e;
+$cyber-border-bright: #2a2a4e;
+
+$neon-pink: #ff0080;
+$neon-cyan: #00ffff;
+$neon-magenta: #ff00ff;
+$neon-green: #00ff88;
+$neon-yellow: #ffff00;
+$neon-red: #ff0044;
+$neon-orange: #ff6600;
+$neon-purple: #8800ff;
+
+$text-primary: #e0e0ff;
+$text-secondary: #8888aa;
+$text-muted: #444466;
+
+// ═══════════════════════════════════════════════════════════════
+// 🌟 GLOW MIXINS
+// ═══════════════════════════════════════════════════════════════
+
+@mixin glow($color, $intensity: 1) {
+    box-shadow:
+        0 0 #{5px * $intensity} $color,
+        0 0 #{10px * $intensity} rgba($color, 0.5),
+        0 0 #{20px * $intensity} rgba($color, 0.3),
+        0 0 #{40px * $intensity} rgba($color, 0.1);
+}
+
+@mixin text-glow($color) {
+    text-shadow:
+        0 0 5px $color,
+        0 0 10px rgba($color, 0.8),
+        0 0 20px rgba($color, 0.5);
+}
+
+@mixin border-glow($color, $width: 1px) {
+    border: $width solid $color;
+    box-shadow:
+        0 0 5px rgba($color, 0.5),
+        0 0 10px rgba($color, 0.3),
+        inset 0 0 10px rgba($color, 0.1);
+}
+
+@mixin tech-clip {
+    clip-path: polygon(
+        0 10px,
+        10px 0,
+        calc(100% - 10px) 0,
+        100% 10px,
+        100% calc(100% - 10px),
+        calc(100% - 10px) 100%,
+        10px 100%,
+        0 calc(100% - 10px)
+    );
+}
+
+@mixin tech-clip-large {
+    clip-path: polygon(
+        0 20px,
+        20px 0,
+        calc(100% - 20px) 0,
+        100% 20px,
+        100% calc(100% - 20px),
+        calc(100% - 20px) 100%,
+        20px 100%,
+        0 calc(100% - 20px)
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📱 BASE STYLES - MAINFRAME TERMINAL
+// ═══════════════════════════════════════════════════════════════
+
+* {
+    box-sizing: border-box;
+    -webkit-tap-highlight-color: transparent;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    min-height: 100vh;
+    min-height: 100dvh;
+    background: $cyber-bg;
+    color: $text-primary;
+    font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace;
+    font-size: 11px;
+    line-height: 1.3;
+    overflow-x: hidden;
+
+    // 🔥 iOS SAFE AREA SUPPORT! 💖
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+}
+
+// 🔥 SCANLINES OVERLAY! 💖
+body::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 9999;
+    background: repeating-linear-gradient(
+        0deg,
+        rgba(0, 0, 0, 0.1) 0px,
+        rgba(0, 0, 0, 0.1) 1px,
+        transparent 1px,
+        transparent 2px
+    );
+}
+
+// 🔥 GRID BACKGROUND! 💖
+body::after {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: -1;
+    background-image:
+        linear-gradient(rgba($neon-cyan, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba($neon-cyan, 0.03) 1px, transparent 1px);
+    background-size: 50px 50px;
+}
+
+// 🔥 DECORATIVE CORNER CIRCLES! 💖
+.cyber-corner-decor {
+    position: fixed;
+    pointer-events: none;
+    z-index: 50;
+    filter: invert(1) sepia(1) saturate(5) hue-rotate(150deg) drop-shadow(0 0 6px $neon-cyan);
+    opacity: 0.4;
+
+    &.top-right {
+        top: 60px;
+        right: -8px;
+        width: 50px;
+        height: 50px;
+        background: url('/cyber/circ2.svg') center/contain no-repeat;
+        animation: spin-slow 15s linear infinite reverse;
+        filter: invert(1) sepia(1) saturate(5) hue-rotate(280deg) drop-shadow(0 0 6px $neon-pink);
+    }
+
+    &.bottom-left {
+        bottom: 80px;
+        left: -15px;
+        width: 36px;
+        height: 36px;
+        background: url('/cyber/circ2.svg') center/contain no-repeat;
+        animation: spin-slow 25s linear infinite;
+    }
+}
+
+@keyframes spin-slow {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📐 LAYOUT
+// ═══════════════════════════════════════════════════════════════
+
+.app {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+}
+
+// 🔥 HEADER - MAINFRAME STYLE! 💖
+.header {
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    background: linear-gradient(180deg, $cyber-surface 0%, rgba($cyber-surface, 0.95) 100%);
+    padding: 12px 16px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid $neon-pink;
+    box-shadow: 0 0 15px rgba($neon-pink, 0.3);
+
+    // Tech corner decorations
+    &::before, &::after {
+        content: '';
+        position: absolute;
+        width: 12px;
+        height: 12px;
+        border: 1px solid $neon-cyan;
+    }
+
+    &::before {
+        top: 6px;
+        left: 6px;
+        border-right: none;
+        border-bottom: none;
+    }
+
+    &::after {
+        top: 6px;
+        right: 6px;
+        border-left: none;
+        border-bottom: none;
+    }
+
+    .title {
+        font-size: 11px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        color: $neon-pink;
+        @include text-glow($neon-pink);
+        position: relative;
+        padding-left: 16px;
+
+        // Blinking cursor
+        &::before {
+            content: '>';
+            position: absolute;
+            left: 0;
+            color: $neon-cyan;
+            animation: blink 1s infinite;
+        }
+    }
+
+    .status {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 0;
+
+            &.connected {
+                background: $neon-green;
+                @include glow($neon-green, 0.6);
+                animation: pulse-glow 2s infinite;
+            }
+
+            &.disconnected {
+                background: $neon-red;
+                @include glow($neon-red, 0.4);
+            }
+
+            &.connecting {
+                background: $neon-yellow;
+                animation: pulse 0.5s infinite;
+            }
+        }
+    }
+}
+
+.screen-container {
+    flex: 1;
+    padding: 16px;
+    padding-top: 32px;
+    padding-bottom: 80px; // Space for nav dots
+    overflow-y: auto;
+    overflow-x: hidden;
+    position: relative;
+
+    // 🔥 DECORATIVE TECH LINES! 💖
+    &::before {
+        content: '';
+        position: absolute;
+        top: 8px;
+        right: 12px;
+        width: 120px;
+        height: 35px;
+        background: url('/cyber/lines1.svg') center/contain no-repeat;
+        opacity: 0.5;
+        filter: invert(1) sepia(1) saturate(5) hue-rotate(150deg) drop-shadow(0 0 4px $neon-cyan);
+        pointer-events: none;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📦 GROUP - TECH PANEL
+// ═══════════════════════════════════════════════════════════════
+
+.group {
+    background: $cyber-surface;
+    margin-bottom: 48px;
+    padding: 20px 16px;
+    position: relative;
+    border: 1px solid $neon-cyan;
+    box-shadow:
+        0 0 10px rgba($neon-cyan, 0.25),
+        inset 0 0 20px rgba($neon-cyan, 0.04);
+
+    // 🔥 TOP SVG ORNAMENT! 💖
+    &::before {
+        content: '';
+        position: absolute;
+        top: -10px;
+        left: 8%;
+        right: 8%;
+        height: 20px;
+        background: url('/cyber/border1.svg') center/contain no-repeat;
+        filter: drop-shadow(0 0 6px $neon-cyan);
+    }
+
+    // 🔥 BOTTOM SVG ORNAMENT! 💖
+    &::after {
+        content: '';
+        position: absolute;
+        bottom: -10px;
+        left: 8%;
+        right: 8%;
+        height: 20px;
+        background: url('/cyber/border2.svg') center/contain no-repeat;
+        transform: scaleY(-1);
+        filter: drop-shadow(0 0 6px $neon-pink);
+    }
+
+    // 🔥 GROUP TITLE BAR! 💖
+    .group-header {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 12px;
+        padding-bottom: 8px;
+        border-bottom: 1px solid rgba($neon-pink, 0.3);
+
+        &::before {
+            content: '//';
+            color: $neon-pink;
+            font-weight: 700;
+        }
+
+        .group-title {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+            color: $neon-pink;
+            @include text-glow($neon-pink);
+        }
+    }
+
+    &:last-child {
+        margin-bottom: 0;
+    }
+
+    // 🔥 ALTERNATE GROUP COLORS! 💖
+    &:nth-child(even) {
+        border-color: $neon-pink;
+        box-shadow:
+            0 0 15px rgba($neon-pink, 0.3),
+            inset 0 0 30px rgba($neon-pink, 0.05);
+
+        &::before {
+            filter: drop-shadow(0 0 8px $neon-pink);
+        }
+
+        &::after {
+            filter: drop-shadow(0 0 8px $neon-cyan);
+        }
+
+        .light-control::before {
+            background: linear-gradient(180deg, transparent, $neon-pink, transparent);
+            box-shadow: 0 0 8px $neon-pink;
+        }
+
+        .light-control::after {
+            background: $neon-pink;
+            box-shadow: 0 0 10px $neon-pink, 0 0 20px rgba($neon-pink, 0.5);
+        }
+
+        .light-control:hover {
+            background: linear-gradient(90deg, rgba($neon-pink, 0.05) 0%, transparent 70%);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🔥 BLOCK - HORIZONTAL GROUPING! 💖
+// ═══════════════════════════════════════════════════════════════
+
+.block-horizontal {
+    display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid $cyber-border;
+
+    // 🔥 EACH CHILD TAKES EQUAL SPACE! 💖
+    > * {
+        flex: 1;
+        min-width: 0;
+    }
+
+    // 🔥 OVERRIDE CHILD BORDERS - BLOCK HANDLES IT! 💖
+    .light-control,
+    .sensor-display,
+    .outlet-control {
+        border-bottom: none;
+        padding: 8px;
+        margin: 0;
+        background: rgba($cyber-surface, 0.5);
+        border: 1px solid $cyber-border;
+    }
+
+    // 🔥 COMPACT SENSOR IN BLOCK - ONE LINE! 💖
+    .sensor-display {
+        margin: 0;
+        padding: 8px 10px;
+        flex-direction: row;
+        gap: 10px;
+        justify-content: center;
+        align-items: center;
+
+        &::before,
+        &::after {
+            display: none;
+        }
+
+        .sensor-value {
+            padding: 2px 6px;
+            background: transparent;
+            border: none;
+
+            margin: 0px -10px;
+            .icon {
+                font-size: 14px;
+                margin-right: 4px;
+            }
+
+            .value {
+                font-size: 18px;
+            }
+
+            .unit {
+                font-size: 9px;
+            }
+        }
+
+        .separator {
+            font-size: 12px;
+        }
+    }
+
+    // 🔥 COMPACT LIGHT IN BLOCK! 💖
+    .light-control {
+        flex-direction: row;
+        align-items: center;
+        gap: 8px;
+
+        &::before,
+        &::after {
+            display: none;
+        }
+
+        .light-toggle {
+            flex: 0 0 100px; // 🔥 SAME FIXED SIZE! 💖
+            width: 100px;
+            height: 38px;
+            padding: 0 8px;
+            font-size: 10px;
+        }
+
+        .light-slider {
+            flex: 1;
+            height: 32px;
+        }
+    }
+
+    &:last-child {
+        border-bottom: none;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🌡️ SENSOR DISPLAY - DATA READOUT
+// ═══════════════════════════════════════════════════════════════
+
+.sensor-display {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 28px;
+    background: rgba($cyber-bg, 0.9);
+    border: 1px solid $cyber-border;
+    border-top: 2px solid $neon-cyan;
+    margin: -20px -16px 16px -16px;
+    padding: 18px 14px;
+    position: relative;
+
+    // 🔥 DECORATIVE CIRCULAR ELEMENT! 💖
+    &::before {
+        content: '';
+        position: absolute;
+        right: 10px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 32px;
+        height: 32px;
+        background: url('/cyber/circ1.svg') center/contain no-repeat;
+        opacity: 0.5;
+        filter: invert(1) sepia(1) saturate(5) hue-rotate(150deg);
+        animation: spin-slow 30s linear infinite;
+    }
+
+    // 🔥 DATA LABEL! 💖
+    &::after {
+        content: 'SENSOR_DATA';
+        position: absolute;
+        left: 10px;
+        top: 5px;
+        font-size: 7px;
+        letter-spacing: 1px;
+        color: $text-muted;
+        text-transform: uppercase;
+    }
+
+    .sensor-value {
+        display: flex;
+        align-items: baseline;
+        gap: 4px;
+        padding: 12px 18px; // 🔥 MORE INNER SPACE! 💖
+        background: rgba($neon-cyan, 0.05);
+        border: 1px solid rgba($neon-cyan, 0.2);
+
+        .icon {
+            font-size: 16px;
+            margin-right: 8px;
+        }
+
+        .value {
+            font-size: 24px;
+            font-weight: 700;
+            color: $neon-cyan;
+            @include text-glow($neon-cyan);
+            font-variant-numeric: tabular-nums;
+        }
+
+        .unit {
+            font-size: 10px;
+            color: $text-secondary;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-left: 2px;
+        }
+    }
+
+    .separator {
+        color: $neon-magenta;
+        font-size: 18px;
+        @include text-glow($neon-magenta);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 💡 LIGHT CONTROL - COMMAND INTERFACE
+// ═══════════════════════════════════════════════════════════════
+
+.light-control {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 16px;
+    padding: 16px 12px;
+    margin: 8px 0;
+    border-bottom: 1px solid $cyber-border;
+    position: relative;
+    background: linear-gradient(90deg, rgba($neon-cyan, 0.02) 0%, transparent 50%);
+
+    // 🔥 LEFT DECORATIVE LINE! 💖
+    &::before {
+        content: '';
+        position: absolute;
+        left: 0;
+        top: 6px;
+        bottom: 6px;
+        width: 2px;
+        background: linear-gradient(180deg, transparent, $neon-cyan, transparent);
+        box-shadow: 0 0 6px $neon-cyan;
+    }
+
+    // 🔥 DATA INDICATOR DOT! 💖
+    &::after {
+        content: '';
+        position: absolute;
+        left: -2px;
+        top: 50%;
+        transform: translateY(-50%);
+        width: 5px;
+        height: 5px;
+        background: $neon-cyan;
+        box-shadow: 0 0 8px $neon-cyan, 0 0 14px rgba($neon-cyan, 0.4);
+        animation: pulse-glow 2s infinite;
+    }
+
+    &:last-child {
+        border-bottom: none;
+        margin-bottom: 0;
+    }
+
+    &:first-child {
+        margin-top: 0;
+    }
+
+    &:hover {
+        background: linear-gradient(90deg, rgba($neon-cyan, 0.05) 0%, transparent 70%);
+    }
+
+    .light-name {
+        flex: 0 0 60px;
+        font-size: 9px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        color: $text-secondary;
+    }
+
+    .light-toggle {
+        flex: 0 0 100px; // 🔥 FIXED SIZE - ALWAYS SAME! 💖
+        width: 100px;
+        height: 38px;
+        padding: 0 8px;
+        border: 1px solid;
+        font-family: inherit;
+        font-size: 10px;
+        font-weight: 700;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        cursor: pointer;
+        transition: all 0.15s ease;
+        position: relative;
+        overflow: hidden;
+        text-align: center;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+
+        clip-path: polygon(0 0, calc(100% - 6px) 0, 100% 6px, 100% 100%, 6px 100%, 0 calc(100% - 6px));
+
+        &.off {
+            background: rgba($neon-red, 0.1);
+            border-color: $neon-red;
+            color: $neon-red;
+
+            &:hover {
+                background: rgba($neon-red, 0.2);
+                box-shadow: 0 0 15px rgba($neon-red, 0.4);
+            }
+
+            &:active {
+                transform: scale(0.97);
+            }
+        }
+
+        &.on {
+            background: rgba($neon-green, 0.15);
+            border-color: $neon-green;
+            color: $neon-green;
+            box-shadow: 0 0 10px rgba($neon-green, 0.4);
+
+            &:hover {
+                background: rgba($neon-green, 0.25);
+                box-shadow: 0 0 18px rgba($neon-green, 0.6);
+            }
+
+            &:active {
+                transform: scale(0.97);
+            }
+        }
+    }
+
+    .light-slider {
+        flex: 1;
+        height: 38px;
+        display: flex;
+        align-items: center;
+        padding: 0 10px;
+        background: rgba($cyber-bg, 0.6);
+        border: 1px solid $cyber-border;
+        position: relative;
+
+        &::before {
+            content: '';
+            position: absolute;
+            top: 3px;
+            left: 3px;
+            width: 4px;
+            height: 4px;
+            border-top: 1px solid $neon-yellow;
+            border-left: 1px solid $neon-yellow;
+        }
+
+        &::after {
+            content: '';
+            position: absolute;
+            bottom: 3px;
+            right: 3px;
+            width: 4px;
+            height: 4px;
+            border-bottom: 1px solid $neon-yellow;
+            border-right: 1px solid $neon-yellow;
+        }
+    }
+
+    // 🔥 NO-SLIDER VARIANT - SAME BUTTON SIZE! 💖
+    &.no-slider {
+        .light-toggle {
+            // Same size as with slider - don't expand!
+            flex: 0 0 auto;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🎚️ CYBER SLIDER - POWER LEVEL
+// ═══════════════════════════════════════════════════════════════
+
+.cyber-slider {
+    width: 100%;
+    height: 40px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: pointer;
+
+    &::-webkit-slider-runnable-track {
+        height: 6px;
+        background: $cyber-border;
+        border: 1px solid $cyber-border-bright;
+    }
+
+    &::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        width: 20px;
+        height: 20px;
+        background: $neon-yellow;
+        border: 2px solid $neon-orange;
+        margin-top: -8px;
+        box-shadow: 0 0 10px $neon-yellow, 0 0 20px rgba($neon-yellow, 0.5);
+        transition: all 0.15s ease;
+    }
+
+    &::-moz-range-track {
+        height: 6px;
+        background: $cyber-border;
+        border: 1px solid $cyber-border-bright;
+    }
+
+    &::-moz-range-thumb {
+        width: 24px;
+        height: 24px;
+        border: none;
+        background: $neon-yellow;
+        @include glow($neon-yellow, 0.8);
+    }
+
+    &.filled {
+        background: linear-gradient(
+            to right,
+            $neon-yellow 0%,
+            $neon-yellow var(--percent, 0%),
+            $cyber-border var(--percent, 0%),
+            $cyber-border 100%
+        );
+        height: 6px;
+        border: 1px solid $cyber-border-bright;
+
+        &::-webkit-slider-thumb {
+            margin-top: -10px;
+        }
+    }
+
+    &:disabled {
+        opacity: 0.3;
+        cursor: not-allowed;
+
+        &::-webkit-slider-thumb {
+            background: $text-muted;
+            box-shadow: none;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🔘 CYBER SWITCH (legacy, keeping for compatibility)
+// ═══════════════════════════════════════════════════════════════
+
+.cyber-switch {
+    position: relative;
+    width: 64px;
+    height: 36px;
+    flex-shrink: 0;
+
+    input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+        position: absolute;
+
+        &:checked + .switch-track {
+            background: rgba($neon-green, 0.2);
+            border-color: $neon-green;
+            @include glow($neon-green, 0.5);
+
+            .switch-thumb {
+                transform: translateX(28px);
+                background: $neon-green;
+                @include glow($neon-green, 1);
+            }
+        }
+    }
+
+    .switch-track {
+        position: absolute;
+        top: 0;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        background: $cyber-surface;
+        border: 2px solid $neon-red;
+        transition: all 0.2s ease;
+        cursor: pointer;
+
+        .switch-thumb {
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 28px;
+            height: 28px;
+            background: $neon-red;
+            box-shadow: 0 0 8px rgba($neon-red, 0.8);
+            transition: all 0.2s ease;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🔌 OUTLET CONTROL
+// ═══════════════════════════════════════════════════════════════
+
+.outlet-control {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 0;
+    border-bottom: 1px solid $cyber-border;
+
+    &:last-child {
+        border-bottom: none;
+    }
+
+    .outlet-name {
+        font-size: 13px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 2px;
+        color: $text-primary;
+    }
+
+    .outlet-status {
+        font-size: 11px;
+        color: $text-secondary;
+        letter-spacing: 1px;
+
+        &.on {
+            color: $neon-green;
+            @include text-glow($neon-green);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📍 SCREEN NAVIGATION - TERMINAL TABS
+// ═══════════════════════════════════════════════════════════════
+
+// 🔥 SCREEN NAV - FULL CYBER COMMAND BAR! 💖
+.screen-dots {
+    position: fixed;
+    bottom: 12px;
+    left: 12px;
+    right: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 10px 16px;
+    background: linear-gradient(180deg, rgba($cyber-surface, 0.95) 0%, rgba($cyber-bg, 0.98) 100%);
+    border: 1px solid $neon-pink;
+    box-shadow:
+        0 0 20px rgba($neon-pink, 0.3),
+        0 0 40px rgba($neon-pink, 0.15),
+        inset 0 0 15px rgba($neon-pink, 0.08);
+
+    // 🔥 TECH CORNER CUTS! 💖
+    clip-path: polygon(
+        0 6px,
+        6px 0,
+        calc(100% - 6px) 0,
+        100% 6px,
+        100% calc(100% - 6px),
+        calc(100% - 6px) 100%,
+        6px 100%,
+        0 calc(100% - 6px)
+    );
+
+    // 🔥 LEFT SIDE DECORATION! 💖
+    &::before {
+        content: '[ SCR ]';
+        position: absolute;
+        left: 12px;
+        font-size: 7px;
+        letter-spacing: 1px;
+        color: $neon-cyan;
+        text-transform: uppercase;
+        @include text-glow($neon-cyan);
+    }
+
+    // 🔥 RIGHT SIDE DECORATION! 💖
+    &::after {
+        content: '◈◈◈';
+        position: absolute;
+        right: 12px;
+        font-size: 8px;
+        letter-spacing: 2px;
+        color: $neon-magenta;
+        @include text-glow($neon-magenta);
+        animation: pulse 2s infinite;
+    }
+
+    .dot {
+        width: 32px;
+        height: 8px;
+        background: $cyber-border;
+        cursor: pointer;
+        transition: all 0.2s ease;
+        position: relative;
+        border: 1px solid $cyber-border-bright;
+
+        clip-path: polygon(
+            0 0,
+            calc(100% - 3px) 0,
+            100% 50%,
+            calc(100% - 3px) 100%,
+            0 100%,
+            3px 50%
+        );
+
+        &.active {
+            background: linear-gradient(90deg, $neon-pink, $neon-magenta);
+            border-color: $neon-pink;
+            box-shadow: 0 0 10px $neon-pink, 0 0 20px rgba($neon-pink, 0.4);
+            animation: pulse-glow 1.5s infinite;
+        }
+
+        &:hover:not(.active) {
+            background: $text-muted;
+            border-color: $neon-cyan;
+            box-shadow: 0 0 8px rgba($neon-cyan, 0.3);
+        }
+    }
+}
+
+// 🔥 BOTTOM DECORATIVE LINE! 💖
+.app::after {
+    content: '';
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 4px;
+    background: linear-gradient(90deg,
+        transparent 0%,
+        $neon-cyan 20%,
+        $neon-pink 50%,
+        $neon-magenta 80%,
+        transparent 100%
+    );
+    box-shadow: 0 0 20px $neon-pink;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🎬 ANIMATIONS
+// ═══════════════════════════════════════════════════════════════
+
+@keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.3; }
+}
+
+@keyframes pulse-glow {
+    0%, 100% {
+        box-shadow: 0 0 5px currentColor, 0 0 10px currentColor;
+    }
+    50% {
+        box-shadow: 0 0 10px currentColor, 0 0 20px currentColor, 0 0 30px currentColor;
+    }
+}
+
+@keyframes blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0; }
+}
+
+@keyframes scan {
+    0% { top: 0; }
+    100% { top: 100%; }
+}
+
+@keyframes glitch {
+    0%, 90%, 100% { transform: translate(0); }
+    92% { transform: translate(-2px, 1px); }
+    94% { transform: translate(2px, -1px); }
+    96% { transform: translate(-1px, 2px); }
+    98% { transform: translate(1px, -2px); }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📱 TOUCH INTERACTIONS
+// ═══════════════════════════════════════════════════════════════
+
+.touchable {
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+
+    &:active {
+        transform: scale(0.98);
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 🔥 UTILITY CLASSES
+// ═══════════════════════════════════════════════════════════════
+
+.text-neon-pink { color: $neon-pink; @include text-glow($neon-pink); }
+.text-neon-cyan { color: $neon-cyan; @include text-glow($neon-cyan); }
+.text-neon-green { color: $neon-green; @include text-glow($neon-green); }
+.text-neon-yellow { color: $neon-yellow; @include text-glow($neon-yellow); }
+.text-neon-red { color: $neon-red; @include text-glow($neon-red); }
+.text-neon-magenta { color: $neon-magenta; @include text-glow($neon-magenta); }
+
+.glow-pink { @include glow($neon-pink); }
+.glow-cyan { @include glow($neon-cyan); }
+.glow-green { @include glow($neon-green); }
+
+// ═══════════════════════════════════════════════════════════════
+// 🎉 VIBEC0RE BRAND
+// ═══════════════════════════════════════════════════════════════
+
+.vibec0re-logo {
+    font-weight: 900;
+    letter-spacing: 6px;
+    text-transform: uppercase;
+    background: linear-gradient(135deg, $neon-pink 0%, $neon-magenta 50%, $neon-cyan 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    animation: glitch 5s infinite;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 📺 LOADING STATE
+// ═══════════════════════════════════════════════════════════════
+
+.loading {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+    gap: 16px;
+
+    p {
+        font-size: 12px;
+        text-transform: uppercase;
+        letter-spacing: 3px;
+        animation: pulse 1s infinite;
+    }
+
+    &::before {
+        content: '[ INITIALIZING ]';
+        font-size: 10px;
+        color: $neon-cyan;
+        letter-spacing: 2px;
+    }
+}

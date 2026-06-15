@@ -1,0 +1,17 @@
+{
+  "name": "v1bectl - VIBEC0RE Home Automation",
+  "short_name": "v1bectl",
+  "description": "BLAZING FAST Home Automation Control - PURE RUST PWA!",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#050505",
+  "theme_color": "#ff0000",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><text y='.9em' font-size='450' text-anchor='middle' x='50%'>🔥</text></svg>",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

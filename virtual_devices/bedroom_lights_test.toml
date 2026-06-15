@@ -1,0 +1,25 @@
+# 🔥 TEST LIGHT GROUP FOR DUMMY GATEWAY - LINEAR MAPPING! 💖
+
+type = "light_group_linear"
+device_id = "virtual_bedroom_test"
+name = "Bedroom Test Group"
+
+# Using actual devices from dummy gateway for testing
+[members]
+top = "light_bedroom"      # Bedroom RGB Light (80-100% range)
+main = "light_living_room"  # Living Room Light (40-90% range)
+bed = "light_kitchen"       # Kitchen Light (0-50% range)
+
+# Maps input brightness from 0..100 to members
+# the member internal range is mapped to interval [min, max]
+# with x < min => 0 and x > max = 100
+[brightness]
+top = [80, 100]   # Only uses top 20% of range
+main = [40, 90]   # Middle 50% of range
+bed = [0, 50]     # Bottom 50% of range
+
+# Group behavior settings
+[settings]
+
+# Transition time in milliseconds
+transition_time = 200

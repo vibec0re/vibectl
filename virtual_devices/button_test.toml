@@ -1,0 +1,14 @@
+# 🔥 TEST BUTTON CONTROLLER FOR DUMMY GATEWAY! 💖
+
+type = "button_controller"
+device_id = "ctrl_test_button"
+name = "Test Button Controller"
+
+# Use the switch_hallway device as button
+button = "switch_hallway"
+
+# When button pressed ON - increment brightness by 20
+press_on = ["inc", "virtual_bedroom_test", 20]
+
+# When button pressed OFF - turn off the lights
+press_off = ["off", "virtual_bedroom_test"]

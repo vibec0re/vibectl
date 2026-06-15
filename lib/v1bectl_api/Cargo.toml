@@ -1,0 +1,26 @@
+[package]
+name = "v1bectl_api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "WebSocket/TCP API server for v1bectl"
+
+[dependencies]
+v1bectl_sync = { path = "../v1bectl_sync" }
+v1bectl_virtual = { path = "../v1bectl_virtual" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+futures-util = "0.3"

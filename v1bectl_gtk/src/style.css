@@ -1,0 +1,248 @@
+/* 🔥 VIBEC0RE GTK4 CYBER ACCENT THEME 🔥 */
+
+/* Layer shell popup — transparent window, rounded panel with shadow */
+window.layer-shell {
+    background: transparent;
+}
+
+.panel-outer {
+    margin: 12px;
+}
+
+.panel-content {
+    background: @window_bg_color;
+    border-radius: 12px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4),
+                0 0 0 1px alpha(@borders, 0.3);
+}
+
+/* ============================================================
+   🏷️  HEADER BAR — LEFT-ALIGNED TITLE, DOT PULLED IN FROM EDGE
+   ============================================================ */
+
+label.screen-title {
+    letter-spacing: 2px;
+    font-family: monospace;
+    margin-left: 6px;
+}
+
+/* Wrap connection dot with margin so it isn't flush to the window edge */
+.connection-indicator {
+    margin-right: 10px;
+}
+
+.connection-dot {
+    min-width: 10px;
+    min-height: 10px;
+    border-radius: 50%;
+    transition: background 200ms, box-shadow 200ms;
+}
+
+.connection-dot.connected {
+    background: #a6e3a1;
+    box-shadow: 0 0 6px #a6e3a1,
+                0 0 12px alpha(#a6e3a1, 0.5);
+}
+
+.connection-dot.disconnected {
+    background: #f38ba8;
+    box-shadow: 0 0 6px #f38ba8;
+}
+
+.connection-dot.connecting {
+    background: #f9e2af;
+    box-shadow: 0 0 6px #f9e2af;
+}
+
+/* ============================================================
+   📦  GROUP CARDS
+   ============================================================ */
+
+.device-group {
+    background: alpha(@card_bg_color, 0.5);
+    border-radius: 10px;
+    border: 1px solid alpha(@borders, 0.5);
+    padding: 14px;
+    margin-bottom: 10px;
+}
+
+/* ============================================================
+   💡  DEVICE ROWS — COMMON + TYPE-SPECIFIC
+   ============================================================ */
+
+.device-row {
+    background: alpha(@card_bg_color, 0.3);
+    border-radius: 8px;
+    padding: 8px 10px;
+    border-left: 3px solid @borders;
+    margin-bottom: 6px;
+    /* Consistent min-height so sensor rows match switch-bearing rows in blocks */
+    min-height: 42px;
+    transition: border-left-color 200ms, background 200ms;
+}
+
+.device-row.device-on {
+    border-left-color: #ff2bd6;
+    background: alpha(#ff2bd6, 0.08);
+}
+
+.device-row.device-off {
+    border-left-color: #585b70;
+}
+
+.device-row.device-off label.device-name {
+    opacity: 0.5;
+}
+
+.device-row.device-unknown {
+    border-left-color: #f9e2af;
+}
+
+/* Type-specific accents */
+.device-row.device-light.device-on {
+    border-left-color: #ff2bd6;
+}
+
+.device-row.device-outlet.device-on {
+    border-left-color: #00f0ff;
+    background: alpha(#00f0ff, 0.08);
+}
+
+.device-row.device-sensor {
+    border-left-color: alpha(#89dceb, 0.6);
+}
+
+/* Device top row (name + switch) */
+.device-top-row {
+    min-height: 20px;
+}
+
+/* Device name label — consistent across light/outlet rows */
+label.device-name {
+    font-weight: 500;
+    letter-spacing: 0.5px;
+}
+
+/* ============================================================
+   🌡️  SENSOR VALUES
+   ============================================================ */
+
+label.sensor-temp {
+    color: #f9e2af;
+    font-weight: bold;
+    font-family: monospace;
+}
+
+label.sensor-humidity {
+    color: #89dceb;
+    font-weight: bold;
+    font-family: monospace;
+}
+
+label.sensor-label {
+    opacity: 0.5;
+    font-size: small;
+}
+
+/* ============================================================
+   🎚️  BRIGHTNESS SLIDER — VAPORWAVE NEON 🔥💜💖💙
+   ============================================================ */
+
+.brightness-row {
+    margin-top: 4px;
+}
+
+scale.brightness-slider {
+    padding: 4px 0;
+}
+
+scale.brightness-slider trough {
+    background: alpha(#1a0a2e, 0.85);
+    border: 1px solid alpha(#ff2bd6, 0.25);
+    border-radius: 4px;
+    min-height: 6px;
+}
+
+scale.brightness-slider trough highlight {
+    background: linear-gradient(to right,
+        #7c2bff 0%,
+        #ff2bd6 50%,
+        #00f0ff 100%);
+    border-radius: 4px;
+    box-shadow: 0 0 8px alpha(#ff2bd6, 0.6),
+                inset 0 0 3px alpha(#ffffff, 0.3);
+}
+
+scale.brightness-slider slider {
+    min-width: 18px;
+    min-height: 18px;
+    background: #ff2bd6;
+    border: 2px solid #00f0ff;
+    border-radius: 50%;
+    box-shadow: 0 0 10px alpha(#ff2bd6, 0.9),
+                0 0 20px alpha(#00f0ff, 0.4);
+    transition: background 150ms, box-shadow 150ms, border-color 150ms;
+}
+
+scale.brightness-slider slider:hover {
+    background: #00f0ff;
+    border-color: #ff2bd6;
+    box-shadow: 0 0 14px alpha(#00f0ff, 1.0),
+                0 0 28px alpha(#ff2bd6, 0.6);
+}
+
+scale.brightness-slider slider:active {
+    background: #ffffff;
+    box-shadow: 0 0 18px #ff2bd6,
+                0 0 32px #00f0ff;
+}
+
+/* Brightness readout label */
+label.brightness-label {
+    color: #ff2bd6;
+    font-family: monospace;
+    font-size: small;
+    font-weight: bold;
+    min-width: 34px;
+    text-shadow: 0 0 4px alpha(#ff2bd6, 0.6);
+}
+
+/* ============================================================
+   🔘  SWITCHES — soft magenta accent when on (no glow, no shouting)
+   ============================================================ */
+
+switch:checked {
+    background: alpha(#ff2bd6, 0.85);
+}
+
+/* ============================================================
+   ⚫  SCREEN DOTS
+   ============================================================ */
+
+button.screen-dot {
+    min-width: 10px;
+    min-height: 10px;
+    padding: 0;
+    border-radius: 50%;
+    background: alpha(@borders, 0.5);
+    border: none;
+    transition: background 200ms, box-shadow 200ms;
+}
+
+button.screen-dot.active {
+    background: #ff2bd6;
+    box-shadow: 0 0 6px #ff2bd6,
+                0 0 12px alpha(#00f0ff, 0.4);
+}
+
+button.screen-dot:hover {
+    background: alpha(#ff2bd6, 0.6);
+}
+
+/* ============================================================
+   🎨  LAYOUT HELPERS
+   ============================================================ */
+
+.device-block {
+    margin-bottom: 6px;
+}

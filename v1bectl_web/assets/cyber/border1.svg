@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="1246.6752mm"
+   height="47.83667mm"
+   viewBox="0 0 1246.6752 47.83667"
+   version="1.1"
+   id="svg1"
+   inkscape:version="1.4.2 (ebf0e940d0, 2025-05-08)"
+   sodipodi:docname="border1.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview1"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:document-units="mm"
+     inkscape:zoom="0.2604753"
+     inkscape:cx="1973.3157"
+     inkscape:cy="1623.9543"
+     inkscape:window-width="1920"
+     inkscape:window-height="1890"
+     inkscape:window-x="0"
+     inkscape:window-y="0"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs1" />
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(508.52915,-35.983223)">
+    <path
+       id="path3"
+       d="m -477.37252,51.92878 h 57.88166 l 15.57797,-15.945557 h 156.36946 l 15.57867,15.945557 h 453.90155 l 15.57867,-15.945557 h 292.5798 L 514.52012,51.92878 H 738.14597 L 722.5673,67.877864 H 618.54371 L 602.96504,83.819893 H 446.59628 L 431.02114,67.877864 H 304.91719 L 289.33852,83.819893 H 132.97329 L 117.39462,67.877864 h -401.26358 l -15.57867,15.942029 h -209.08152 l 15.57831,-15.942029 v -0.0035 h 0.002 z M 671.2593,35.983223 h 37.20394 l -11.56053,11.835696 h -37.20394 z m -62.23706,0 h 37.20394 l -11.56053,11.835696 h -37.20394 z m -62.23706,0 h 37.20394 l -11.56053,11.835696 h -37.20394 z m -586.468402,0 h -37.203947 l 11.560529,11.835696 h 37.203947 z m -48.764475,0 h -37.203943 l 11.56052,11.835696 h 37.203951 z m -48.764473,0 h -37.20395 l 11.56053,11.835696 h 37.20395 z M -462.31455,51.92878 h 31.96837 l 15.57831,-15.945557 h -31.96837 z m 276.3379,-15.945557 h -37.20394 l 11.56052,11.835696 h 37.20395 l -11.56053,-11.835696"
+       style="fill:#0e0f0e;fill-opacity:1;fill-rule:evenodd;stroke:none;stroke-width:0.0352778" />
+  </g>
+</svg>

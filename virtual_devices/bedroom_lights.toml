@@ -1,0 +1,27 @@
+# 🔥 LIGHT GROUP - VIBEC0RE VIRTUAL DEVICE! 💖
+
+type = "light_group_linear"
+device_id = "virtual_bedroom_lights"
+name = "Bedroom Lights"
+
+# Member lights to control together
+# Example device IDs — replace these with your own Dirigera device IDs
+[members]
+top = "11111111-1111-1111-1111-111111111111_1"   # Ceiling light
+main = "22222222-2222-2222-2222-222222222222_1"  # Main light
+bed = "33333333-3333-3333-3333-333333333333_1"   # Bedside light
+
+
+# Maps input brightness from 0..100 to members
+# the member internal range is mapped to interval [min, max]
+# with x < min => 0 and x > max = 100
+[brightness]
+top = [80, 100]
+main = [40, 90]
+bed = [0, 50]
+
+# Group behavior settings
+[settings]
+
+# Transition time in milliseconds
+transition_time = 200

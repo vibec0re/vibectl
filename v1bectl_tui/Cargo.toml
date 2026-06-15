@@ -1,0 +1,33 @@
+[package]
+name = "v1bectl_tui"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "v1bectl terminal UI (ratatui)"
+
+[[bin]]
+name = "v1bectl_tui"
+path = "src/main.rs"
+
+[dependencies]
+v1bectl_sync = { path = "../lib/v1bectl_sync" }
+v1bectl_virtual = { path = "../lib/v1bectl_virtual" }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+ratatui = "0.28"
+crossterm = "0.28"
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+futures-util = "0.3"
+clap = { workspace = true }
+dirs = "5.0"
+tui-scrollview = "0.4"  # 🔥 SMART SCROLLING WIDGET! 💖

@@ -1,0 +1,27 @@
+[package]
+name = "v1bectl_gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Gateway trait and IKEA Dirigera implementation for v1bectl"
+
+[dependencies]
+v1bectl_sync = { path = "../v1bectl_sync" }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+async-trait = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = "0.3"
+
+[dev-dependencies]
+mockall = { workspace = true }

@@ -1,0 +1,40 @@
+# Build output
+target/
+dist/
+*.wasm
+
+# Web build cache
+.trunk/
+
+# Logs
+*.log
+
+# Environment / secrets
+.env
+.env.*
+*.token
+access.token
+
+# Data dumps (e.g. gateway device dumps — never commit your real home!)
+*_dump.json
+
+# 🔥 Private session / scratch files — not shared! <3
+SANDBOX.md
+SESSION.md
+ISSUE
+*.sandbox
+*.session
+
+# Local scratch test scripts
+test_*.sh
+
+# Local agent / editor config
+.claude/
+.superpowers/
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+*.swp

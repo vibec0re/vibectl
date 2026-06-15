@@ -1,0 +1,21 @@
+[package]
+name = "v1bectl_sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Bidirectional state synchronization engine for v1bectl"
+
+[dependencies]
+v1bectl_state = { path = "../v1bectl_state" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ciborium = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
