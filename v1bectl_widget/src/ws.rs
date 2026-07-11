@@ -16,7 +16,7 @@
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tokio::time::{interval, sleep, Duration};
+use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
 use v1bectl_state::{DeviceEvent, DeviceState, RgbColor};
@@ -68,7 +68,6 @@ pub enum ApiRequest {
         is_on: bool,
     },
     Ping,
-    Pong,
 }
 
 /// The responses this widget understands (subset). Anything else decodes to
@@ -126,8 +125,6 @@ pub enum Cmd {
 pub enum Inbound {
     Devices(Vec<DeviceState>),
     Event(DeviceEvent),
-    /// A server-side liveness probe to answer (echo the correlation id).
-    PingRequest(String),
     /// Valid envelope, but nothing we act on (acks, unknown responses, ...).
     Ignored,
 }
@@ -148,28 +145,20 @@ pub fn decode_inbound(buf: &[u8]) -> Option<Inbound> {
                 _ => Inbound::Ignored,
             }
         }
-        ApiMessageType::Request => match ciborium::from_reader::<ApiRequest, _>(&msg.payload[..]) {
-            Ok(ApiRequest::Ping) => Inbound::PingRequest(msg.correlation_id),
-            _ => Inbound::Ignored,
-        },
-        ApiMessageType::Error => Inbound::Ignored,
+        // The server never sends Request frames to clients; Error carries
+        // nothing an echo-driven widget acts on.
+        ApiMessageType::Request | ApiMessageType::Error => Inbound::Ignored,
     };
     Some(inbound)
 }
 
-/// Encode a request into a whole binary frame (fresh correlation id unless
-/// one is supplied — a Pong echoes its Ping's).
-pub fn encode_request(req: &ApiRequest, correlation_id: Option<String>) -> Vec<u8> {
+/// Encode a request into a whole binary frame with a fresh correlation id.
+pub fn encode_request(req: &ApiRequest) -> Vec<u8> {
     let mut payload = Vec::new();
     ciborium::into_writer(req, &mut payload).expect("CBOR of a plain request cannot fail");
-    let message_type = if matches!(req, ApiRequest::Pong) {
-        ApiMessageType::Response
-    } else {
-        ApiMessageType::Request
-    };
     let msg = ApiMessage {
-        correlation_id: correlation_id.unwrap_or_else(|| Uuid::new_v4().to_string()),
-        message_type,
+        correlation_id: Uuid::new_v4().to_string(),
+        message_type: ApiMessageType::Request,
         payload,
     };
     let mut frame = Vec::new();
@@ -203,6 +192,11 @@ fn backoff_secs(attempt: u32) -> u64 {
     (1u64 << attempt.min(4)).min(30)
 }
 
+/// A session must live this long before the backoff resets — an
+/// accept-then-drop server must not defeat the curve (same guard as the
+/// hytte-plugin runtime's shell-socket backoff).
+const STABLE_SESSION: Duration = Duration::from_secs(30);
+
 /// The long-running WS client. Exits when the reducer side is gone (`msg_tx`
 /// closed) — i.e. when the plugin session ends and its sources are dropped.
 pub async fn client(
@@ -217,9 +211,16 @@ pub async fn client(
         }
         match connect_async(&url).await {
             Ok((stream, _)) => {
-                attempt = 0;
+                // Anything queued while the server was unreachable (or while
+                // the connect was in flight) is stale user intent — drop it
+                // rather than replaying a toggle burst into the fresh session.
+                while cmd_rx.try_recv().is_ok() {}
+                let started = Instant::now();
                 if run_conn(stream, &mut cmd_rx, &msg_tx).await.is_none() {
                     return; // reducer gone
+                }
+                if started.elapsed() >= STABLE_SESSION {
+                    attempt = 0;
                 }
                 if msg_tx.send(WsMsg::Status(Conn::Offline)).is_err() {
                     return;
@@ -234,9 +235,6 @@ pub async fn client(
         }
         sleep(Duration::from_secs(backoff_secs(attempt))).await;
         attempt = attempt.saturating_add(1);
-        // Commands aimed at a dead server are stale by now — drop them
-        // rather than firing a queued-up toggle burst on reconnect.
-        while cmd_rx.try_recv().is_ok() {}
     }
 }
 
@@ -258,7 +256,6 @@ async fn run_conn(
     if sink
         .send(Message::Binary(encode_request(
             &ApiRequest::DiscoverDevices,
-            None,
         )))
         .await
         .is_err()
@@ -270,31 +267,38 @@ async fn run_conn(
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // consume the immediate first tick
 
+    // Read-side watchdog: a healthy connection has inbound traffic at least
+    // every keepalive round (the server Pongs our Ping), so a long silence
+    // means a half-open TCP connection — reconnect instead of sitting
+    // "Online" with dead controls until the kernel notices.
+    const SILENCE_LIMIT: Duration = Duration::from_secs(90);
+    let mut last_inbound = Instant::now();
+
     loop {
         tokio::select! {
             frame = source.next() => match frame {
-                Some(Ok(Message::Binary(buf))) => match decode_inbound(&buf) {
-                    Some(Inbound::Devices(devices)) => {
-                        if msg_tx.send(WsMsg::Devices(devices)).is_err() {
-                            return None;
+                Some(Ok(Message::Binary(buf))) => {
+                    last_inbound = Instant::now();
+                    match decode_inbound(&buf) {
+                        Some(Inbound::Devices(devices)) => {
+                            if msg_tx.send(WsMsg::Devices(devices)).is_err() {
+                                return None;
+                            }
                         }
-                    }
-                    Some(Inbound::Event(ev)) => {
-                        if msg_tx.send(WsMsg::Event(ev)).is_err() {
-                            return None;
+                        Some(Inbound::Event(ev)) => {
+                            if msg_tx.send(WsMsg::Event(ev)).is_err() {
+                                return None;
+                            }
                         }
+                        Some(Inbound::Ignored) => {}
+                        None => eprintln!("[v1bectl-widget] undecodable frame dropped"),
                     }
-                    Some(Inbound::PingRequest(correlation_id)) => {
-                        let frame = encode_request(&ApiRequest::Pong, Some(correlation_id));
-                        if sink.send(Message::Binary(frame)).await.is_err() {
-                            return Some(());
-                        }
-                    }
-                    Some(Inbound::Ignored) => {}
-                    None => eprintln!("[v1bectl-widget] undecodable frame dropped"),
-                },
+                }
                 Some(Ok(Message::Close(_))) | None => return Some(()),
-                Some(Ok(_)) => {} // text/ping/pong frames — tungstenite handles pongs
+                Some(Ok(_)) => {
+                    // text/ping/pong frames — tungstenite answers pongs itself
+                    last_inbound = Instant::now();
+                }
                 Some(Err(e)) => {
                     eprintln!("[v1bectl-widget] ws error: {e}");
                     return Some(());
@@ -302,7 +306,7 @@ async fn run_conn(
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(cmd) => {
-                    let frame = encode_request(&request_for(cmd), None);
+                    let frame = encode_request(&request_for(cmd));
                     if sink.send(Message::Binary(frame)).await.is_err() {
                         return Some(());
                     }
@@ -312,7 +316,11 @@ async fn run_conn(
                 None => return None,
             },
             _ = keepalive.tick() => {
-                let frame = encode_request(&ApiRequest::Ping, None);
+                if last_inbound.elapsed() > SILENCE_LIMIT {
+                    eprintln!("[v1bectl-widget] no inbound traffic for {SILENCE_LIMIT:?}; reconnecting");
+                    return Some(());
+                }
+                let frame = encode_request(&ApiRequest::Ping);
                 if sink.send(Message::Binary(frame)).await.is_err() {
                     return Some(());
                 }
@@ -345,30 +353,19 @@ mod tests {
 
     #[test]
     fn encode_request_round_trips_through_the_envelope() {
-        let buf = encode_request(
-            &ApiRequest::SetLightState {
-                device_id: "l1".into(),
-                is_on: Some(true),
-                brightness: Some(50),
-                color_temp: None,
-                rgb_color: None,
-            },
-            None,
-        );
+        let buf = encode_request(&ApiRequest::SetLightState {
+            device_id: "l1".into(),
+            is_on: Some(true),
+            brightness: Some(50),
+            color_temp: None,
+            rgb_color: None,
+        });
         let msg: ApiMessage = ciborium::from_reader(&buf[..]).unwrap();
         assert!(matches!(msg.message_type, ApiMessageType::Request));
         let req: ApiRequest = ciborium::from_reader(&msg.payload[..]).unwrap();
         assert!(
             matches!(req, ApiRequest::SetLightState { device_id, is_on: Some(true), brightness: Some(50), .. } if device_id == "l1")
         );
-    }
-
-    #[test]
-    fn pong_echoes_the_ping_correlation_id_as_a_response() {
-        let buf = encode_request(&ApiRequest::Pong, Some("abc-123".into()));
-        let msg: ApiMessage = ciborium::from_reader(&buf[..]).unwrap();
-        assert_eq!(msg.correlation_id, "abc-123");
-        assert!(matches!(msg.message_type, ApiMessageType::Response));
     }
 
     #[test]
@@ -421,12 +418,6 @@ mod tests {
         assert!(
             matches!(decode_inbound(&buf), Some(Inbound::Devices(d)) if d.len() == 1 && d[0].device_id == "l1")
         );
-    }
-
-    #[test]
-    fn decode_inbound_server_ping_yields_its_correlation_id() {
-        let buf = frame(ApiMessageType::Request, "ping-7", cbor(&ApiRequest::Ping));
-        assert!(matches!(decode_inbound(&buf), Some(Inbound::PingRequest(id)) if id == "ping-7"));
     }
 
     #[test]
@@ -541,13 +532,25 @@ mod live_tests {
             }
         }
 
-        // Leave the dummy as we found it.
+        // Leave the dummy as we found it — and AWAIT the restore's echo:
+        // ending the test here would cancel the client task at runtime
+        // teardown before the frame is ever written.
         cmd_tx
             .send(Cmd::SetLight {
-                device_id: light.device_id,
+                device_id: light.device_id.clone(),
                 is_on: Some(was_on),
                 brightness: None,
             })
             .unwrap();
+        loop {
+            match timeout(DEADLINE, msg_rx.recv())
+                .await
+                .expect("the restore's event echo before the deadline")
+                .expect("client task alive")
+            {
+                WsMsg::Event(ev) if ev.device_id == light.device_id => break,
+                _ => {}
+            }
+        }
     }
 }

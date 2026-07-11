@@ -30,13 +30,13 @@
 mod ws;
 
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{Input, MsgStream, Plugin};
 use tokio::sync::mpsc;
-use v1bectl_state::{DeviceState, DeviceStateValue, EventType};
+use v1bectl_state::{DeviceState, DeviceStateValue, DeviceType, EventType};
 
 use ws::{Cmd, Conn, WsMsg};
 
@@ -55,6 +55,15 @@ struct VibeWidget {
     conn: Conn,
     devices: Vec<DeviceState>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    /// Fractional scroll accumulated per light, so touchpad smooth-scroll
+    /// deltas (dozens of sub-1.0 events per swipe) fold into whole notches
+    /// instead of each slamming a full step.
+    scroll_accum: HashMap<String, f64>,
+    /// The brightness we last *asked* for, per light — the base for the next
+    /// scroll step while the server's echo is still in flight (otherwise a
+    /// burst of notches all compute from the same stale model value).
+    /// Cleared when a state patch for the device arrives.
+    pending_bright: HashMap<String, u8>,
 }
 
 impl VibeWidget {
@@ -74,20 +83,18 @@ impl VibeWidget {
             EventType::StateChanged {
                 new_state: Some(state),
                 ..
-            } => {
-                if let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) {
-                    dev.state = state;
-                }
-            }
+            } => self.patch_state(device_id, state),
             EventType::AttributeChanged {
                 attribute,
                 new_value,
                 ..
             } if attribute == "state" => {
-                if let Ok(state) = serde_json::from_value::<DeviceStateValue>(new_value) {
-                    if let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) {
-                        dev.state = state;
-                    }
+                match serde_json::from_value::<DeviceStateValue>(new_value) {
+                    Ok(state) => self.patch_state(device_id, state),
+                    // A raw-gateway payload we can't shape (real Dirigera
+                    // pushes carry gateway JSON, not DeviceStateValue) —
+                    // resync instead of silently going stale.
+                    Err(_) => self.send(Cmd::Refresh),
                 }
             }
             EventType::DeviceReachabilityChanged { reachable } => {
@@ -101,10 +108,37 @@ impl VibeWidget {
         }
     }
 
-    /// Lights + outlets currently on.
+    /// Apply a new state value to a device, *merging* optional fields the
+    /// echo may omit (a `SetLightState{is_on}` echo carries `brightness:
+    /// None`; an outlet echo carries `power_consumption: None`) — a patch
+    /// must not wipe live readouts. Also settles any pending scroll target.
+    fn patch_state(&mut self, device_id: &str, new: DeviceStateValue) {
+        self.pending_bright.remove(device_id);
+        let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
+            return;
+        };
+        dev.state = match (&dev.state, new) {
+            (DeviceStateValue::Light(old), DeviceStateValue::Light(mut new)) => {
+                new.brightness = new.brightness.or(old.brightness);
+                new.color_temp = new.color_temp.or(old.color_temp);
+                new.rgb_color = new.rgb_color.or(old.rgb_color.clone());
+                DeviceStateValue::Light(new)
+            }
+            (DeviceStateValue::Outlet(old), DeviceStateValue::Outlet(mut new)) => {
+                new.power_consumption = new.power_consumption.or(old.power_consumption);
+                new.total_energy = new.total_energy.or(old.total_energy);
+                DeviceStateValue::Outlet(new)
+            }
+            (_, new) => new,
+        };
+    }
+
+    /// Physical lights + outlets currently on (groups would double-count
+    /// their members — `renders()` keeps them out of the widget entirely).
     fn on_count(&self) -> usize {
         self.devices
             .iter()
+            .filter(|d| renders(d))
             .filter(|d| match &d.state {
                 DeviceStateValue::Light(l) => l.is_on,
                 DeviceStateValue::Outlet(o) => o.is_on,
@@ -130,6 +164,8 @@ impl Plugin for VibeWidget {
             conn: Conn::Connecting,
             devices: Vec::new(),
             cmd_tx,
+            scroll_accum: HashMap::new(),
+            pending_bright: HashMap::new(),
         }
     }
 
@@ -205,24 +241,7 @@ impl VibeWidget {
             }
         } else if let Some(id) = node.strip_prefix("vw-ls-") {
             if let EventKind::Scroll { dy, .. } = kind {
-                if let Some(DeviceStateValue::Light(light)) = self.device(id).map(|d| &d.state) {
-                    // Scroll up (negative dy) brightens, down dims — the
-                    // shell's volume-chip convention.
-                    let step = if dy < 0.0 {
-                        BRIGHTNESS_STEP
-                    } else {
-                        -BRIGHTNESS_STEP
-                    };
-                    let current = i16::from(light.brightness.unwrap_or(50));
-                    let next = (current + step).clamp(1, 100) as u8;
-                    self.send(Cmd::SetLight {
-                        device_id: id.to_string(),
-                        // Brightening a light that's off also turns it on
-                        // (the legacy web client's convention).
-                        is_on: (!light.is_on && step > 0).then_some(true),
-                        brightness: Some(next),
-                    });
-                }
+                self.on_light_scroll(id, dy);
             }
         } else if let Some(id) = node.strip_prefix("vw-o-") {
             if matches!(kind, EventKind::Click) {
@@ -234,6 +253,50 @@ impl VibeWidget {
                 }
             }
         }
+    }
+
+    /// Scroll-to-dim with notch accumulation: raw smooth-scroll deltas
+    /// (touchpads emit dozens of sub-1.0 events per swipe) fold into whole
+    /// notches; each notch is ±5 %. Scroll up (negative dy) brightens — the
+    /// shell's volume-chip convention. Horizontal scroll (dy == 0) is a no-op.
+    fn on_light_scroll(&mut self, id: &str, dy: f64) {
+        let Some(DeviceStateValue::Light(light)) = self.device(id).map(|d| &d.state) else {
+            return;
+        };
+        let is_on = light.is_on;
+        let model_bright = light.brightness;
+
+        let acc = self.scroll_accum.entry(id.to_string()).or_insert(0.0);
+        *acc += -dy; // up = positive
+        let notches = acc.trunc();
+        if notches == 0.0 {
+            return;
+        }
+        *acc -= notches;
+
+        // Base = the last requested value while an echo is in flight,
+        // else the model's.
+        let base = i16::from(
+            self.pending_bright
+                .get(id)
+                .copied()
+                .or(model_bright)
+                .unwrap_or(50),
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        let next = (base + (notches as i16) * BRIGHTNESS_STEP).clamp(1, 100) as u8;
+        let brightening = notches > 0.0;
+        if next == base as u8 && (is_on || !brightening) {
+            return; // already at the clamp; nothing new to ask for
+        }
+        self.pending_bright.insert(id.to_string(), next);
+        self.send(Cmd::SetLight {
+            device_id: id.to_string(),
+            // Brightening a light that's off also turns it on (the legacy
+            // web client's convention).
+            is_on: (!is_on && brightening).then_some(true),
+            brightness: Some(next),
+        });
     }
 
     /// Title, connection dot, and the on-count.
@@ -289,12 +352,18 @@ impl VibeWidget {
     }
 }
 
-/// Whether a device gets a row (mirrors what the web UI renders).
+/// Whether a device gets a row (mirrors what the web UI renders). Gated on
+/// the *device type*, not the state shape: `VirtualLightGroup`s carry
+/// Light-shaped state too, but the server's virtual path emits no event
+/// echo, so an echo-driven toggle on a group latches — until the server
+/// publishes events for virtual writes, groups stay off the widget.
 fn renders(dev: &DeviceState) -> bool {
-    matches!(
-        dev.state,
-        DeviceStateValue::Light(_) | DeviceStateValue::Outlet(_) | DeviceStateValue::Sensor(_)
-    )
+    match dev.device_info.device_type {
+        DeviceType::Light => matches!(dev.state, DeviceStateValue::Light(_)),
+        DeviceType::Outlet => matches!(dev.state, DeviceStateValue::Outlet(_)),
+        DeviceType::Sensor => matches!(dev.state, DeviceStateValue::Sensor(_)),
+        _ => false,
+    }
 }
 
 fn status_label(text: &str) -> Node {
@@ -360,12 +429,21 @@ fn device_row(dev: &DeviceState) -> Option<Node> {
                 if outlet.is_on { "vw-on" } else { "vw-off" }.to_string(),
             ];
             classes.extend(offline_class);
+            // State must be legible without CSS (the vw-* classes are hooks
+            // for the shell's stylesheet, which may not style them).
+            let glyph = if offline {
+                "◌"
+            } else if outlet.is_on {
+                "●"
+            } else {
+                "○"
+            };
             let mut children = vec![Node::Button {
                 id: format!("vw-o-{id}"),
                 classes: vec!["vw-toggle".into()],
                 child: Box::new(Node::Label {
                     id: None,
-                    text: format!("⏻ {name}"),
+                    text: format!("{glyph} {name} ⏻"),
                     classes: vec![],
                 }),
             }];
@@ -387,6 +465,9 @@ fn device_row(dev: &DeviceState) -> Option<Node> {
         }
         DeviceStateValue::Sensor(sensor) => {
             let mut parts = vec![name.to_string()];
+            if offline {
+                parts.push("◌".to_string());
+            }
             if let Some(t) = sensor.temperature {
                 parts.push(format!("🌡 {t:.1}°"));
             }
@@ -520,7 +601,7 @@ mod tests {
                 "● v1bectl",
                 "2 on",
                 "bedroom",
-                "⏻ Skrivbord",
+                "● Skrivbord ⏻",
                 "4.2 W",
                 "○ Sänglampa",
                 "living_room",
@@ -569,7 +650,7 @@ mod tests {
                 brightness: Some(100),
             }
         );
-        // Scroll down dims.
+        // Scroll down dims — based on the *pending* 100, not the stale 98.
         let _ = m.update(Input::Event {
             node: "vw-ls-l1".into(),
             kind: EventKind::Scroll { dx: 0.0, dy: 1.0 },
@@ -579,8 +660,129 @@ mod tests {
             Cmd::SetLight {
                 device_id: "l1".into(),
                 is_on: None,
-                brightness: Some(93),
+                brightness: Some(95),
             }
+        );
+    }
+
+    #[test]
+    fn touchpad_smooth_scroll_accumulates_to_notches() {
+        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
+        // Three sub-notch deltas: nothing fires until the notch completes.
+        for _ in 0..2 {
+            let _ = m.update(Input::Event {
+                node: "vw-ls-l1".into(),
+                kind: EventKind::Scroll { dx: 0.0, dy: -0.4 },
+            });
+            assert!(
+                rx.try_recv().is_err(),
+                "sub-notch deltas accumulate silently"
+            );
+        }
+        let _ = m.update(Input::Event {
+            node: "vw-ls-l1".into(),
+            kind: EventKind::Scroll { dx: 0.0, dy: -0.4 },
+        });
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::SetLight {
+                device_id: "l1".into(),
+                is_on: None,
+                brightness: Some(55),
+            }
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_is_a_no_op() {
+        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
+        let _ = m.update(Input::Event {
+            node: "vw-ls-l1".into(),
+            kind: EventKind::Scroll { dx: 3.0, dy: 0.0 },
+        });
+        assert!(rx.try_recv().is_err(), "dy == 0 must not change brightness");
+    }
+
+    #[test]
+    fn virtual_light_groups_are_not_rendered_or_counted() {
+        let mut group = light("g1", "Bedroom Lights", "virtual", true, Some(100));
+        group.device_info.device_type = DeviceType::VirtualLightGroup;
+        let (mut m, rx) = model_with(vec![
+            group,
+            light("l1", "Taklampa", "living_room", true, Some(70)),
+        ]);
+        let all = texts(&m.view());
+        assert!(
+            !all.iter().any(|t| t.contains("Bedroom Lights")),
+            "the server's virtual path emits no event echo — groups stay off the widget"
+        );
+        assert!(
+            all.iter().any(|t| t == "1 on"),
+            "groups don't inflate the count: {all:?}"
+        );
+        // Defensively: even a synthetic event on a group id sends nothing.
+        let _ = m.update(Input::Event {
+            node: "vw-l-g1".into(),
+            kind: EventKind::Click,
+        });
+        let _ = rx; // no assertion on cmd here — group still has Light state
+    }
+
+    #[test]
+    fn echo_without_optional_fields_does_not_wipe_readouts() {
+        let (mut m, _rx) = model_with(vec![
+            light("l1", "Taklampa", "x", true, Some(70)),
+            outlet("o1", "Skrivbord", "x", true),
+        ]);
+        // A SetLightState{is_on}-style echo: brightness None must not wipe 70.
+        m.apply_event(
+            "l1",
+            EventType::StateChanged {
+                old_state: None,
+                new_state: Some(DeviceStateValue::Light(LightState {
+                    is_on: false,
+                    brightness: None,
+                    color_temp: None,
+                    rgb_color: None,
+                })),
+            },
+        );
+        assert!(
+            matches!(&m.devices[0].state, DeviceStateValue::Light(l) if !l.is_on && l.brightness == Some(70))
+        );
+        // An outlet echo with power_consumption: None must not wipe 4.2 W.
+        m.apply_event(
+            "o1",
+            EventType::StateChanged {
+                old_state: None,
+                new_state: Some(DeviceStateValue::Outlet(OutletState {
+                    is_on: false,
+                    power_consumption: None,
+                    total_energy: None,
+                })),
+            },
+        );
+        assert!(
+            matches!(&m.devices[1].state, DeviceStateValue::Outlet(o) if !o.is_on && o.power_consumption == Some(4.2))
+        );
+    }
+
+    #[test]
+    fn undecodable_attribute_payload_triggers_a_resync() {
+        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", false, Some(20))]);
+        // A raw Dirigera-gateway payload, not a DeviceStateValue.
+        m.apply_event(
+            "l1",
+            EventType::AttributeChanged {
+                attribute: "state".into(),
+                old_value: serde_json::Value::Null,
+                new_value: serde_json::json!({"isOn": true, "lightLevel": 80}),
+            },
+        );
+        assert_eq!(rx.try_recv().unwrap(), Cmd::Refresh);
+        assert!(
+            matches!(&m.devices[0].state, DeviceStateValue::Light(l) if !l.is_on),
+            "model untouched until the resync lands"
         );
     }
 
