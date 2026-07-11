@@ -13,9 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 # The trollshell plugin runtime SDK (re-exports the wire protocol as
-# `hytte_plugin::proto` and `tokio_stream` for sources). Pinned to the SDK PR
-# branch until vibec0re/trollshell#279 merges — then flip to branch = "main".
-hytte-plugin = { git = "https://github.com/vibec0re/trollshell", branch = "feat/plugin-sdk-275" }
+# `hytte_plugin::proto` and `tokio_stream` for sources). Tracks trollshell
+# main (the SDK landed in vibec0re/trollshell#279).
+hytte-plugin = { git = "https://github.com/vibec0re/trollshell", branch = "main" }
 
 # Shared v1bectl types (DeviceState, DeviceEvent, LightState, ...) — the
 # tokio-free core, same source of truth the server serializes from.

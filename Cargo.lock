@@ -989,7 +989,7 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=feat%2Fplugin-sdk-275#7e4c8b59f8234336e1d98b61cfe2cfc5d2f880bb"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#7be013101ff09ae214a44ca008b6851c81591262"
 dependencies = [
  "hytte-plugin-proto",
  "tokio",
@@ -1804,7 +1804,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin-proto"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=feat%2Fplugin-sdk-275#7e4c8b59f8234336e1d98b61cfe2cfc5d2f880bb"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#7be013101ff09ae214a44ca008b6851c81591262"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -2935,7 +2935,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3373,7 +3373,7 @@ dependencies = [
  "getrandom 0.3.3",
  "once_cell",
  "rustix 1.0.8",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
