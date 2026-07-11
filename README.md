@@ -61,6 +61,7 @@ Runs on port **31337** by default (1337 → leet → elite 🔥).
 | `v1bectl_tui` | Terminal UI (ratatui) |
 | `v1bectl_web` | Web UI (Yew / WASM) |
 | `v1bectl_gtk` | GTK4 desktop app |
+| `v1bectl_widget` | trollshell sidebar widget (out-of-process plugin over [hytte-plugin](https://github.com/vibec0re/trollshell)) |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
