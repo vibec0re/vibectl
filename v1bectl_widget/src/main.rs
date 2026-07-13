@@ -46,12 +46,11 @@
 mod screens;
 mod ws;
 
-use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{Input, MsgStream, Plugin};
+use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
 use tokio::sync::mpsc;
 use v1bectl_state::{DeviceState, DeviceStateValue, DeviceType, EventType};
 
@@ -60,13 +59,6 @@ use ws::{Cmd, Conn, WsMsg};
 
 /// How much one scroll notch changes brightness (percent).
 const BRIGHTNESS_STEP: i16 = 5;
-
-thread_local! {
-    /// Hand-off slot: `init()` parks the command receiver here for
-    /// `sources()` to collect. Sound because the SDK session calls `init()`
-    /// before `sources()`, both on the runtime thread.
-    static CMD_RX: RefCell<Option<mpsc::UnboundedReceiver<Cmd>>> = const { RefCell::new(None) };
-}
 
 /// The model: connection state + the device list, patched by server events.
 struct VibeWidget {
@@ -162,6 +154,9 @@ impl VibeWidget {
 
 impl Plugin for VibeWidget {
     type Msg = WsMsg;
+    /// The reducer queues these on the SDK's command lane; `ws::client` drains
+    /// the paired receiver and turns them into wire requests.
+    type Cmd = Cmd;
 
     fn manifest() -> Manifest {
         // No host-state subscriptions, no shell capabilities: everything this
@@ -169,26 +164,23 @@ impl Plugin for VibeWidget {
         Manifest::new("vibectl", Mount::SidebarBottom)
     }
 
-    fn init() -> Self {
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-        CMD_RX.with(|slot| *slot.borrow_mut() = Some(cmd_rx));
+    fn init(cmds: CmdSender<Self::Cmd>) -> Self {
+        // The SDK owns the command lane now (trollshell#280): keep the sender,
+        // `sources()` gets the paired receiver — no more thread-local hand-off.
         Self {
             conn: Conn::Connecting,
             devices: Vec::new(),
             screens: screens::load(),
             expanded: HashSet::new(),
-            cmd_tx,
+            cmd_tx: cmds,
             scroll_accum: HashMap::new(),
             pending_bright: HashMap::new(),
         }
     }
 
-    fn sources() -> Option<MsgStream<Self::Msg>> {
-        let cmd_rx = CMD_RX
-            .with(|slot| slot.borrow_mut().take())
-            .expect("init() parks the command receiver before sources() runs");
+    fn sources(cmds: CmdReceiver<Self::Cmd>) -> Option<MsgStream<Self::Msg>> {
         let (msg_tx, msg_rx) = mpsc::unbounded_channel();
-        tokio::spawn(ws::client(cmd_rx, msg_tx));
+        tokio::spawn(ws::client(cmds, msg_tx));
         Some(Box::pin(UnboundedReceiverStream::new(msg_rx)))
     }
 
@@ -201,8 +193,9 @@ impl Plugin for VibeWidget {
                 self.apply_event(&id, ev.event_type);
             }
             Input::Event { node, kind } => self.on_ui_event(&node, kind),
-            // We subscribe to no host state and issue no RunCommands.
-            Input::Snapshot(_) | Input::EffectResult { .. } => {}
+            // No host state, no RunCommands, and nothing to do when our sidebar
+            // slot shows/hides — the WS keeps state live either way.
+            Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => {}
         }
         Vec::new()
     }
@@ -433,10 +426,11 @@ impl VibeWidget {
                 ],
             });
         }
-        // Trailing expander chevron — the Adwaita idiom: `pan-down` when
-        // collapsed (click to open downward), `pan-up` when expanded. (It sits
-        // after the text, not flush to the panel's right edge — the node vocab
-        // has no hexpand/spacer to push it there.)
+        // Right-pin the chevron (the Adwaita expander idiom): a Spacer eats the
+        // slack between the text cluster and the chevron, pushing it to the
+        // trailing edge. `pan-down` collapsed (click to open downward),
+        // `pan-up` expanded.
+        header_row.push(Node::Spacer);
         header_row.push(Node::Icon {
             id: None,
             name: if open {
@@ -985,10 +979,8 @@ mod tests {
     /// machine can't leak in — the auto layout is exercised unless a test opts
     /// into a config via [`model_with_config`].
     fn model_with(devices: Vec<DeviceState>) -> (VibeWidget, mpsc::UnboundedReceiver<Cmd>) {
-        let mut m = VibeWidget::init();
-        let rx = CMD_RX
-            .with(|slot| slot.borrow_mut().take())
-            .expect("init parks the receiver");
+        let (cmd_tx, rx) = hytte_plugin::cmd_channel::<Cmd>();
+        let mut m = VibeWidget::init(cmd_tx);
         m.conn = Conn::Online;
         m.screens = Vec::new();
         let _ = m.update(Input::App(WsMsg::Devices(devices)));

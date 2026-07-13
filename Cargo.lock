@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#7be013101ff09ae214a44ca008b6851c81591262"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#5b040b16b1b509fee1ae0fa496edbd2aa8ea2aa8"
 dependencies = [
  "hytte-plugin-proto",
  "tokio",
@@ -1804,10 +1804,11 @@ dependencies = [
 [[package]]
 name = "hytte-plugin-proto"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#7be013101ff09ae214a44ca008b6851c81591262"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#5b040b16b1b509fee1ae0fa496edbd2aa8ea2aa8"
 dependencies = [
  "rmp-serde",
  "serde",
+ "serde_bytes",
  "tokio",
 ]
 
@@ -3046,6 +3047,16 @@ dependencies = [
  "js-sys",
  "serde",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "serde_bytes"
+version = "0.11.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5d440709e79d88e51ac01c4b72fc6cb7314017bb7da9eeff678aa94c10e3ea8"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]
