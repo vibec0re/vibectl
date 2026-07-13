@@ -6,13 +6,22 @@
 //! `$XDG_RUNTIME_DIR/trollshell/plugin.sock`. The shell never recompiles for
 //! it — that's the whole point.
 //!
-//! Faithful miniature of the cyber web UI (`v1bectl_web`): rooms → light
-//! toggles + brightness, outlet toggles (+ live wattage), inline
-//! temp/humidity sensors, and a connection dot. Interactions:
+//! Faithful miniature of the cyber web UI (`v1bectl_web`): light toggles +
+//! brightness, outlet toggles (+ live wattage), inline temp/humidity sensors,
+//! and a connection dot. Interactions:
 //!
 //! - **click** a light/outlet → toggle
 //! - **scroll** on a light row → brightness ±5 % (the vocab has no slider;
 //!   scroll-to-adjust is the shell-native idiom anyway)
+//!
+//! # Layout
+//!
+//! Two paths (see `view`). With a `screens.kdl` config present (the same
+//! curated file the GTK/web clients read — see the [`screens`] module), the
+//! widget renders *that* layout: screens → groups → blocks, custom row labels,
+//! and per-element `switch`/`slider`/`show-temp`/`show-humidity` flags.
+//! Otherwise — or if none of the config's device refs resolve — it falls back
+//! to auto-grouping every device by room, so the sidebar is never blank.
 //!
 //! # Shape
 //!
@@ -27,6 +36,7 @@
 //! updates and echoes a `DeviceEvent`, which is the single source of truth —
 //! same convention as the other v1bectl clients.
 
+mod screens;
 mod ws;
 
 use std::cell::RefCell;
@@ -38,6 +48,7 @@ use hytte_plugin::{Input, MsgStream, Plugin};
 use tokio::sync::mpsc;
 use v1bectl_state::{DeviceState, DeviceStateValue, DeviceType, EventType};
 
+use screens::{DeviceRef, Element, Screen};
 use ws::{Cmd, Conn, WsMsg};
 
 /// How much one scroll notch changes brightness (percent).
@@ -54,6 +65,9 @@ thread_local! {
 struct VibeWidget {
     conn: Conn,
     devices: Vec<DeviceState>,
+    /// The curated layout from `screens.kdl` (empty ⇒ auto-group by room). Read
+    /// once at startup; the device list it renders arrives live over the WS.
+    screens: Vec<Screen>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     /// Fractional scroll accumulated per light, so touchpad smooth-scroll
     /// deltas (dozens of sub-1.0 events per swipe) fold into whole notches
@@ -163,6 +177,7 @@ impl Plugin for VibeWidget {
         Self {
             conn: Conn::Connecting,
             devices: Vec::new(),
+            screens: screens::load(),
             cmd_tx,
             scroll_accum: HashMap::new(),
             pending_bright: HashMap::new(),
@@ -202,17 +217,11 @@ impl Plugin for VibeWidget {
                 Conn::Online => "no devices",
             }));
         } else {
-            for (room, devices) in self.rooms() {
-                children.push(Node::Label {
-                    id: None,
-                    text: room,
-                    classes: vec!["vw-room".into()],
-                });
-                for dev in devices {
-                    if let Some(row) = device_row(dev) {
-                        children.push(row);
-                    }
-                }
+            // Config-driven layout when `screens.kdl` resolves at least one row;
+            // otherwise auto-group by room so the sidebar is never blank.
+            match self.view_config() {
+                Some(body) => children.extend(body),
+                None => children.extend(self.view_rooms()),
             }
         }
         Node::Box {
@@ -350,6 +359,181 @@ impl VibeWidget {
         }
         rooms
     }
+
+    /// The default layout: every renderable device, grouped by room and
+    /// alphabetical. Used when no `screens.kdl` is configured — or when none of
+    /// its device refs resolve, so the widget still shows the home.
+    fn view_rooms(&self) -> Vec<Node> {
+        let mut out = Vec::new();
+        for (room, devices) in self.rooms() {
+            out.push(Node::Label {
+                id: None,
+                text: room,
+                classes: vec!["vw-room".into()],
+            });
+            for dev in devices {
+                if let Some(row) = device_row(dev, &RowOpts::auto(dev)) {
+                    out.push(row);
+                }
+            }
+        }
+        out
+    }
+
+    /// Render the configured screens, or `None` when no layout is loaded or
+    /// none of its refs resolve against the live device list (→ caller falls
+    /// back to [`Self::view_rooms`]). A screen contributes its title only when
+    /// at least one of its groups yields a row, so refs the server doesn't
+    /// (yet) know about leave no empty headers behind.
+    fn view_config(&self) -> Option<Vec<Node>> {
+        if self.screens.is_empty() {
+            return None;
+        }
+        let mut out = Vec::new();
+        // How many actual *device* rows resolved. Text and empty blocks don't
+        // count — a title/banner-only screen must not suppress the fallback.
+        let mut resolved = 0usize;
+        for screen in &self.screens {
+            let mut groups = Vec::new();
+            for group in &screen.groups {
+                let rows = self.render_elements(&group.elements, &mut resolved);
+                if !rows.is_empty() {
+                    groups.push(Node::Box {
+                        id: None,
+                        dir: Dir::Vertical,
+                        spacing: 4,
+                        scroll: false,
+                        classes: vec!["vw-group".into()],
+                        children: rows,
+                    });
+                }
+            }
+            if !groups.is_empty() {
+                out.push(Node::Label {
+                    id: None,
+                    text: screen.title.clone(),
+                    classes: vec!["vw-screen".into()],
+                });
+                out.extend(groups);
+            }
+        }
+        // Fall back to the room layout when the config resolved *no* real
+        // device — otherwise a config that only names devices the server
+        // doesn't know (a stale/renamed config) would hide the whole home
+        // behind its titles and text banners.
+        (resolved > 0).then_some(out)
+    }
+
+    /// Turn config elements into rows, resolving each device ref against the
+    /// live list and skipping the ones we don't have (yet). Bumps `resolved`
+    /// once per device row actually produced (not for text or empty blocks) so
+    /// the caller can tell "the config rendered the home" from "the config
+    /// rendered only decoration". A `block` lays its resolved children out
+    /// horizontally, mirroring the GTK/web renderers.
+    fn render_elements(&self, elements: &[Element], resolved: &mut usize) -> Vec<Node> {
+        let mut out = Vec::new();
+        for element in elements {
+            match element {
+                Element::Light {
+                    name,
+                    device_ref,
+                    show_switch,
+                    show_slider,
+                } => {
+                    if let Some(dev) = self.resolve(device_ref) {
+                        let opts = RowOpts {
+                            name,
+                            allow_toggle: *show_switch,
+                            show_slider: *show_slider,
+                            show_temp: true,
+                            show_humidity: true,
+                        };
+                        if let Some(row) = device_row(dev, &opts) {
+                            *resolved += 1;
+                            out.push(row);
+                        }
+                    }
+                }
+                Element::Outlet { name, device_ref } => {
+                    if let Some(dev) = self.resolve(device_ref) {
+                        let opts = RowOpts {
+                            name,
+                            allow_toggle: true,
+                            show_slider: false,
+                            show_temp: true,
+                            show_humidity: true,
+                        };
+                        if let Some(row) = device_row(dev, &opts) {
+                            *resolved += 1;
+                            out.push(row);
+                        }
+                    }
+                }
+                Element::Sensor {
+                    device_ref,
+                    show_temp,
+                    show_humidity,
+                } => {
+                    if let Some(dev) = self.resolve(device_ref) {
+                        // A sensor slot is read-only: never emit a toggle, even
+                        // if the ref points at an actuator (a misconfiguration).
+                        let opts = RowOpts {
+                            name: &dev.device_info.name,
+                            allow_toggle: false,
+                            show_slider: false,
+                            show_temp: *show_temp,
+                            show_humidity: *show_humidity,
+                        };
+                        if let Some(row) = device_row(dev, &opts) {
+                            *resolved += 1;
+                            out.push(row);
+                        }
+                    }
+                }
+                Element::Text { template } => out.push(Node::Label {
+                    id: None,
+                    text: template.clone(),
+                    classes: vec!["vw-text".into()],
+                }),
+                Element::Block { elements } => {
+                    let cells: Vec<Node> = elements
+                        .iter()
+                        .filter_map(|el| {
+                            let sub = self.render_elements(std::slice::from_ref(el), resolved);
+                            (!sub.is_empty()).then(|| Node::Box {
+                                id: None,
+                                dir: Dir::Vertical,
+                                spacing: 4,
+                                scroll: false,
+                                classes: vec!["vw-block-cell".into()],
+                                children: sub,
+                            })
+                        })
+                        .collect();
+                    if !cells.is_empty() {
+                        out.push(Node::Box {
+                            id: None,
+                            dir: Dir::Horizontal,
+                            spacing: 8,
+                            scroll: false,
+                            classes: vec!["vw-block".into()],
+                            children: cells,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve a config device ref to a live device. Names match exactly — a
+    /// substring would let "Deko" pick up "Deko Bunt"; same rule as GTK.
+    fn resolve(&self, device_ref: &DeviceRef) -> Option<&DeviceState> {
+        match device_ref {
+            DeviceRef::ById(id) => self.device(id),
+            DeviceRef::ByName(name) => self.devices.iter().find(|d| &d.device_info.name == name),
+        }
+    }
 }
 
 /// Whether a device gets a row (mirrors what the web UI renders). Gated on
@@ -374,10 +558,51 @@ fn status_label(text: &str) -> Node {
     }
 }
 
-/// One device row, or `None` for kinds we don't render.
-fn device_row(dev: &DeviceState) -> Option<Node> {
+/// Per-row display options. The auto layout ([`RowOpts::auto`]) uses the
+/// device's own name and shows everything; a `screens.kdl` element overrides
+/// these — a custom label, `slider`/`switch`, sensor `show-temp`/`show-humidity`.
+///
+/// `allow_toggle` and `show_slider` are **independent**, matching GTK: a light
+/// can be toggle-only (`switch`, no `slider`), brightness-only (`slider`, no
+/// `switch`), both, or a static readout (neither).
+struct RowOpts<'a> {
+    /// The row label: the config `name`, or the device's own name.
+    name: &'a str,
+    /// Emit the clickable on/off toggle (light/outlet). Config `switch` for
+    /// lights; always on for the auto layout and outlet elements; always off
+    /// for the read-only sensor slot.
+    allow_toggle: bool,
+    /// Light: the brightness affordance — the readout bar *and* scroll-to-dim
+    /// (config `slider`; the auto layout always wants it).
+    show_slider: bool,
+    /// Sensor: show temperature / humidity (config `show-temp`/`show-humidity`).
+    show_temp: bool,
+    show_humidity: bool,
+}
+
+impl<'a> RowOpts<'a> {
+    /// The auto-layout defaults: the device's own name, everything shown,
+    /// lights fully interactive.
+    fn auto(dev: &'a DeviceState) -> Self {
+        RowOpts {
+            name: &dev.device_info.name,
+            allow_toggle: true,
+            show_slider: true,
+            show_temp: true,
+            show_humidity: true,
+        }
+    }
+}
+
+/// One device row, or `None` for devices we don't render (unknown/virtual —
+/// [`renders`] gates them, so an echo-less virtual group can't slip in via a
+/// config ref and latch on toggle).
+fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
+    if !renders(dev) {
+        return None;
+    }
     let id = &dev.device_id;
-    let name = &dev.device_info.name;
+    let name = opts.name;
     let offline = !dev.device_info.reachable;
     let offline_class = offline.then(|| "vw-unreachable".to_string());
 
@@ -396,28 +621,46 @@ fn device_row(dev: &DeviceState) -> Option<Node> {
                 if light.is_on { "vw-on" } else { "vw-off" }.to_string(),
             ];
             classes.extend(offline_class);
-            let mut children = vec![Node::Button {
-                id: format!("vw-l-{id}"),
-                classes: vec!["vw-toggle".into()],
-                child: Box::new(Node::Label {
-                    id: None,
-                    text: format!("{glyph} {name}"),
-                    classes: vec![],
-                }),
-            }];
-            if let (true, Some(b)) = (light.is_on, light.brightness) {
-                children.push(Node::Progress {
-                    id: None,
-                    fraction: f64::from(b) / 100.0,
-                    classes: vec!["vw-bright".into()],
-                });
+            let label = Node::Label {
+                id: None,
+                text: format!("{glyph} {name}"),
+                classes: vec![],
+            };
+            // Toggle affordance ← `switch`: a clickable button, or a static
+            // label. Kept independent from the brightness affordance below.
+            let head = if opts.allow_toggle {
+                Node::Button {
+                    id: format!("vw-l-{id}"),
+                    classes: vec!["vw-toggle".into()],
+                    child: Box::new(label),
+                }
+            } else {
+                label
+            };
+            let mut children = vec![head];
+            // Brightness bar ← `slider`, and only when on with a known level.
+            if opts.show_slider && light.is_on {
+                if let Some(b) = light.brightness {
+                    children.push(Node::Progress {
+                        id: None,
+                        fraction: f64::from(b) / 100.0,
+                        classes: vec!["vw-bright".into()],
+                    });
+                }
             }
+            // Scroll-to-dim target ← `slider` too: no slider ⇒ no `vw-ls-` id
+            // and no scroll, so a toggle-only light can't be dimmed (or, when
+            // off, scrolled on) — matching what `slider false` means in GTK.
+            let (row_id, scroll) = if opts.show_slider {
+                (Some(format!("vw-ls-{id}")), true)
+            } else {
+                (None, false)
+            };
             Node::Box {
-                // The scroll target for brightness — needs its own id.
-                id: Some(format!("vw-ls-{id}")),
+                id: row_id,
                 dir: Dir::Horizontal,
                 spacing: 6,
-                scroll: true,
+                scroll,
                 classes,
                 children,
             }
@@ -438,15 +681,23 @@ fn device_row(dev: &DeviceState) -> Option<Node> {
             } else {
                 "○"
             };
-            let mut children = vec![Node::Button {
-                id: format!("vw-o-{id}"),
-                classes: vec!["vw-toggle".into()],
-                child: Box::new(Node::Label {
-                    id: None,
-                    text: format!("{glyph} {name} ⏻"),
-                    classes: vec![],
-                }),
-            }];
+            let label = Node::Label {
+                id: None,
+                text: format!("{glyph} {name} ⏻"),
+                classes: vec![],
+            };
+            // Honor read-only intent: a sensor slot that resolves to an outlet
+            // (a misconfiguration) shows a static readout, never a live toggle.
+            let head = if opts.allow_toggle {
+                Node::Button {
+                    id: format!("vw-o-{id}"),
+                    classes: vec!["vw-toggle".into()],
+                    child: Box::new(label),
+                }
+            } else {
+                label
+            };
+            let mut children = vec![head];
             if let (true, Some(w)) = (outlet.is_on, outlet.power_consumption) {
                 children.push(Node::Label {
                     id: None,
@@ -468,11 +719,15 @@ fn device_row(dev: &DeviceState) -> Option<Node> {
             if offline {
                 parts.push("◌".to_string());
             }
-            if let Some(t) = sensor.temperature {
-                parts.push(format!("🌡 {t:.1}°"));
+            if opts.show_temp {
+                if let Some(t) = sensor.temperature {
+                    parts.push(format!("🌡 {t:.1}°"));
+                }
             }
-            if let Some(h) = sensor.humidity {
-                parts.push(format!("💧 {h:.0}%"));
+            if opts.show_humidity {
+                if let Some(h) = sensor.humidity {
+                    parts.push(format!("💧 {h:.0}%"));
+                }
             }
             let mut classes = vec!["vw-row".to_string(), "vw-sensor".to_string()];
             classes.extend(offline_class);
@@ -559,15 +814,81 @@ mod tests {
         }
     }
 
-    /// A model plus the probe end of its command channel.
+    /// A model plus the probe end of its command channel. Screens are cleared
+    /// so tests are hermetic: whatever `screens.kdl` happens to be on the test
+    /// machine can't leak in — the auto layout is exercised unless a test opts
+    /// into a config via [`model_with_config`].
     fn model_with(devices: Vec<DeviceState>) -> (VibeWidget, mpsc::UnboundedReceiver<Cmd>) {
         let mut m = VibeWidget::init();
         let rx = CMD_RX
             .with(|slot| slot.borrow_mut().take())
             .expect("init parks the receiver");
         m.conn = Conn::Online;
+        m.screens = Vec::new();
         let _ = m.update(Input::App(WsMsg::Devices(devices)));
         (m, rx)
+    }
+
+    /// Like [`model_with`], but driven by an inline `screens.kdl` layout.
+    fn model_with_config(
+        devices: Vec<DeviceState>,
+        kdl: &str,
+    ) -> (VibeWidget, mpsc::UnboundedReceiver<Cmd>) {
+        let (mut m, rx) = model_with(devices);
+        m.screens = screens::parse_screens(kdl).expect("test kdl parses");
+        (m, rx)
+    }
+
+    /// Every `Button` id and every `Box` id in a tree (the shell only emits
+    /// events for nodes that exist, so absence of an id ⇒ that interaction
+    /// can't fire).
+    fn ids(node: &Node) -> Vec<String> {
+        fn walk(node: &Node, out: &mut Vec<String>) {
+            match node {
+                Node::Box { id, children, .. } => {
+                    out.extend(id.clone());
+                    children.iter().for_each(|c| walk(c, out));
+                }
+                Node::Button { id, child, .. } => {
+                    out.push(id.clone());
+                    walk(child, out);
+                }
+                Node::Revealer { child, .. } => walk(child, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(node, &mut out);
+        out
+    }
+
+    /// Is there a `Progress` (brightness) node anywhere in the tree?
+    fn has_progress(node: &Node) -> bool {
+        match node {
+            Node::Progress { .. } => true,
+            Node::Box { children, .. } => children.iter().any(has_progress),
+            Node::Button { child, .. } | Node::Revealer { child, .. } => has_progress(child),
+            _ => false,
+        }
+    }
+
+    /// Is there a horizontal `vw-block` box (a KDL `block`) in the tree?
+    fn has_horizontal_block(node: &Node) -> bool {
+        match node {
+            Node::Box {
+                dir,
+                classes,
+                children,
+                ..
+            } => {
+                (matches!(dir, Dir::Horizontal) && classes.iter().any(|c| c == "vw-block"))
+                    || children.iter().any(has_horizontal_block)
+            }
+            Node::Button { child, .. } | Node::Revealer { child, .. } => {
+                has_horizontal_block(child)
+            }
+            _ => false,
+        }
     }
 
     /// Collect every label text in a tree (order = render order).
@@ -892,5 +1213,357 @@ mod tests {
             kind: EventKind::Click,
         });
         assert!(rx.try_recv().is_err(), "no command for foreign nodes");
+    }
+
+    // ── screens.kdl-driven layout ────────────────────────────────────────────
+
+    #[test]
+    fn config_layout_uses_titles_and_custom_names() {
+        let kdl = r#"
+screen "wz" {
+    title "NEST :: WOHNZIMMER"
+    group {
+        sensor {
+            device "Wohnzimmer"
+            show-temp true
+            show-humidity false
+        }
+        light "MAIN" {
+            device "LR Shelf"
+            switch true
+            slider true
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(
+            vec![
+                sensor("s1", "Wohnzimmer", "living_room"),
+                light("l1", "LR Shelf", "living_room", true, Some(60)),
+            ],
+            kdl,
+        );
+        let all = texts(&m.view());
+        assert!(all.iter().any(|t| t == "NEST :: WOHNZIMMER"), "{all:?}");
+        // The light shows its CONFIG label, not the device's own name.
+        assert!(all.iter().any(|t| t == "● MAIN"), "config label: {all:?}");
+        assert!(
+            !all.iter().any(|t| t.contains("LR Shelf")),
+            "device name suppressed: {all:?}"
+        );
+        // show-humidity false → humidity hidden, temperature still shown.
+        assert!(
+            all.iter().any(|t| t.contains('🌡') && !t.contains('💧')),
+            "humidity gated off: {all:?}"
+        );
+    }
+
+    #[test]
+    fn config_falls_back_to_rooms_when_no_ref_resolves() {
+        let kdl = r#"screen "wz" { title "WZ" group { light "X" { device "Nonexistent" } } }"#;
+        let (m, _rx) = model_with_config(
+            vec![light("l1", "Taklampa", "living_room", true, Some(70))],
+            kdl,
+        );
+        let all = texts(&m.view());
+        // Nothing in the config resolves → auto room layout (never blank).
+        assert!(all.iter().any(|t| t == "living_room"), "fell back: {all:?}");
+        assert!(all.iter().any(|t| t == "● Taklampa"), "{all:?}");
+        assert!(
+            !all.iter().any(|t| t == "WZ"),
+            "no config title when falling back: {all:?}"
+        );
+    }
+
+    #[test]
+    fn config_light_row_routes_clicks_by_resolved_device_id() {
+        let kdl = r#"screen "wz" { group { light "MAIN" { device "LR Shelf" } } }"#;
+        let (mut m, mut rx) =
+            model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
+        // The button id is keyed by the resolved device_id — clicks still route.
+        let _ = m.update(Input::Event {
+            node: "vw-l-l1".into(),
+            kind: EventKind::Click,
+        });
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            Cmd::SetLight {
+                device_id: "l1".into(),
+                is_on: Some(false),
+                brightness: None,
+            }
+        );
+    }
+
+    #[test]
+    fn config_switch_false_renders_a_static_row() {
+        let kdl = r#"
+screen "wz" {
+    group {
+        light "MAIN" {
+            device "LR Shelf"
+            switch false
+            slider false
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
+        let view = m.view();
+        // Shown (with its glyph)…
+        assert!(
+            texts(&view).iter().any(|t| t == "● MAIN"),
+            "{:?}",
+            texts(&view)
+        );
+        // …but with no toggle button and no scroll target, so nothing can fire.
+        let ids = ids(&view);
+        assert!(!ids.iter().any(|i| i == "vw-l-l1"), "no toggle: {ids:?}");
+        assert!(
+            !ids.iter().any(|i| i == "vw-ls-l1"),
+            "no scroll target: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn config_slider_flag_gates_the_brightness_bar() {
+        let has_bar = |slider: bool| {
+            // The `slider` line carries no quotes, so the v1-compat pass rewrites
+            // its bare boolean — mirrors how real configs are written.
+            let kdl = format!(
+                "screen \"wz\" {{\n\
+                 \x20   group {{\n\
+                 \x20       light \"MAIN\" {{\n\
+                 \x20           device \"LR Shelf\"\n\
+                 \x20           slider {slider}\n\
+                 \x20       }}\n\
+                 \x20   }}\n\
+                 }}"
+            );
+            let (m, _rx) =
+                model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], &kdl);
+            has_progress(&m.view())
+        };
+        assert!(has_bar(true), "slider=true shows the brightness bar");
+        assert!(!has_bar(false), "slider=false hides it");
+    }
+
+    #[test]
+    fn config_slider_false_removes_the_scroll_to_dim_target() {
+        // The shipped screens.kdl has `switch true slider false` lights (Deko,
+        // ACC, Decke): toggle-only, so slider=false must drop scroll-to-dim —
+        // otherwise an off light could still be scrolled on, which GTK forbids.
+        let kdl = r#"
+screen "wz" {
+    group {
+        light "Deko" {
+            device "Deko"
+            switch true
+            slider false
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![light("l1", "Deko", "lr", true, Some(60))], kdl);
+        let view = m.view();
+        let ids = ids(&view);
+        assert!(
+            ids.iter().any(|i| i == "vw-l-l1"),
+            "toggle present: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|i| i == "vw-ls-l1"),
+            "slider=false ⇒ no scroll-to-dim target: {ids:?}"
+        );
+        assert!(!has_progress(&view), "slider=false ⇒ no brightness bar");
+    }
+
+    #[test]
+    fn config_switch_false_slider_true_is_brightness_only() {
+        // switch=false, slider=true: no toggle, but still dimmable — matching
+        // GTK, where the same config yields an interactive brightness control.
+        let kdl = r#"
+screen "wz" {
+    group {
+        light "MAIN" {
+            device "LR Shelf"
+            switch false
+            slider true
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
+        let view = m.view();
+        let ids = ids(&view);
+        assert!(!ids.iter().any(|i| i == "vw-l-l1"), "no toggle: {ids:?}");
+        assert!(
+            ids.iter().any(|i| i == "vw-ls-l1"),
+            "still dimmable via scroll: {ids:?}"
+        );
+        assert!(has_progress(&view), "brightness bar shown");
+    }
+
+    #[test]
+    fn config_text_does_not_suppress_the_room_fallback() {
+        // A text banner resolves no device; if every device ref also fails, the
+        // widget must still fall back to the room layout — not hide the whole
+        // home behind a title + banner.
+        let kdl = r#"
+screen "wz" {
+    title "WZ"
+    group {
+        text "MY HOME"
+        light "X" {
+            device "Nonexistent"
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(
+            vec![light("l1", "Taklampa", "living_room", true, Some(70))],
+            kdl,
+        );
+        let all = texts(&m.view());
+        assert!(all.iter().any(|t| t == "living_room"), "fell back: {all:?}");
+        assert!(all.iter().any(|t| t == "● Taklampa"), "home shown: {all:?}");
+        assert!(
+            !all.iter().any(|t| t == "MY HOME"),
+            "banner not shown when falling back: {all:?}"
+        );
+    }
+
+    #[test]
+    fn config_text_renders_alongside_a_resolving_device() {
+        // But when a device *does* resolve, the config layout (text and all) wins.
+        let kdl = r#"
+screen "wz" {
+    title "WZ"
+    group {
+        text "MY HOME"
+        light "MAIN" {
+            device "LR Shelf"
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
+        let all = texts(&m.view());
+        assert!(all.iter().any(|t| t == "MY HOME"), "banner shown: {all:?}");
+        assert!(all.iter().any(|t| t == "● MAIN"), "device shown: {all:?}");
+    }
+
+    #[test]
+    fn config_sensor_pointing_at_an_outlet_is_read_only() {
+        // A read-only sensor slot that resolves to an actuator (a
+        // misconfiguration) must not become a clickable toggle.
+        let kdl = r#"
+screen "wz" {
+    group {
+        sensor {
+            device "Desk"
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![outlet("o1", "Desk", "lr", true)], kdl);
+        let view = m.view();
+        assert!(
+            texts(&view).iter().any(|t| t.contains("Desk")),
+            "readout shown: {:?}",
+            texts(&view)
+        );
+        assert!(
+            !ids(&view).iter().any(|i| i == "vw-o-o1"),
+            "read-only slot has no toggle: {:?}",
+            ids(&view)
+        );
+    }
+
+    #[test]
+    fn config_block_is_horizontal_and_resolves_members() {
+        let kdl = r#"
+screen "wz" {
+    group {
+        block {
+            light "Deko" {
+                device "Deko"
+                switch true
+                slider false
+            }
+            light "ACC" {
+                device "Laccent1"
+                switch true
+                slider false
+            }
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(
+            vec![
+                light("l1", "Deko", "lr", true, Some(50)),
+                light("l2", "Laccent1", "lr", false, Some(0)),
+            ],
+            kdl,
+        );
+        let view = m.view();
+        assert!(has_horizontal_block(&view), "block is a horizontal box");
+        let all = texts(&view);
+        assert!(all.iter().any(|t| t == "● Deko"), "{all:?}");
+        assert!(all.iter().any(|t| t == "○ ACC"), "{all:?}");
+    }
+
+    #[test]
+    fn config_light_pointing_at_an_outlet_adapts_to_an_outlet_row() {
+        // IKEA control outlets are often declared as `light`s; render the row
+        // the device's real state supports (same adaptation as GTK).
+        let kdl = r#"
+screen "wz" {
+    group {
+        light "Lamp" {
+            device "Desk"
+            switch true
+            slider true
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![outlet("o1", "Desk", "lr", true)], kdl);
+        let all = texts(&m.view());
+        assert!(
+            all.iter().any(|t| t == "● Lamp ⏻"),
+            "outlet glyph + name: {all:?}"
+        );
+        assert!(all.iter().any(|t| t == "4.2 W"), "live wattage: {all:?}");
+    }
+
+    #[test]
+    fn config_skips_virtual_light_groups() {
+        // A `light` ref to a virtual group must not render — its echo-less
+        // toggle would latch. It's dropped; the real light still shows.
+        let mut group = light("g1", "All LR", "lr", true, Some(100));
+        group.device_info.device_type = DeviceType::VirtualLightGroup;
+        let kdl = r#"
+screen "wz" {
+    group {
+        light "GROUP" { device "All LR" }
+        light "MAIN" { device "LR Shelf" }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(
+            vec![group, light("l1", "LR Shelf", "lr", true, Some(60))],
+            kdl,
+        );
+        let all = texts(&m.view());
+        assert!(
+            !all.iter().any(|t| t.contains("GROUP")),
+            "virtual group skipped: {all:?}"
+        );
+        assert!(
+            all.iter().any(|t| t == "● MAIN"),
+            "real light shown: {all:?}"
+        );
     }
 }

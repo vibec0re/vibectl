@@ -4071,6 +4071,7 @@ dependencies = [
  "ciborium",
  "futures-util",
  "hytte-plugin",
+ "kdl",
  "serde",
  "serde_json",
  "tokio",
