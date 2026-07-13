@@ -417,24 +417,11 @@ impl VibeWidget {
     /// the default.
     fn panel(&self, key: &str, name: &str, climate: Option<&Climate>, body: Vec<Node>) -> Node {
         let open = self.expanded.contains(key);
-        let mut header_row = vec![
-            Node::Icon {
-                id: None,
-                // The stock GTK/Adwaita expander chevrons — themed + symbolic.
-                name: if open {
-                    "pan-down-symbolic"
-                } else {
-                    "pan-end-symbolic"
-                }
-                .into(),
-                classes: vec!["vw-panel-chevron".into()],
-            },
-            Node::Label {
-                id: None,
-                text: name.to_string(),
-                classes: vec!["vw-panel-title".into(), "heading".into()],
-            },
-        ];
+        let mut header_row = vec![Node::Label {
+            id: None,
+            text: name.to_string(),
+            classes: vec!["vw-panel-title".into(), "heading".into()],
+        }];
         if let Some(peek) = climate.and_then(Climate::peek) {
             header_row.push(Node::Label {
                 id: None,
@@ -446,6 +433,20 @@ impl VibeWidget {
                 ],
             });
         }
+        // Trailing expander chevron — the Adwaita idiom: `pan-down` when
+        // collapsed (click to open downward), `pan-up` when expanded. (It sits
+        // after the text, not flush to the panel's right edge — the node vocab
+        // has no hexpand/spacer to push it there.)
+        header_row.push(Node::Icon {
+            id: None,
+            name: if open {
+                "pan-up-symbolic"
+            } else {
+                "pan-down-symbolic"
+            }
+            .into(),
+            classes: vec!["vw-panel-chevron".into()],
+        });
         Node::Box {
             id: None,
             dir: Dir::Vertical,
@@ -1119,13 +1120,13 @@ mod tests {
             light("l1", "Taklampa", "living_room", true, Some(70)),
             sensor("s1", "Klimat", "living_room"),
         ]);
-        // Collapsed by default: chevron points right (pan-end).
+        // Collapsed by default: trailing chevron points down (click to open).
         assert!(!m.expanded.contains("living_room"));
-        assert!(icons(&m.view()).iter().any(|i| i == "pan-end-symbolic"));
+        assert!(icons(&m.view()).iter().any(|i| i == "pan-down-symbolic"));
         // Climate peeks in the header (temp + humidity), promoted out of the body.
         assert!(texts(&m.view()).iter().any(|t| t == "🌡 21.4°  💧 39%"));
 
-        // Click the header → expands (chevron flips down), no server command.
+        // Click the header → expands (chevron flips up), no server command.
         let fx = m.update(Input::Event {
             node: "vw-panel-living_room".into(),
             kind: EventKind::Click,
@@ -1133,7 +1134,7 @@ mod tests {
         assert!(fx.is_empty(), "panel toggle is pure local UI");
         assert!(rx.try_recv().is_err(), "no command for a panel toggle");
         assert!(m.expanded.contains("living_room"));
-        assert!(icons(&m.view()).iter().any(|i| i == "pan-down-symbolic"));
+        assert!(icons(&m.view()).iter().any(|i| i == "pan-up-symbolic"));
 
         // Click again → collapses.
         let _ = m.update(Input::Event {
