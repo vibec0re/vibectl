@@ -7,8 +7,9 @@
 //! it — that's the whole point.
 //!
 //! Faithful miniature of the cyber web UI (`v1bectl_web`): light toggles +
-//! brightness, outlet toggles (+ live wattage), inline temp/humidity sensors,
-//! and a connection dot. Interactions:
+//! brightness, outlet toggles (+ live wattage), inline temp/humidity sensors.
+//! No header chrome — just the devices (an empty-state line shows only before
+//! devices load or when the server is down). Interactions:
 //!
 //! - **click** a light/outlet → toggle
 //! - **scroll** on a light row → brightness ±5 % (the vocab has no slider;
@@ -146,20 +147,6 @@ impl VibeWidget {
             (_, new) => new,
         };
     }
-
-    /// Physical lights + outlets currently on (groups would double-count
-    /// their members — `renders()` keeps them out of the widget entirely).
-    fn on_count(&self) -> usize {
-        self.devices
-            .iter()
-            .filter(|d| renders(d))
-            .filter(|d| match &d.state {
-                DeviceStateValue::Light(l) => l.is_on,
-                DeviceStateValue::Outlet(o) => o.is_on,
-                _ => false,
-            })
-            .count()
-    }
 }
 
 impl Plugin for VibeWidget {
@@ -209,21 +196,23 @@ impl Plugin for VibeWidget {
     }
 
     fn view(&self) -> Node {
-        let mut children = vec![self.header(), Node::Separator { classes: vec![] }];
-        if self.devices.is_empty() {
-            children.push(status_label(match self.conn {
+        // No header/status-line chrome: just the devices. The only non-device
+        // line is the empty-state message, so the widget isn't blank before
+        // devices load (or when the server is down).
+        let children = if self.devices.is_empty() {
+            vec![status_label(match self.conn {
                 Conn::Connecting => "connecting to v1bectl…",
                 Conn::Offline => "server unreachable — retrying",
                 Conn::Online => "no devices",
-            }));
+            })]
         } else {
             // Config-driven layout when `screens.kdl` resolves at least one row;
             // otherwise auto-group by room so the sidebar is never blank.
             match self.view_config() {
-                Some(body) => children.extend(body),
-                None => children.extend(self.view_rooms()),
+                Some(body) => body,
+                None => self.view_rooms(),
             }
-        }
+        };
         Node::Box {
             id: Some("vw-root".into()),
             dir: Dir::Vertical,
@@ -308,36 +297,6 @@ impl VibeWidget {
         });
     }
 
-    /// Title, connection dot, and the on-count.
-    fn header(&self) -> Node {
-        let (dot, dot_class) = match self.conn {
-            Conn::Online => ("●", "vw-online"),
-            Conn::Connecting => ("◌", "vw-connecting"),
-            Conn::Offline => ("○", "vw-offline"),
-        };
-        let mut children = vec![Node::Label {
-            id: None,
-            text: format!("{dot} v1bectl"),
-            classes: vec!["vw-title".into(), "heading".into(), dot_class.into()],
-        }];
-        let on = self.on_count();
-        if on > 0 {
-            children.push(Node::Label {
-                id: None,
-                text: format!("{on} on"),
-                classes: vec!["vw-count".into(), "dim-label".into(), "numeric".into()],
-            });
-        }
-        Node::Box {
-            id: None,
-            dir: Dir::Horizontal,
-            spacing: 8,
-            scroll: false,
-            classes: vec!["vw-header".into()],
-            children,
-        }
-    }
-
     /// Devices grouped by room (`device_groups.first()`), rooms and devices
     /// each alphabetical.
     fn rooms(&self) -> BTreeMap<String, Vec<&DeviceState>> {
@@ -413,11 +372,14 @@ impl VibeWidget {
                 }
             }
             if !groups.is_empty() {
-                out.push(Node::Label {
-                    id: None,
-                    text: screen.title.clone(),
-                    classes: vec!["vw-screen".into(), "heading".into()],
-                });
+                // Only a screen that declared a `title` gets a header label.
+                if let Some(title) = &screen.title {
+                    out.push(Node::Label {
+                        id: None,
+                        text: title.clone(),
+                        classes: vec!["vw-screen".into(), "heading".into()],
+                    });
+                }
                 out.extend(groups);
             }
         }
@@ -915,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn view_groups_by_room_and_counts_on_devices() {
+    fn view_groups_by_room_no_header_chrome() {
         let (m, _rx) = model_with(vec![
             light("l1", "Taklampa", "living_room", true, Some(70)),
             light("l2", "Sänglampa", "bedroom", false, Some(30)),
@@ -923,12 +885,11 @@ mod tests {
             sensor("s1", "Klimat", "living_room"),
         ]);
         let all = texts(&m.view());
-        // Rooms alphabetical, devices alphabetical within each.
+        // No header/status line: straight into rooms (alphabetical), devices
+        // alphabetical within each.
         assert_eq!(
             all,
             vec![
-                "● v1bectl",
-                "2 on",
                 "bedroom",
                 "● Skrivbord ⏻",
                 "4.2 W",
@@ -1033,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn virtual_light_groups_are_not_rendered_or_counted() {
+    fn virtual_light_groups_are_not_rendered() {
         let mut group = light("g1", "Bedroom Lights", "virtual", true, Some(100));
         group.device_info.device_type = DeviceType::VirtualLightGroup;
         let (mut m, rx) = model_with(vec![
@@ -1046,8 +1007,8 @@ mod tests {
             "the server's virtual path emits no event echo — groups stay off the widget"
         );
         assert!(
-            all.iter().any(|t| t == "1 on"),
-            "groups don't inflate the count: {all:?}"
+            all.iter().any(|t| t == "● Taklampa"),
+            "the physical light still renders: {all:?}"
         );
         // Defensively: even a synthetic event on a group id sends nothing.
         let _ = m.update(Input::Event {
@@ -1263,6 +1224,31 @@ screen "wz" {
         assert!(
             all.iter().any(|t| t.contains('🌡') && !t.contains('💧')),
             "humidity gated off: {all:?}"
+        );
+    }
+
+    #[test]
+    fn config_omitted_title_renders_no_header() {
+        // A screen with no `title` node shows no header — not even the screen
+        // name. (Removing `title "…"` from the KDL removes it from the widget.)
+        let kdl = r#"
+screen "wohnzimmer" {
+    group {
+        light "MAIN" {
+            device "LR Shelf"
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
+        let all = texts(&m.view());
+        assert!(
+            !all.iter().any(|t| t == "wohnzimmer"),
+            "screen name not rendered as a title: {all:?}"
+        );
+        assert!(
+            all.iter().any(|t| t == "● MAIN"),
+            "device still shown: {all:?}"
         );
     }
 

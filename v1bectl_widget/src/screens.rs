@@ -20,11 +20,14 @@ use kdl::KdlDocument;
 
 // ── Config model ─────────────────────────────────────────────────────────────
 
-/// A named screen: a title plus an ordered list of groups.
+/// A named screen: an *optional* title plus an ordered list of groups. `title`
+/// is `None` when the KDL omits the `title` node — so dropping `title "…"`
+/// from a screen drops the header from the widget, rather than falling back to
+/// the screen name.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Screen {
     pub name: String,
-    pub title: String,
+    pub title: Option<String>,
     pub groups: Vec<Group>,
 }
 
@@ -162,11 +165,8 @@ fn parse_screen(node: &kdl::KdlNode) -> Result<Screen, String> {
 
     let children = node.children();
 
-    // `title` child, defaulting to the screen name.
-    let title = children
-        .and_then(|c| c.get("title"))
-        .and_then(first_string)
-        .unwrap_or_else(|| name.clone());
+    // `title` child, if any — no default: an absent `title` renders no header.
+    let title = children.and_then(|c| c.get("title")).and_then(first_string);
 
     let groups = children
         .map(|c| {
@@ -300,13 +300,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_title_and_defaults_to_name() {
+    fn title_is_present_only_when_declared() {
         let with_title = parse_screens(r#"screen "lr" { title "Living Room" }"#).unwrap();
         assert_eq!(with_title[0].name, "lr");
-        assert_eq!(with_title[0].title, "Living Room");
+        assert_eq!(with_title[0].title.as_deref(), Some("Living Room"));
 
+        // No `title` node → None (not defaulted to the name), so nothing renders.
         let no_title = parse_screens(r#"screen "bedroom" {}"#).unwrap();
-        assert_eq!(no_title[0].title, "bedroom");
+        assert_eq!(no_title[0].title, None);
     }
 
     #[test]
@@ -321,7 +322,7 @@ screen "s" { title "S" }
         )
         .unwrap();
         assert_eq!(screens.len(), 1);
-        assert_eq!(screens[0].title, "S");
+        assert_eq!(screens[0].title.as_deref(), Some("S"));
     }
 
     #[test]
