@@ -318,14 +318,14 @@ impl VibeWidget {
         let mut children = vec![Node::Label {
             id: None,
             text: format!("{dot} v1bectl"),
-            classes: vec!["vw-title".into(), dot_class.into()],
+            classes: vec!["vw-title".into(), "heading".into(), dot_class.into()],
         }];
         let on = self.on_count();
         if on > 0 {
             children.push(Node::Label {
                 id: None,
                 text: format!("{on} on"),
-                classes: vec!["vw-count".into()],
+                classes: vec!["vw-count".into(), "dim-label".into(), "numeric".into()],
             });
         }
         Node::Box {
@@ -369,7 +369,11 @@ impl VibeWidget {
             out.push(Node::Label {
                 id: None,
                 text: room,
-                classes: vec!["vw-room".into()],
+                classes: vec![
+                    "vw-room".into(),
+                    "dim-label".into(),
+                    "caption-heading".into(),
+                ],
             });
             for dev in devices {
                 if let Some(row) = device_row(dev, &RowOpts::auto(dev)) {
@@ -412,7 +416,7 @@ impl VibeWidget {
                 out.push(Node::Label {
                     id: None,
                     text: screen.title.clone(),
-                    classes: vec!["vw-screen".into()],
+                    classes: vec!["vw-screen".into(), "heading".into()],
                 });
                 out.extend(groups);
             }
@@ -493,7 +497,7 @@ impl VibeWidget {
                 Element::Text { template } => out.push(Node::Label {
                     id: None,
                     text: template.clone(),
-                    classes: vec!["vw-text".into()],
+                    classes: vec!["vw-text".into(), "dim-label".into()],
                 }),
                 Element::Block { elements } => {
                     let cells: Vec<Node> = elements
@@ -554,7 +558,7 @@ fn status_label(text: &str) -> Node {
     Node::Label {
         id: None,
         text: text.to_string(),
-        classes: vec!["vw-status".into()],
+        classes: vec!["vw-status".into(), "dim-label".into()],
     }
 }
 
@@ -631,7 +635,7 @@ fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
             let head = if opts.allow_toggle {
                 Node::Button {
                     id: format!("vw-l-{id}"),
-                    classes: vec!["vw-toggle".into()],
+                    classes: vec!["vw-toggle".into(), "flat".into()],
                     child: Box::new(label),
                 }
             } else {
@@ -691,7 +695,7 @@ fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
             let head = if opts.allow_toggle {
                 Node::Button {
                     id: format!("vw-o-{id}"),
-                    classes: vec!["vw-toggle".into()],
+                    classes: vec!["vw-toggle".into(), "flat".into()],
                     child: Box::new(label),
                 }
             } else {
@@ -702,7 +706,7 @@ fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
                 children.push(Node::Label {
                     id: None,
                     text: format!("{w:.1} W"),
-                    classes: vec!["vw-watts".into()],
+                    classes: vec!["vw-watts".into(), "dim-label".into(), "numeric".into()],
                 });
             }
             Node::Box {
@@ -729,7 +733,11 @@ fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
                     parts.push(format!("💧 {h:.0}%"));
                 }
             }
-            let mut classes = vec!["vw-row".to_string(), "vw-sensor".to_string()];
+            let mut classes = vec![
+                "vw-row".to_string(),
+                "vw-sensor".to_string(),
+                "dim-label".to_string(),
+            ];
             classes.extend(offline_class);
             Node::Label {
                 id: None,
