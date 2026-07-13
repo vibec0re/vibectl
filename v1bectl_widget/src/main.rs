@@ -14,6 +14,7 @@
 //! - **click** a light/outlet → toggle
 //! - **scroll** on a light row → brightness ±5 % (the vocab has no slider;
 //!   scroll-to-adjust is the shell-native idiom anyway)
+//! - **click** a panel header → expand / collapse that section
 //!
 //! # Layout
 //!
@@ -23,6 +24,11 @@
 //! and per-element `switch`/`slider`/`show-temp`/`show-humidity` flags.
 //! Otherwise — or if none of the config's device refs resolve — it falls back
 //! to auto-grouping every device by room, so the sidebar is never blank.
+//!
+//! Either way, each top-level section (a screen, or a room) is a **collapsible
+//! panel**: a clickable header (chevron + name + a climate peek) over a
+//! `Revealer` of its devices. Collapsed by default; the expanded set is local
+//! UI state the reducer flips on a header click.
 //!
 //! # Shape
 //!
@@ -41,7 +47,7 @@ mod screens;
 mod ws;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
@@ -69,6 +75,11 @@ struct VibeWidget {
     /// The curated layout from `screens.kdl` (empty ⇒ auto-group by room). Read
     /// once at startup; the device list it renders arrives live over the WS.
     screens: Vec<Screen>,
+    /// Which section panels are currently expanded (by key: screen name / room).
+    /// Empty = all collapsed, the default — panels reveal on click. Pure local
+    /// UI state; a click toggles it and the reducer's re-render opens/closes the
+    /// `Revealer`. No server round-trip.
+    expanded: HashSet<String>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
     /// Fractional scroll accumulated per light, so touchpad smooth-scroll
     /// deltas (dozens of sub-1.0 events per swipe) fold into whole notches
@@ -165,6 +176,7 @@ impl Plugin for VibeWidget {
             conn: Conn::Connecting,
             devices: Vec::new(),
             screens: screens::load(),
+            expanded: HashSet::new(),
             cmd_tx,
             scroll_accum: HashMap::new(),
             pending_bright: HashMap::new(),
@@ -250,6 +262,11 @@ impl VibeWidget {
                     });
                 }
             }
+        } else if let Some(key) = node.strip_prefix("vw-panel-") {
+            // Toggle a section panel open/closed — pure local UI, no server hop.
+            if matches!(kind, EventKind::Click) && !self.expanded.remove(key) {
+                self.expanded.insert(key.to_string());
+            }
         }
     }
 
@@ -319,47 +336,53 @@ impl VibeWidget {
         rooms
     }
 
-    /// The default layout: every renderable device, grouped by room and
-    /// alphabetical. Used when no `screens.kdl` is configured — or when none of
-    /// its device refs resolve, so the widget still shows the home.
+    /// The default layout: every renderable device grouped into a collapsible
+    /// panel per room (alphabetical). Used when no `screens.kdl` is configured
+    /// — or when none of its refs resolve, so the widget still shows the home.
     fn view_rooms(&self) -> Vec<Node> {
-        let mut out = Vec::new();
-        for (room, devices) in self.rooms() {
-            out.push(left(Node::Label {
-                id: None,
-                text: room,
-                classes: vec![
-                    "vw-room".into(),
-                    "dim-label".into(),
-                    "caption-heading".into(),
-                ],
-            }));
-            for dev in devices {
-                if let Some(row) = device_row(dev, &RowOpts::auto(dev)) {
-                    out.push(row);
-                }
-            }
-        }
-        out
+        self.rooms()
+            .into_iter()
+            .map(|(room, devices)| {
+                // Promote the room's climate sensor into the header and drop it
+                // from the body, so temp/humidity isn't shown twice.
+                let climate = devices
+                    .iter()
+                    .find_map(|d| Climate::of(&d.device_id, &d.state));
+                let skip = climate.as_ref().map(|c| c.id.as_str());
+                let body: Vec<Node> = devices
+                    .iter()
+                    .filter(|d| Some(d.device_id.as_str()) != skip)
+                    .filter_map(|dev| device_row(dev, &RowOpts::auto(dev)))
+                    .collect();
+                self.panel(&room, &room, climate.as_ref(), body)
+            })
+            .collect()
     }
 
-    /// Render the configured screens, or `None` when no layout is loaded or
-    /// none of its refs resolve against the live device list (→ caller falls
-    /// back to [`Self::view_rooms`]). A screen contributes its title only when
-    /// at least one of its groups yields a row, so refs the server doesn't
-    /// (yet) know about leave no empty headers behind.
+    /// Render the configured screens as collapsible panels — one per screen —
+    /// or `None` when no layout is loaded or none of its refs resolve against
+    /// the live device list (→ caller falls back to [`Self::view_rooms`]). A
+    /// screen becomes a panel only when at least one of its groups yields a
+    /// row, so refs the server doesn't (yet) know about leave no empty panels.
     fn view_config(&self) -> Option<Vec<Node>> {
         if self.screens.is_empty() {
             return None;
         }
         let mut out = Vec::new();
         // How many actual *device* rows resolved. Text and empty blocks don't
-        // count — a title/banner-only screen must not suppress the fallback.
+        // count — a banner-only screen must not suppress the fallback.
         let mut resolved = 0usize;
-        for screen in &self.screens {
+        for (i, screen) in self.screens.iter().enumerate() {
+            // Promote the screen's first climate sensor into the header; it then
+            // counts as resolved and is dropped from the body (no duplicate row).
+            let climate = self.screen_climate(screen);
+            if climate.is_some() {
+                resolved += 1;
+            }
+            let skip = climate.as_ref().map(|c| c.id.as_str());
             let mut groups = Vec::new();
             for group in &screen.groups {
-                let rows = self.render_elements(&group.elements, &mut resolved);
+                let rows = self.render_elements(&group.elements, &mut resolved, skip);
                 if !rows.is_empty() {
                     groups.push(Node::Box {
                         id: None,
@@ -371,32 +394,141 @@ impl VibeWidget {
                     });
                 }
             }
-            if !groups.is_empty() {
-                // Only a screen that declared a `title` gets a header label.
-                if let Some(title) = &screen.title {
-                    out.push(left(Node::Label {
-                        id: None,
-                        text: title.clone(),
-                        classes: vec!["vw-screen".into(), "heading".into()],
-                    }));
-                }
-                out.extend(groups);
+            if !groups.is_empty() || climate.is_some() {
+                // Key by index, not name: two screens may share a name, and the
+                // key is both the toggle-event id and the expanded-set entry, so
+                // it must be unique — else clicking one panel toggles both.
+                let key = format!("screen-{i}");
+                let name = screen.title.as_deref().unwrap_or(&screen.name);
+                out.push(self.panel(&key, name, climate.as_ref(), groups));
             }
         }
         // Fall back to the room layout when the config resolved *no* real
         // device — otherwise a config that only names devices the server
         // doesn't know (a stale/renamed config) would hide the whole home
-        // behind its titles and text banners.
+        // behind its panels and text banners.
         (resolved > 0).then_some(out)
     }
 
+    /// A collapsible section panel: a full-width, flat, clickable header — an
+    /// Adwaita expander chevron (stock symbolic icon), the section `name`, and
+    /// a climate peek — over a `Revealer` holding `body`. `key` addresses the
+    /// toggle event (`vw-panel-{key}`) and keys the expanded set; collapsed is
+    /// the default.
+    fn panel(&self, key: &str, name: &str, climate: Option<&Climate>, body: Vec<Node>) -> Node {
+        let open = self.expanded.contains(key);
+        let mut header_row = vec![
+            Node::Icon {
+                id: None,
+                // The stock GTK/Adwaita expander chevrons — themed + symbolic.
+                name: if open {
+                    "pan-down-symbolic"
+                } else {
+                    "pan-end-symbolic"
+                }
+                .into(),
+                classes: vec!["vw-panel-chevron".into()],
+            },
+            Node::Label {
+                id: None,
+                text: name.to_string(),
+                classes: vec!["vw-panel-title".into(), "heading".into()],
+            },
+        ];
+        if let Some(peek) = climate.and_then(Climate::peek) {
+            header_row.push(Node::Label {
+                id: None,
+                text: peek,
+                classes: vec![
+                    "vw-panel-climate".into(),
+                    "dim-label".into(),
+                    "numeric".into(),
+                ],
+            });
+        }
+        Node::Box {
+            id: None,
+            dir: Dir::Vertical,
+            spacing: 4,
+            scroll: false,
+            classes: vec!["vw-panel".into()],
+            children: vec![
+                Node::Button {
+                    id: format!("vw-panel-{key}"),
+                    classes: vec!["vw-panel-header".into(), "flat".into()],
+                    child: Box::new(Node::Box {
+                        id: None,
+                        dir: Dir::Horizontal,
+                        spacing: 6,
+                        scroll: false,
+                        classes: vec!["vw-panel-header-row".into()],
+                        children: header_row,
+                    }),
+                },
+                Node::Revealer {
+                    id: None,
+                    open,
+                    child: Box::new(Node::Box {
+                        id: None,
+                        dir: Dir::Vertical,
+                        spacing: 4,
+                        scroll: false,
+                        classes: vec!["vw-panel-body".into()],
+                        children: body,
+                    }),
+                },
+            ],
+        }
+    }
+
+    /// The climate to promote into a screen's panel header: the first sensor
+    /// element that resolves to a sensor with something to show (honoring its
+    /// `show-temp` / `show-humidity` flags), searched depth-first through blocks.
+    fn screen_climate(&self, screen: &Screen) -> Option<Climate> {
+        screen
+            .groups
+            .iter()
+            .flat_map(|g| &g.elements)
+            .find_map(|el| self.element_climate(el))
+    }
+
+    fn element_climate(&self, element: &Element) -> Option<Climate> {
+        match element {
+            Element::Sensor {
+                device_ref,
+                show_temp,
+                show_humidity,
+            } => {
+                let dev = self.resolve(device_ref)?;
+                let DeviceStateValue::Sensor(s) = &dev.state else {
+                    return None;
+                };
+                let temp = if *show_temp { s.temperature } else { None };
+                let humidity = if *show_humidity { s.humidity } else { None };
+                (temp.is_some() || humidity.is_some()).then(|| Climate {
+                    id: dev.device_id.clone(),
+                    temp,
+                    humidity,
+                })
+            }
+            Element::Block { elements } => elements.iter().find_map(|e| self.element_climate(e)),
+            _ => None,
+        }
+    }
+
     /// Turn config elements into rows, resolving each device ref against the
-    /// live list and skipping the ones we don't have (yet). Bumps `resolved`
-    /// once per device row actually produced (not for text or empty blocks) so
-    /// the caller can tell "the config rendered the home" from "the config
-    /// rendered only decoration". A `block` lays its resolved children out
-    /// horizontally, mirroring the GTK/web renderers.
-    fn render_elements(&self, elements: &[Element], resolved: &mut usize) -> Vec<Node> {
+    /// live list and skipping the ones we don't have (yet). `skip` is the device
+    /// id promoted into the panel header (its sensor row is dropped so it isn't
+    /// shown twice). Bumps `resolved` once per device row actually produced (not
+    /// for text or empty blocks) so the caller can tell "the config rendered the
+    /// home" from "the config rendered only decoration". A `block` lays its
+    /// resolved children out horizontally, mirroring the GTK/web renderers.
+    fn render_elements(
+        &self,
+        elements: &[Element],
+        resolved: &mut usize,
+        skip: Option<&str>,
+    ) -> Vec<Node> {
         let mut out = Vec::new();
         for element in elements {
             match element {
@@ -441,18 +573,21 @@ impl VibeWidget {
                     show_humidity,
                 } => {
                     if let Some(dev) = self.resolve(device_ref) {
-                        // A sensor slot is read-only: never emit a toggle, even
-                        // if the ref points at an actuator (a misconfiguration).
-                        let opts = RowOpts {
-                            name: &dev.device_info.name,
-                            allow_toggle: false,
-                            show_slider: false,
-                            show_temp: *show_temp,
-                            show_humidity: *show_humidity,
-                        };
-                        if let Some(row) = device_row(dev, &opts) {
-                            *resolved += 1;
-                            out.push(row);
+                        // Drop the sensor promoted into the panel header (`skip`)
+                        // so it isn't also a body row. A sensor slot is read-only:
+                        // never a toggle, even if the ref points at an actuator.
+                        if Some(dev.device_id.as_str()) != skip {
+                            let opts = RowOpts {
+                                name: &dev.device_info.name,
+                                allow_toggle: false,
+                                show_slider: false,
+                                show_temp: *show_temp,
+                                show_humidity: *show_humidity,
+                            };
+                            if let Some(row) = device_row(dev, &opts) {
+                                *resolved += 1;
+                                out.push(row);
+                            }
                         }
                     }
                 }
@@ -465,7 +600,8 @@ impl VibeWidget {
                     let cells: Vec<Node> = elements
                         .iter()
                         .filter_map(|el| {
-                            let sub = self.render_elements(std::slice::from_ref(el), resolved);
+                            let sub =
+                                self.render_elements(std::slice::from_ref(el), resolved, skip);
                             (!sub.is_empty()).then(|| Node::Box {
                                 id: None,
                                 dir: Dir::Vertical,
@@ -539,6 +675,48 @@ fn status_label(text: &str) -> Node {
         text: text.to_string(),
         classes: vec!["vw-status".into(), "dim-label".into()],
     })
+}
+
+/// A section's climate, promoted into its panel header (temp + humidity) and
+/// dropped from the body so it isn't shown twice. `id` is the sensor device to
+/// omit from the rows.
+struct Climate {
+    id: String,
+    temp: Option<f32>,
+    humidity: Option<f32>,
+}
+
+impl Climate {
+    /// The climate to promote for a raw sensor device (the auto/room layout —
+    /// both readings shown). `None` unless it's a sensor with something to show.
+    fn of(id: &str, state: &DeviceStateValue) -> Option<Self> {
+        match state {
+            DeviceStateValue::Sensor(s) if s.temperature.is_some() || s.humidity.is_some() => {
+                Some(Climate {
+                    id: id.to_string(),
+                    temp: s.temperature,
+                    humidity: s.humidity,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The header peek string — `🌡 23.9°  💧 39%`, whichever readings are
+    /// present — or `None` if neither is.
+    fn peek(&self) -> Option<String> {
+        let mut s = String::new();
+        if let Some(t) = self.temp {
+            s.push_str(&format!("🌡 {t:.1}°"));
+        }
+        if let Some(h) = self.humidity {
+            if !s.is_empty() {
+                s.push_str("  ");
+            }
+            s.push_str(&format!("💧 {h:.0}%"));
+        }
+        (!s.is_empty()).then_some(s)
+    }
 }
 
 /// Per-row display options. The auto layout ([`RowOpts::auto`]) uses the
@@ -859,6 +1037,21 @@ mod tests {
         }
     }
 
+    /// Every `Icon` name in a tree (e.g. the panel chevron `pan-end-symbolic`).
+    fn icons(node: &Node) -> Vec<String> {
+        fn walk(node: &Node, out: &mut Vec<String>) {
+            match node {
+                Node::Icon { name, .. } => out.push(name.clone()),
+                Node::Box { children, .. } => children.iter().for_each(|c| walk(c, out)),
+                Node::Button { child, .. } | Node::Revealer { child, .. } => walk(child, out),
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(node, &mut out);
+        out
+    }
+
     /// Is there a horizontal `vw-block` box (a KDL `block`) in the tree?
     fn has_horizontal_block(node: &Node) -> bool {
         match node {
@@ -894,7 +1087,7 @@ mod tests {
     }
 
     #[test]
-    fn view_groups_by_room_no_header_chrome() {
+    fn view_groups_by_room_into_panels() {
         let (m, _rx) = model_with(vec![
             light("l1", "Taklampa", "living_room", true, Some(70)),
             light("l2", "Sänglampa", "bedroom", false, Some(30)),
@@ -902,8 +1095,10 @@ mod tests {
             sensor("s1", "Klimat", "living_room"),
         ]);
         let all = texts(&m.view());
-        // No header/status line: straight into rooms (alphabetical), devices
-        // alphabetical within each.
+        // One collapsible panel per room (alphabetical): a name + climate-peek
+        // header (the room's sensor promoted out of the body — no duplicate
+        // "Klimat" row), then its devices. All present in the tree; the
+        // collapsed Revealer just hides them at render time.
         assert_eq!(
             all,
             vec![
@@ -912,10 +1107,158 @@ mod tests {
                 "4.2 W",
                 "○ Sänglampa",
                 "living_room",
-                "Klimat  🌡 21.4°  💧 39%",
+                "🌡 21.4°  💧 39%",
                 "● Taklampa",
             ]
         );
+    }
+
+    #[test]
+    fn clicking_a_panel_header_toggles_it_open() {
+        let (mut m, mut rx) = model_with(vec![
+            light("l1", "Taklampa", "living_room", true, Some(70)),
+            sensor("s1", "Klimat", "living_room"),
+        ]);
+        // Collapsed by default: chevron points right (pan-end).
+        assert!(!m.expanded.contains("living_room"));
+        assert!(icons(&m.view()).iter().any(|i| i == "pan-end-symbolic"));
+        // Climate peeks in the header (temp + humidity), promoted out of the body.
+        assert!(texts(&m.view()).iter().any(|t| t == "🌡 21.4°  💧 39%"));
+
+        // Click the header → expands (chevron flips down), no server command.
+        let fx = m.update(Input::Event {
+            node: "vw-panel-living_room".into(),
+            kind: EventKind::Click,
+        });
+        assert!(fx.is_empty(), "panel toggle is pure local UI");
+        assert!(rx.try_recv().is_err(), "no command for a panel toggle");
+        assert!(m.expanded.contains("living_room"));
+        assert!(icons(&m.view()).iter().any(|i| i == "pan-down-symbolic"));
+
+        // Click again → collapses.
+        let _ = m.update(Input::Event {
+            node: "vw-panel-living_room".into(),
+            kind: EventKind::Click,
+        });
+        assert!(!m.expanded.contains("living_room"));
+    }
+
+    #[test]
+    fn config_promotes_climate_sensor_out_of_the_body() {
+        // The climate sensor peeks in the panel header and is NOT also a row.
+        let kdl = r#"
+screen "wz" {
+    title "Wohnzimmer"
+    group {
+        sensor {
+            device "Klima"
+            show-temp true
+            show-humidity true
+        }
+        light "MAIN" {
+            device "LR Shelf"
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(
+            vec![
+                sensor("s1", "Klima", "lr"),
+                light("l1", "LR Shelf", "lr", true, Some(60)),
+            ],
+            kdl,
+        );
+        let all = texts(&m.view());
+        assert!(
+            all.iter().any(|t| t == "🌡 21.4°  💧 39%"),
+            "climate in header: {all:?}"
+        );
+        assert!(
+            !all.iter().any(|t| t.contains("Klima")),
+            "no duplicate sensor row: {all:?}"
+        );
+        assert!(
+            all.iter().any(|t| t.contains("Wohnzimmer")),
+            "title header: {all:?}"
+        );
+    }
+
+    #[test]
+    fn panel_climate_honors_the_sensor_show_flags() {
+        // show-temp false must not leak temperature into the header peek — the
+        // same suppression the sensor row already honors.
+        let kdl = r#"
+screen "wz" {
+    group {
+        sensor {
+            device "Klima"
+            show-temp false
+            show-humidity true
+        }
+        light "MAIN" {
+            device "LR Shelf"
+        }
+    }
+}
+"#;
+        let (m, _rx) = model_with_config(
+            vec![
+                sensor("s1", "Klima", "lr"),
+                light("l1", "LR Shelf", "lr", true, Some(60)),
+            ],
+            kdl,
+        );
+        let all = texts(&m.view());
+        assert!(all.iter().any(|t| t == "💧 39%"), "humidity peek: {all:?}");
+        assert!(
+            !all.iter().any(|t| t.contains('🌡')),
+            "show-temp false → no temperature anywhere: {all:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_screen_names_get_independent_panels() {
+        // Two screens sharing a name must not share a toggle — panels are keyed
+        // by index, so each gets its own id and expanded entry.
+        let kdl = r#"
+screen "wz" {
+    group {
+        light "A" {
+            device "LR Shelf"
+        }
+    }
+}
+screen "wz" {
+    group {
+        light "B" {
+            device "Office"
+        }
+    }
+}
+"#;
+        let (mut m, _rx) = model_with_config(
+            vec![
+                light("l1", "LR Shelf", "lr", true, Some(60)),
+                light("l2", "Office", "office", false, Some(0)),
+            ],
+            kdl,
+        );
+        let idset = ids(&m.view());
+        assert!(
+            idset.iter().any(|i| i == "vw-panel-screen-0"),
+            "distinct keys: {idset:?}"
+        );
+        assert!(
+            idset.iter().any(|i| i == "vw-panel-screen-1"),
+            "distinct keys: {idset:?}"
+        );
+        // Toggling the first leaves the second collapsed.
+        let _ = m.update(Input::Event {
+            node: "vw-panel-screen-0".into(),
+            kind: EventKind::Click,
+        });
+        assert!(m.expanded.contains("screen-0"));
+        assert!(!m.expanded.contains("screen-1"), "panels are independent");
     }
 
     #[test]
@@ -1230,7 +1573,11 @@ screen "wz" {
             kdl,
         );
         let all = texts(&m.view());
-        assert!(all.iter().any(|t| t == "NEST :: WOHNZIMMER"), "{all:?}");
+        // The screen title is now the panel header (chevron + title + climate).
+        assert!(
+            all.iter().any(|t| t.contains("NEST :: WOHNZIMMER")),
+            "{all:?}"
+        );
         // The light shows its CONFIG label, not the device's own name.
         assert!(all.iter().any(|t| t == "● MAIN"), "config label: {all:?}");
         assert!(
@@ -1245,9 +1592,9 @@ screen "wz" {
     }
 
     #[test]
-    fn config_omitted_title_renders_no_header() {
-        // A screen with no `title` node shows no header — not even the screen
-        // name. (Removing `title "…"` from the KDL removes it from the widget.)
+    fn config_omitted_title_labels_the_panel_with_the_screen_name() {
+        // A panel needs a header (it's the collapse control); with no `title`
+        // node it falls back to the screen name for the label.
         let kdl = r#"
 screen "wohnzimmer" {
     group {
@@ -1260,8 +1607,8 @@ screen "wohnzimmer" {
         let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
         let all = texts(&m.view());
         assert!(
-            !all.iter().any(|t| t == "wohnzimmer"),
-            "screen name not rendered as a title: {all:?}"
+            all.iter().any(|t| t == "wohnzimmer"),
+            "panel labelled by screen name: {all:?}"
         );
         assert!(
             all.iter().any(|t| t == "● MAIN"),
@@ -1277,12 +1624,16 @@ screen "wohnzimmer" {
             kdl,
         );
         let all = texts(&m.view());
-        // Nothing in the config resolves → auto room layout (never blank).
-        assert!(all.iter().any(|t| t == "living_room"), "fell back: {all:?}");
+        // Nothing in the config resolves → auto room layout (never blank), as
+        // room panels.
+        assert!(
+            all.iter().any(|t| t.contains("living_room")),
+            "fell back: {all:?}"
+        );
         assert!(all.iter().any(|t| t == "● Taklampa"), "{all:?}");
         assert!(
-            !all.iter().any(|t| t == "WZ"),
-            "no config title when falling back: {all:?}"
+            !all.iter().any(|t| t.contains("WZ")),
+            "no config panel when falling back: {all:?}"
         );
     }
 
@@ -1436,7 +1787,10 @@ screen "wz" {
             kdl,
         );
         let all = texts(&m.view());
-        assert!(all.iter().any(|t| t == "living_room"), "fell back: {all:?}");
+        assert!(
+            all.iter().any(|t| t.contains("living_room")),
+            "fell back: {all:?}"
+        );
         assert!(all.iter().any(|t| t == "● Taklampa"), "home shown: {all:?}");
         assert!(
             !all.iter().any(|t| t == "MY HOME"),
