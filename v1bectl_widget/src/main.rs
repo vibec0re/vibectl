@@ -325,7 +325,7 @@ impl VibeWidget {
     fn view_rooms(&self) -> Vec<Node> {
         let mut out = Vec::new();
         for (room, devices) in self.rooms() {
-            out.push(Node::Label {
+            out.push(left(Node::Label {
                 id: None,
                 text: room,
                 classes: vec![
@@ -333,7 +333,7 @@ impl VibeWidget {
                     "dim-label".into(),
                     "caption-heading".into(),
                 ],
-            });
+            }));
             for dev in devices {
                 if let Some(row) = device_row(dev, &RowOpts::auto(dev)) {
                     out.push(row);
@@ -374,11 +374,11 @@ impl VibeWidget {
             if !groups.is_empty() {
                 // Only a screen that declared a `title` gets a header label.
                 if let Some(title) = &screen.title {
-                    out.push(Node::Label {
+                    out.push(left(Node::Label {
                         id: None,
                         text: title.clone(),
                         classes: vec!["vw-screen".into(), "heading".into()],
-                    });
+                    }));
                 }
                 out.extend(groups);
             }
@@ -456,11 +456,11 @@ impl VibeWidget {
                         }
                     }
                 }
-                Element::Text { template } => out.push(Node::Label {
+                Element::Text { template } => out.push(left(Node::Label {
                     id: None,
                     text: template.clone(),
                     classes: vec!["vw-text".into(), "dim-label".into()],
-                }),
+                })),
                 Element::Block { elements } => {
                     let cells: Vec<Node> = elements
                         .iter()
@@ -516,12 +516,29 @@ fn renders(dev: &DeviceState) -> bool {
     }
 }
 
+/// Left-align a node. A `gtk::Label` that's a direct child of a vertical box
+/// fills the width and centres its text (GTK default `xalign 0.5`), and the
+/// widget vocabulary exposes no alignment / halign field. Packing it into a
+/// *horizontal* box instead makes it take its natural width at the start —
+/// i.e. flush left. (The device rows are already horizontal; this is for the
+/// standalone labels: screen titles, room headers, sensors, status, text.)
+fn left(node: Node) -> Node {
+    Node::Box {
+        id: None,
+        dir: Dir::Horizontal,
+        spacing: 0,
+        scroll: false,
+        classes: vec![],
+        children: vec![node],
+    }
+}
+
 fn status_label(text: &str) -> Node {
-    Node::Label {
+    left(Node::Label {
         id: None,
         text: text.to_string(),
         classes: vec!["vw-status".into(), "dim-label".into()],
-    }
+    })
 }
 
 /// Per-row display options. The auto layout ([`RowOpts::auto`]) uses the
@@ -701,11 +718,11 @@ fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
                 "dim-label".to_string(),
             ];
             classes.extend(offline_class);
-            Node::Label {
+            left(Node::Label {
                 id: None,
                 text: parts.join("  "),
                 classes,
-            }
+            })
         }
         _ => return None,
     };
