@@ -12,8 +12,7 @@
 //! devices load or when the server is down). Interactions:
 //!
 //! - **click** a light/outlet → toggle
-//! - **scroll** on a light row → brightness ±5 % (the vocab has no slider;
-//!   scroll-to-adjust is the shell-native idiom anyway)
+//! - **drag / scroll / key** a light's brightness `Slider` → set level
 //! - **click** a panel header → expand / collapse that section
 //!
 //! # Layout
@@ -35,9 +34,8 @@
 //! Pure TEA over the SDK: [`VibeWidget`] (model) + `update` + `view`. The
 //! widget's own I/O — the CBOR-over-WebSocket client to `v1bectl_server`
 //! (`ws.rs`) — reports in through `sources()` as [`Input::App`], and takes
-//! commands from the reducer through a channel the model owns. (The
-//! init-parks-receiver / model-owns-sender pattern; a sanctioned SDK lane is
-//! proposed as trollshell#280.)
+//! commands from the reducer over the SDK's command lane (trollshell#280):
+//! `init` keeps the sender, `sources` hands the paired receiver to the WS task.
 //!
 //! State is never mutated locally on click: the server applies optimistic
 //! updates and echoes a `DeviceEvent`, which is the single source of truth —
@@ -46,7 +44,7 @@
 mod screens;
 mod ws;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
@@ -57,8 +55,8 @@ use v1bectl_state::{DeviceState, DeviceStateValue, DeviceType, EventType};
 use screens::{DeviceRef, Element, Screen};
 use ws::{Cmd, Conn, WsMsg};
 
-/// How much one scroll notch changes brightness (percent).
-const BRIGHTNESS_STEP: i16 = 5;
+/// The brightness slider's keyboard/scroll step (percent).
+const BRIGHTNESS_STEP: f64 = 5.0;
 
 /// The model: connection state + the device list, patched by server events.
 struct VibeWidget {
@@ -73,15 +71,6 @@ struct VibeWidget {
     /// `Revealer`. No server round-trip.
     expanded: HashSet<String>,
     cmd_tx: mpsc::UnboundedSender<Cmd>,
-    /// Fractional scroll accumulated per light, so touchpad smooth-scroll
-    /// deltas (dozens of sub-1.0 events per swipe) fold into whole notches
-    /// instead of each slamming a full step.
-    scroll_accum: HashMap<String, f64>,
-    /// The brightness we last *asked* for, per light — the base for the next
-    /// scroll step while the server's echo is still in flight (otherwise a
-    /// burst of notches all compute from the same stale model value).
-    /// Cleared when a state patch for the device arrives.
-    pending_bright: HashMap<String, u8>,
 }
 
 impl VibeWidget {
@@ -129,9 +118,8 @@ impl VibeWidget {
     /// Apply a new state value to a device, *merging* optional fields the
     /// echo may omit (a `SetLightState{is_on}` echo carries `brightness:
     /// None`; an outlet echo carries `power_consumption: None`) — a patch
-    /// must not wipe live readouts. Also settles any pending scroll target.
+    /// must not wipe live readouts.
     fn patch_state(&mut self, device_id: &str, new: DeviceStateValue) {
-        self.pending_bright.remove(device_id);
         let Some(dev) = self.devices.iter_mut().find(|d| d.device_id == device_id) else {
             return;
         };
@@ -173,8 +161,6 @@ impl Plugin for VibeWidget {
             screens: screens::load(),
             expanded: HashSet::new(),
             cmd_tx: cmds,
-            scroll_accum: HashMap::new(),
-            pending_bright: HashMap::new(),
         }
     }
 
@@ -230,7 +216,8 @@ impl Plugin for VibeWidget {
 }
 
 impl VibeWidget {
-    /// Route a shell UI event (click / scroll, by node id) to a command.
+    /// Route a shell UI event (click / slider move / panel toggle, by node id)
+    /// to a command.
     fn on_ui_event(&mut self, node: &str, kind: EventKind) {
         if let Some(id) = node.strip_prefix("vw-l-") {
             if matches!(kind, EventKind::Click) {
@@ -242,9 +229,19 @@ impl VibeWidget {
                     });
                 }
             }
-        } else if let Some(id) = node.strip_prefix("vw-ls-") {
-            if let EventKind::Scroll { dy, .. } = kind {
-                self.on_light_scroll(id, dy);
+        } else if let Some(id) = node.strip_prefix("vw-sl-") {
+            // The brightness `Slider` moved (drag / scroll / keyboard). Its
+            // `value` is 1..=100; round + clamp to the wire's u8. No local
+            // mutation and no pending-value bookkeeping — the SDK suppresses
+            // programmatic moves mid-drag, and the echo is the source of truth.
+            if let EventKind::ValueChanged { value } = kind {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let brightness = value.round().clamp(1.0, 100.0) as u8;
+                self.send(Cmd::SetLight {
+                    device_id: id.to_string(),
+                    is_on: None,
+                    brightness: Some(brightness),
+                });
             }
         } else if let Some(id) = node.strip_prefix("vw-o-") {
             if matches!(kind, EventKind::Click) {
@@ -261,50 +258,6 @@ impl VibeWidget {
                 self.expanded.insert(key.to_string());
             }
         }
-    }
-
-    /// Scroll-to-dim with notch accumulation: raw smooth-scroll deltas
-    /// (touchpads emit dozens of sub-1.0 events per swipe) fold into whole
-    /// notches; each notch is ±5 %. Scroll up (negative dy) brightens — the
-    /// shell's volume-chip convention. Horizontal scroll (dy == 0) is a no-op.
-    fn on_light_scroll(&mut self, id: &str, dy: f64) {
-        let Some(DeviceStateValue::Light(light)) = self.device(id).map(|d| &d.state) else {
-            return;
-        };
-        let is_on = light.is_on;
-        let model_bright = light.brightness;
-
-        let acc = self.scroll_accum.entry(id.to_string()).or_insert(0.0);
-        *acc += -dy; // up = positive
-        let notches = acc.trunc();
-        if notches == 0.0 {
-            return;
-        }
-        *acc -= notches;
-
-        // Base = the last requested value while an echo is in flight,
-        // else the model's.
-        let base = i16::from(
-            self.pending_bright
-                .get(id)
-                .copied()
-                .or(model_bright)
-                .unwrap_or(50),
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        let next = (base + (notches as i16) * BRIGHTNESS_STEP).clamp(1, 100) as u8;
-        let brightening = notches > 0.0;
-        if next == base as u8 && (is_on || !brightening) {
-            return; // already at the clamp; nothing new to ask for
-        }
-        self.pending_bright.insert(id.to_string(), next);
-        self.send(Cmd::SetLight {
-            device_id: id.to_string(),
-            // Brightening a light that's off also turns it on (the legacy
-            // web client's convention).
-            is_on: (!is_on && brightening).then_some(true),
-            brightness: Some(next),
-        });
     }
 
     /// Devices grouped by room (`device_groups.first()`), rooms and devices
@@ -430,7 +383,7 @@ impl VibeWidget {
         // `pan-up` expanded. It sits after the text, not flush to the right
         // edge — `Node::Spacer` would right-pin it, but Spacer hard-sets
         // *vexpand* too, which propagates up and stretches the whole widget
-        // tall (vibec0re/trollshell — needs an axis-aware / hexpand-only gap).
+        // tall (vibec0re/trollshell#332 — needs an axis-aware / hexpand-only gap).
         header_row.push(Node::Icon {
             id: None,
             name: if open {
@@ -728,8 +681,8 @@ struct RowOpts<'a> {
     /// lights; always on for the auto layout and outlet elements; always off
     /// for the read-only sensor slot.
     allow_toggle: bool,
-    /// Light: the brightness affordance — the readout bar *and* scroll-to-dim
-    /// (config `slider`; the auto layout always wants it).
+    /// Light: show the interactive brightness slider (config `slider`; the
+    /// auto layout always wants it).
     show_slider: bool,
     /// Sensor: show temperature / humidity (config `show-temp`/`show-humidity`).
     show_temp: bool,
@@ -794,29 +747,28 @@ fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
                 label
             };
             let mut children = vec![head];
-            // Brightness bar ← `slider`, and only when on with a known level.
+            // Interactive brightness slider ← `slider`, and only when on with a
+            // known level (`gtk::Scale`: drag / scroll / keyboard). No slider ⇒
+            // toggle-only, matching what `slider false` means in GTK. `value`
+            // is a mutable prop the host reconciles from the echo; the widget
+            // holds no optimistic state (the SDK guards the drag).
             if opts.show_slider && light.is_on {
                 if let Some(b) = light.brightness {
-                    children.push(Node::Progress {
-                        id: None,
-                        fraction: f64::from(b) / 100.0,
-                        classes: vec!["vw-bright".into()],
+                    children.push(Node::Slider {
+                        id: format!("vw-sl-{id}"),
+                        min: 1.0,
+                        max: 100.0,
+                        value: f64::from(b),
+                        step: BRIGHTNESS_STEP,
+                        classes: vec!["vw-bright".into(), "flat".into()],
                     });
                 }
             }
-            // Scroll-to-dim target ← `slider` too: no slider ⇒ no `vw-ls-` id
-            // and no scroll, so a toggle-only light can't be dimmed (or, when
-            // off, scrolled on) — matching what `slider false` means in GTK.
-            let (row_id, scroll) = if opts.show_slider {
-                (Some(format!("vw-ls-{id}")), true)
-            } else {
-                (None, false)
-            };
             Node::Box {
-                id: row_id,
+                id: None,
                 dir: Dir::Horizontal,
                 spacing: 6,
-                scroll,
+                scroll: false,
                 classes,
                 children,
             }
@@ -1011,6 +963,7 @@ mod tests {
                     out.push(id.clone());
                     walk(child, out);
                 }
+                Node::Slider { id, .. } => out.push(id.clone()),
                 Node::Revealer { child, .. } => walk(child, out),
                 _ => {}
             }
@@ -1020,12 +973,12 @@ mod tests {
         out
     }
 
-    /// Is there a `Progress` (brightness) node anywhere in the tree?
-    fn has_progress(node: &Node) -> bool {
+    /// Is there a brightness `Slider` node anywhere in the tree?
+    fn has_slider(node: &Node) -> bool {
         match node {
-            Node::Progress { .. } => true,
-            Node::Box { children, .. } => children.iter().any(has_progress),
-            Node::Button { child, .. } | Node::Revealer { child, .. } => has_progress(child),
+            Node::Slider { .. } => true,
+            Node::Box { children, .. } => children.iter().any(has_slider),
+            Node::Button { child, .. } | Node::Revealer { child, .. } => has_slider(child),
             _ => false,
         }
     }
@@ -1278,72 +1231,41 @@ screen "wz" {
     }
 
     #[test]
-    fn scroll_dims_and_brightens_with_clamping() {
-        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(98))]);
-        // Scroll up (negative dy) brightens, clamped to 100.
+    fn slider_move_sets_brightness_without_local_mutation() {
+        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
+        // A `Slider` move (drag/scroll/keyboard) reports the new value.
         let _ = m.update(Input::Event {
-            node: "vw-ls-l1".into(),
-            kind: EventKind::Scroll { dx: 0.0, dy: -1.0 },
+            node: "vw-sl-l1".into(),
+            kind: EventKind::ValueChanged { value: 73.4 },
         });
         assert_eq!(
             rx.try_recv().unwrap(),
             Cmd::SetLight {
                 device_id: "l1".into(),
                 is_on: None,
-                brightness: Some(100),
+                brightness: Some(73), // rounded
             }
         );
-        // Scroll down dims — based on the *pending* 100, not the stale 98.
-        let _ = m.update(Input::Event {
-            node: "vw-ls-l1".into(),
-            kind: EventKind::Scroll { dx: 0.0, dy: 1.0 },
-        });
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Cmd::SetLight {
-                device_id: "l1".into(),
-                is_on: None,
-                brightness: Some(95),
-            }
+        // No local mutation — the server's echo is the source of truth.
+        assert!(
+            matches!(&m.devices[0].state, DeviceStateValue::Light(l) if l.brightness == Some(50)),
+            "brightness unchanged until the echo"
         );
     }
 
     #[test]
-    fn touchpad_smooth_scroll_accumulates_to_notches() {
+    fn slider_value_is_rounded_and_clamped_to_1_100() {
         let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
-        // Three sub-notch deltas: nothing fires until the notch completes.
-        for _ in 0..2 {
+        for (value, want) in [(250.0, 100u8), (0.2, 1), (49.6, 50)] {
             let _ = m.update(Input::Event {
-                node: "vw-ls-l1".into(),
-                kind: EventKind::Scroll { dx: 0.0, dy: -0.4 },
+                node: "vw-sl-l1".into(),
+                kind: EventKind::ValueChanged { value },
             });
             assert!(
-                rx.try_recv().is_err(),
-                "sub-notch deltas accumulate silently"
+                matches!(rx.try_recv().unwrap(), Cmd::SetLight { brightness: Some(b), .. } if b == want),
+                "value {value} → brightness {want}"
             );
         }
-        let _ = m.update(Input::Event {
-            node: "vw-ls-l1".into(),
-            kind: EventKind::Scroll { dx: 0.0, dy: -0.4 },
-        });
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Cmd::SetLight {
-                device_id: "l1".into(),
-                is_on: None,
-                brightness: Some(55),
-            }
-        );
-    }
-
-    #[test]
-    fn horizontal_scroll_is_a_no_op() {
-        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
-        let _ = m.update(Input::Event {
-            node: "vw-ls-l1".into(),
-            kind: EventKind::Scroll { dx: 3.0, dy: 0.0 },
-        });
-        assert!(rx.try_recv().is_err(), "dy == 0 must not change brightness");
     }
 
     #[test]
@@ -1430,19 +1352,15 @@ screen "wz" {
     }
 
     #[test]
-    fn brightening_an_off_light_turns_it_on() {
-        let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", false, Some(40))]);
-        let _ = m.update(Input::Event {
-            node: "vw-ls-l1".into(),
-            kind: EventKind::Scroll { dx: 0.0, dy: -1.0 },
-        });
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            Cmd::SetLight {
-                device_id: "l1".into(),
-                is_on: Some(true),
-                brightness: Some(45),
-            }
+    fn an_off_light_has_no_slider() {
+        // The brightness slider shows only when the light is on; an off light
+        // is toggle-only (turn it on first, then drag).
+        let (m, _rx) = model_with(vec![light("l1", "Taklampa", "x", false, Some(40))]);
+        let view = m.view();
+        assert!(!has_slider(&view), "no slider while off");
+        assert!(
+            !ids(&view).iter().any(|i| i == "vw-sl-l1"),
+            "no slider id while off"
         );
     }
 
@@ -1671,18 +1589,15 @@ screen "wz" {
             "{:?}",
             texts(&view)
         );
-        // …but with no toggle button and no scroll target, so nothing can fire.
+        // …but with no toggle button and no slider, so nothing can fire.
         let ids = ids(&view);
         assert!(!ids.iter().any(|i| i == "vw-l-l1"), "no toggle: {ids:?}");
-        assert!(
-            !ids.iter().any(|i| i == "vw-ls-l1"),
-            "no scroll target: {ids:?}"
-        );
+        assert!(!ids.iter().any(|i| i == "vw-sl-l1"), "no slider: {ids:?}");
     }
 
     #[test]
-    fn config_slider_flag_gates_the_brightness_bar() {
-        let has_bar = |slider: bool| {
+    fn config_slider_flag_gates_the_brightness_slider() {
+        let has = |slider: bool| {
             // The `slider` line carries no quotes, so the v1-compat pass rewrites
             // its bare boolean — mirrors how real configs are written.
             let kdl = format!(
@@ -1697,17 +1612,16 @@ screen "wz" {
             );
             let (m, _rx) =
                 model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], &kdl);
-            has_progress(&m.view())
+            has_slider(&m.view())
         };
-        assert!(has_bar(true), "slider=true shows the brightness bar");
-        assert!(!has_bar(false), "slider=false hides it");
+        assert!(has(true), "slider=true shows the brightness slider");
+        assert!(!has(false), "slider=false hides it");
     }
 
     #[test]
-    fn config_slider_false_removes_the_scroll_to_dim_target() {
+    fn config_slider_false_is_toggle_only() {
         // The shipped screens.kdl has `switch true slider false` lights (Deko,
-        // ACC, Decke): toggle-only, so slider=false must drop scroll-to-dim —
-        // otherwise an off light could still be scrolled on, which GTK forbids.
+        // ACC, Decke): a toggle and no brightness slider.
         let kdl = r#"
 screen "wz" {
     group {
@@ -1727,16 +1641,16 @@ screen "wz" {
             "toggle present: {ids:?}"
         );
         assert!(
-            !ids.iter().any(|i| i == "vw-ls-l1"),
-            "slider=false ⇒ no scroll-to-dim target: {ids:?}"
+            !ids.iter().any(|i| i == "vw-sl-l1"),
+            "slider=false ⇒ no brightness slider: {ids:?}"
         );
-        assert!(!has_progress(&view), "slider=false ⇒ no brightness bar");
+        assert!(!has_slider(&view), "slider=false ⇒ no slider node");
     }
 
     #[test]
     fn config_switch_false_slider_true_is_brightness_only() {
-        // switch=false, slider=true: no toggle, but still dimmable — matching
-        // GTK, where the same config yields an interactive brightness control.
+        // switch=false, slider=true: no toggle, but the interactive brightness
+        // slider is present — matching GTK's brightness-only light.
         let kdl = r#"
 screen "wz" {
     group {
@@ -1753,10 +1667,10 @@ screen "wz" {
         let ids = ids(&view);
         assert!(!ids.iter().any(|i| i == "vw-l-l1"), "no toggle: {ids:?}");
         assert!(
-            ids.iter().any(|i| i == "vw-ls-l1"),
-            "still dimmable via scroll: {ids:?}"
+            ids.iter().any(|i| i == "vw-sl-l1"),
+            "brightness slider present: {ids:?}"
         );
-        assert!(has_progress(&view), "brightness bar shown");
+        assert!(has_slider(&view), "slider node shown");
     }
 
     #[test]
