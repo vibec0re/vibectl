@@ -426,11 +426,11 @@ impl VibeWidget {
                 ],
             });
         }
-        // Right-pin the chevron (the Adwaita expander idiom): a Spacer eats the
-        // slack between the text cluster and the chevron, pushing it to the
-        // trailing edge. `pan-down` collapsed (click to open downward),
-        // `pan-up` expanded.
-        header_row.push(Node::Spacer);
+        // Trailing chevron: `pan-down` collapsed (click to open downward),
+        // `pan-up` expanded. It sits after the text, not flush to the right
+        // edge — `Node::Spacer` would right-pin it, but Spacer hard-sets
+        // *vexpand* too, which propagates up and stretches the whole widget
+        // tall (vibec0re/trollshell — needs an axis-aware / hexpand-only gap).
         header_row.push(Node::Icon {
             id: None,
             name: if open {
