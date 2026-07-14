@@ -149,7 +149,7 @@ impl Plugin for VibeWidget {
     fn manifest() -> Manifest {
         // No host-state subscriptions, no shell capabilities: everything this
         // widget does goes over its own WebSocket.
-        Manifest::new("vibectl", Mount::SidebarBottom)
+        Manifest::new("vibectl", Mount::SidebarLead)
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
@@ -295,12 +295,12 @@ impl VibeWidget {
                     .iter()
                     .find_map(|d| Climate::of(&d.device_id, &d.state));
                 let skip = climate.as_ref().map(|c| c.id.as_str());
-                let body: Vec<Node> = devices
+                let rows: Vec<Node> = devices
                     .iter()
                     .filter(|d| Some(d.device_id.as_str()) != skip)
                     .filter_map(|dev| device_row(dev, &RowOpts::auto(dev)))
                     .collect();
-                self.panel(&room, &room, climate.as_ref(), body)
+                self.panel(&room, &room, climate.as_ref(), boxed_list(rows))
             })
             .collect()
     }
@@ -330,12 +330,12 @@ impl VibeWidget {
             for group in &screen.groups {
                 let rows = self.render_elements(&group.elements, &mut resolved, skip);
                 if !rows.is_empty() {
-                    groups.push(Node::Box {
+                    // One native `boxed-list` card per group, flattened onto the
+                    // plugin card by the host's `.ts-plugin-card list.boxed-list`
+                    // rule so groups read as separated lists on one surface.
+                    groups.push(Node::ListBox {
                         id: None,
-                        dir: Dir::Vertical,
-                        spacing: 4,
-                        scroll: false,
-                        classes: vec!["vw-group".into()],
+                        classes: vec!["boxed-list".into()],
                         children: rows,
                     });
                 }
@@ -356,76 +356,44 @@ impl VibeWidget {
         (resolved > 0).then_some(out)
     }
 
-    /// A collapsible section panel: a full-width, flat, clickable header — an
-    /// Adwaita expander chevron (stock symbolic icon), the section `name`, and
-    /// a climate peek — over a `Revealer` holding `body`. `key` addresses the
-    /// toggle event (`vw-panel-{key}`) and keys the expanded set; collapsed is
-    /// the default.
+    /// A collapsible section as a native [`Node::Expander`] (#333): the host
+    /// draws the disclosure chevron, right-pins it, and reveals `body` on
+    /// toggle — so the plugin no longer hand-rolls a button + chevron + revealer
+    /// (and no longer fights `Node::Spacer`'s cross-axis expand to place the
+    /// chevron, vibec0re/trollshell#332). The header is the section `name` with
+    /// the climate peek pushed to the trailing edge, just inside the chevron.
+    /// `key` addresses the toggle event (`vw-panel-{key}`) and keys the expanded
+    /// set; collapsed is the default.
     fn panel(&self, key: &str, name: &str, climate: Option<&Climate>, body: Vec<Node>) -> Node {
         let open = self.expanded.contains(key);
         let mut header_row = vec![Node::Label {
             id: None,
             text: name.to_string(),
-            classes: vec!["vw-panel-title".into(), "heading".into()],
+            classes: vec!["heading".into()],
         }];
         if let Some(peek) = climate.and_then(Climate::peek) {
+            // A `Spacer` right-pins the climate peek (safe here: it's confined to
+            // the horizontal header box, and the host constrains its axis, #330).
+            header_row.push(Node::Spacer);
             header_row.push(Node::Label {
                 id: None,
                 text: peek,
-                classes: vec![
-                    "vw-panel-climate".into(),
-                    "dim-label".into(),
-                    "numeric".into(),
-                ],
+                classes: vec!["dim-label".into(), "numeric".into()],
             });
         }
-        // Trailing chevron: `pan-down` collapsed (click to open downward),
-        // `pan-up` expanded. It sits after the text, not flush to the right
-        // edge — `Node::Spacer` would right-pin it, but Spacer hard-sets
-        // *vexpand* too, which propagates up and stretches the whole widget
-        // tall (vibec0re/trollshell#332 — needs an axis-aware / hexpand-only gap).
-        header_row.push(Node::Icon {
-            id: None,
-            name: if open {
-                "pan-up-symbolic"
-            } else {
-                "pan-down-symbolic"
-            }
-            .into(),
-            classes: vec!["vw-panel-chevron".into()],
-        });
-        Node::Box {
-            id: None,
-            dir: Dir::Vertical,
-            spacing: 4,
-            scroll: false,
-            classes: vec!["vw-panel".into()],
-            children: vec![
-                Node::Button {
-                    id: format!("vw-panel-{key}"),
-                    classes: vec!["vw-panel-header".into(), "flat".into()],
-                    child: Box::new(Node::Box {
-                        id: None,
-                        dir: Dir::Horizontal,
-                        spacing: 6,
-                        scroll: false,
-                        classes: vec!["vw-panel-header-row".into()],
-                        children: header_row,
-                    }),
-                },
-                Node::Revealer {
-                    id: None,
-                    open,
-                    child: Box::new(Node::Box {
-                        id: None,
-                        dir: Dir::Vertical,
-                        spacing: 4,
-                        scroll: false,
-                        classes: vec!["vw-panel-body".into()],
-                        children: body,
-                    }),
-                },
-            ],
+        Node::Expander {
+            id: format!("vw-panel-{key}"),
+            header: Box::new(Node::Box {
+                id: None,
+                dir: Dir::Horizontal,
+                spacing: 6,
+                scroll: false,
+                classes: vec![],
+                children: header_row,
+            }),
+            children: body,
+            expanded: open,
+            classes: vec![],
         }
     }
 
@@ -477,103 +445,109 @@ impl VibeWidget {
         resolved: &mut usize,
         skip: Option<&str>,
     ) -> Vec<Node> {
-        let mut out = Vec::new();
-        for element in elements {
-            match element {
-                Element::Light {
-                    name,
-                    device_ref,
-                    show_switch,
-                    show_slider,
-                } => {
-                    if let Some(dev) = self.resolve(device_ref) {
-                        let opts = RowOpts {
+        elements
+            .iter()
+            .filter_map(|element| {
+                let content = self.element_content(element, resolved, skip);
+                (!content.is_empty()).then(|| list_row(content))
+            })
+            .collect()
+    }
+
+    /// The inline (horizontal) content nodes for one config element — the guts
+    /// of a list row. A device yields its [`device_content`]; a `text` yields a
+    /// dim label; a `block` yields one cell per resolved member laid side by
+    /// side (each cell a small horizontal box), so the block becomes a single
+    /// multi-column row. Bumps `resolved` once per device that actually renders
+    /// (not for text or empty blocks).
+    fn element_content(
+        &self,
+        element: &Element,
+        resolved: &mut usize,
+        skip: Option<&str>,
+    ) -> Vec<Node> {
+        match element {
+            Element::Light {
+                name,
+                device_ref,
+                show_switch,
+                show_slider,
+            } => self
+                .resolve(device_ref)
+                .and_then(|dev| {
+                    device_content(
+                        dev,
+                        &RowOpts {
                             name,
                             allow_toggle: *show_switch,
                             show_slider: *show_slider,
                             show_temp: true,
                             show_humidity: true,
-                        };
-                        if let Some(row) = device_row(dev, &opts) {
-                            *resolved += 1;
-                            out.push(row);
-                        }
-                    }
-                }
-                Element::Outlet { name, device_ref } => {
-                    if let Some(dev) = self.resolve(device_ref) {
-                        let opts = RowOpts {
+                        },
+                    )
+                })
+                .inspect(|_| *resolved += 1)
+                .unwrap_or_default(),
+            Element::Outlet { name, device_ref } => self
+                .resolve(device_ref)
+                .and_then(|dev| {
+                    device_content(
+                        dev,
+                        &RowOpts {
                             name,
                             allow_toggle: true,
                             show_slider: false,
                             show_temp: true,
                             show_humidity: true,
-                        };
-                        if let Some(row) = device_row(dev, &opts) {
-                            *resolved += 1;
-                            out.push(row);
-                        }
-                    }
-                }
-                Element::Sensor {
-                    device_ref,
-                    show_temp,
-                    show_humidity,
-                } => {
-                    if let Some(dev) = self.resolve(device_ref) {
-                        // Drop the sensor promoted into the panel header (`skip`)
-                        // so it isn't also a body row. A sensor slot is read-only:
-                        // never a toggle, even if the ref points at an actuator.
-                        if Some(dev.device_id.as_str()) != skip {
-                            let opts = RowOpts {
-                                name: &dev.device_info.name,
-                                allow_toggle: false,
-                                show_slider: false,
-                                show_temp: *show_temp,
-                                show_humidity: *show_humidity,
-                            };
-                            if let Some(row) = device_row(dev, &opts) {
-                                *resolved += 1;
-                                out.push(row);
-                            }
-                        }
-                    }
-                }
-                Element::Text { template } => out.push(left(Node::Label {
-                    id: None,
-                    text: template.clone(),
-                    classes: vec!["vw-text".into(), "dim-label".into()],
-                })),
-                Element::Block { elements } => {
-                    let cells: Vec<Node> = elements
-                        .iter()
-                        .filter_map(|el| {
-                            let sub =
-                                self.render_elements(std::slice::from_ref(el), resolved, skip);
-                            (!sub.is_empty()).then(|| Node::Box {
-                                id: None,
-                                dir: Dir::Vertical,
-                                spacing: 4,
-                                scroll: false,
-                                classes: vec!["vw-block-cell".into()],
-                                children: sub,
-                            })
-                        })
-                        .collect();
-                    if !cells.is_empty() {
-                        out.push(Node::Box {
-                            id: None,
-                            dir: Dir::Horizontal,
-                            spacing: 8,
-                            scroll: false,
-                            classes: vec!["vw-block".into()],
-                            children: cells,
-                        });
-                    }
-                }
-            }
+                        },
+                    )
+                })
+                .inspect(|_| *resolved += 1)
+                .unwrap_or_default(),
+            Element::Sensor {
+                device_ref,
+                show_temp,
+                show_humidity,
+            } => self
+                .resolve(device_ref)
+                // Drop the sensor promoted into the panel header (`skip`) so it
+                // isn't also a body row. A sensor slot is read-only: never a
+                // toggle, even if the ref points at an actuator.
+                .filter(|dev| Some(dev.device_id.as_str()) != skip)
+                .and_then(|dev| {
+                    device_content(
+                        dev,
+                        &RowOpts {
+                            name: &dev.device_info.name,
+                            allow_toggle: false,
+                            show_slider: false,
+                            show_temp: *show_temp,
+                            show_humidity: *show_humidity,
+                        },
+                    )
+                })
+                .inspect(|_| *resolved += 1)
+                .unwrap_or_default(),
+            Element::Text { template } => vec![Node::Label {
+                id: None,
+                text: template.clone(),
+                classes: vec!["dim-label".into()],
+            }],
+            Element::Block { elements } => elements
+                .iter()
+                .filter_map(|el| {
+                    let cell = self.element_content(el, resolved, skip);
+                    (!cell.is_empty()).then(|| Node::Box {
+                        id: None,
+                        dir: Dir::Horizontal,
+                        spacing: 6,
+                        scroll: false,
+                        classes: vec![],
+                        children: cell,
+                    })
+                })
+                .collect(),
         }
-        out
     }
 
     /// Resolve a config device ref to a live device. Names match exactly — a
@@ -600,29 +574,43 @@ fn renders(dev: &DeviceState) -> bool {
     }
 }
 
-/// Left-align a node. A `gtk::Label` that's a direct child of a vertical box
-/// fills the width and centres its text (GTK default `xalign 0.5`), and the
-/// widget vocabulary exposes no alignment / halign field. Packing it into a
-/// *horizontal* box instead makes it take its natural width at the start —
-/// i.e. flush left. (The device rows are already horizontal; this is for the
-/// standalone labels: screen titles, room headers, sensors, status, text.)
-fn left(node: Node) -> Node {
+/// Wrap device rows in a native `boxed-list` card list. The host's
+/// `.ts-plugin-card list.boxed-list` rule flattens it onto the plugin card
+/// (no card-in-card), keeping the hairline row separators. Empty ⇒ no list
+/// node, so a climate-only panel (all its rows promoted into the header) shows
+/// just the header.
+fn boxed_list(rows: Vec<Node>) -> Vec<Node> {
+    if rows.is_empty() {
+        return Vec::new();
+    }
+    vec![Node::ListBox {
+        id: None,
+        classes: vec!["boxed-list".into()],
+        children: rows,
+    }]
+}
+
+/// One list row: a horizontal box of `content`, materialized inside a native
+/// `GtkListBoxRow` (with its padding + separators) by the enclosing
+/// `boxed-list`. Spacing 8 keeps the toggle, name, and trailing control apart.
+fn list_row(content: Vec<Node>) -> Node {
     Node::Box {
         id: None,
         dir: Dir::Horizontal,
-        spacing: 0,
+        spacing: 8,
         scroll: false,
         classes: vec![],
-        children: vec![node],
+        children: content,
     }
 }
 
 fn status_label(text: &str) -> Node {
-    left(Node::Label {
+    // The host left-aligns plugin labels by default (#334), so no wrapper box.
+    Node::Label {
         id: None,
         text: text.to_string(),
-        classes: vec!["vw-status".into(), "dim-label".into()],
-    })
+        classes: vec!["dim-label".into()],
+    }
 }
 
 /// A section's climate, promoted into its panel header (temp + humidity) and
@@ -703,155 +691,167 @@ impl<'a> RowOpts<'a> {
     }
 }
 
-/// One device row, or `None` for devices we don't render (unknown/virtual —
-/// [`renders`] gates them, so an echo-less virtual group can't slip in via a
-/// config ref and latch on toggle).
-fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
+/// The leading state icon + name for a light/outlet, as a flat clickable
+/// toggle (when `button_id` is `Some`) or a static box (a `switch false` light,
+/// or a read-only sensor slot pointed at an actuator). `icon_state` is the
+/// blessed class tinting the symbolic icon — `accent` when on, `dim-label` when
+/// off or unreachable — so on/off reads by **colour**, not a `●/○` glyph.
+fn toggle_or_label(
+    button_id: Option<String>,
+    icon: &str,
+    icon_state: &str,
+    name: &str,
+    offline: bool,
+) -> Node {
+    let inner = Node::Box {
+        id: None,
+        dir: Dir::Horizontal,
+        spacing: 6,
+        scroll: false,
+        classes: vec![],
+        children: vec![
+            Node::Icon {
+                id: None,
+                name: icon.to_string(),
+                classes: vec![icon_state.to_string()],
+            },
+            Node::Label {
+                id: None,
+                text: name.to_string(),
+                classes: if offline {
+                    vec!["dim-label".into()]
+                } else {
+                    vec![]
+                },
+            },
+        ],
+    };
+    match button_id {
+        // `flat` drops the button chrome so it reads as row content but still
+        // toggles on click; the whole icon+name is the hit target.
+        Some(id) => Node::Button {
+            id,
+            classes: vec!["flat".into()],
+            child: Box::new(inner),
+        },
+        None => inner,
+    }
+}
+
+/// The inline (horizontal) content for one device row — leading state icon +
+/// name (a flat toggle when interactive), then any trailing control: a
+/// brightness [`Node::Slider`] (lights) or a live-wattage / climate readout
+/// right-pinned by a [`Node::Spacer`]. `None` for devices we don't render
+/// (unknown/virtual — [`renders`] gates them, so an echo-less virtual group
+/// can't slip in via a config ref and latch on toggle).
+fn device_content(dev: &DeviceState, opts: &RowOpts) -> Option<Vec<Node>> {
     if !renders(dev) {
         return None;
     }
     let id = &dev.device_id;
     let name = opts.name;
     let offline = !dev.device_info.reachable;
-    let offline_class = offline.then(|| "vw-unreachable".to_string());
 
-    let row = match &dev.state {
+    let content = match &dev.state {
         DeviceStateValue::Light(light) => {
-            let glyph = if offline {
-                "◌"
-            } else if light.is_on {
-                "●"
+            let icon_state = if offline || !light.is_on {
+                "dim-label"
             } else {
-                "○"
+                "accent"
             };
-            let mut classes = vec![
-                "vw-row".to_string(),
-                "vw-light".to_string(),
-                if light.is_on { "vw-on" } else { "vw-off" }.to_string(),
-            ];
-            classes.extend(offline_class);
-            let label = Node::Label {
-                id: None,
-                text: format!("{glyph} {name}"),
-                classes: vec![],
-            };
-            // Toggle affordance ← `switch`: a clickable button, or a static
-            // label. Kept independent from the brightness affordance below.
-            let head = if opts.allow_toggle {
-                Node::Button {
-                    id: format!("vw-l-{id}"),
-                    classes: vec!["vw-toggle".into(), "flat".into()],
-                    child: Box::new(label),
-                }
-            } else {
-                label
-            };
-            let mut children = vec![head];
-            // Interactive brightness slider ← `slider`, and only when on with a
-            // known level (`gtk::Scale`: drag / scroll / keyboard). No slider ⇒
-            // toggle-only, matching what `slider false` means in GTK. `value`
-            // is a mutable prop the host reconciles from the echo; the widget
-            // holds no optimistic state (the SDK guards the drag).
-            if opts.show_slider && light.is_on {
-                if let Some(b) = light.brightness {
-                    children.push(Node::Slider {
-                        id: format!("vw-sl-{id}"),
-                        min: 1.0,
-                        max: 100.0,
-                        value: f64::from(b),
-                        step: BRIGHTNESS_STEP,
-                        classes: vec!["vw-bright".into(), "flat".into()],
-                    });
-                }
+            let mut children = vec![toggle_or_label(
+                opts.allow_toggle.then(|| format!("vw-l-{id}")),
+                "display-brightness-symbolic",
+                icon_state,
+                name,
+                offline,
+            )];
+            // Brightness slider ← `slider`. Shown whenever `slider` is set —
+            // even with the light off — but rendered **disabled** (greyed,
+            // non-interactive) when off via the host's `enabled` field, so the
+            // row keeps its shape instead of the slider popping in and out as
+            // the light toggles. `value` is a mutable prop the host reconciles
+            // from the echo; the widget holds no optimistic state (the SDK
+            // guards the drag). Off ⇒ show the last-known level, clamped.
+            if opts.show_slider {
+                let value = f64::from(light.brightness.unwrap_or(0)).clamp(1.0, 100.0);
+                children.push(Node::Slider {
+                    id: format!("vw-sl-{id}"),
+                    min: 1.0,
+                    max: 100.0,
+                    value,
+                    step: BRIGHTNESS_STEP,
+                    enabled: light.is_on,
+                    classes: vec![],
+                });
             }
-            Node::Box {
-                id: None,
-                dir: Dir::Horizontal,
-                spacing: 6,
-                scroll: false,
-                classes,
-                children,
-            }
+            children
         }
         DeviceStateValue::Outlet(outlet) => {
-            let mut classes = vec![
-                "vw-row".to_string(),
-                "vw-outlet".to_string(),
-                if outlet.is_on { "vw-on" } else { "vw-off" }.to_string(),
-            ];
-            classes.extend(offline_class);
-            // State must be legible without CSS (the vw-* classes are hooks
-            // for the shell's stylesheet, which may not style them).
-            let glyph = if offline {
-                "◌"
-            } else if outlet.is_on {
-                "●"
+            let icon_state = if offline || !outlet.is_on {
+                "dim-label"
             } else {
-                "○"
+                "accent"
             };
-            let label = Node::Label {
-                id: None,
-                text: format!("{glyph} {name} ⏻"),
-                classes: vec![],
-            };
-            // Honor read-only intent: a sensor slot that resolves to an outlet
-            // (a misconfiguration) shows a static readout, never a live toggle.
-            let head = if opts.allow_toggle {
-                Node::Button {
-                    id: format!("vw-o-{id}"),
-                    classes: vec!["vw-toggle".into(), "flat".into()],
-                    child: Box::new(label),
-                }
-            } else {
-                label
-            };
-            let mut children = vec![head];
+            let mut children = vec![toggle_or_label(
+                // Honor read-only intent: a sensor slot that resolves to an
+                // outlet (a misconfiguration) shows a static readout, no toggle.
+                opts.allow_toggle.then(|| format!("vw-o-{id}")),
+                "system-shutdown-symbolic",
+                icon_state,
+                name,
+                offline,
+            )];
             if let (true, Some(w)) = (outlet.is_on, outlet.power_consumption) {
+                children.push(Node::Spacer);
                 children.push(Node::Label {
                     id: None,
                     text: format!("{w:.1} W"),
-                    classes: vec!["vw-watts".into(), "dim-label".into(), "numeric".into()],
+                    classes: vec!["dim-label".into(), "numeric".into()],
                 });
             }
-            Node::Box {
-                id: None,
-                dir: Dir::Horizontal,
-                spacing: 6,
-                scroll: false,
-                classes,
-                children,
-            }
+            children
         }
         DeviceStateValue::Sensor(sensor) => {
-            let mut parts = vec![name.to_string()];
-            if offline {
-                parts.push("◌".to_string());
-            }
+            let mut readout = Vec::new();
             if opts.show_temp {
                 if let Some(t) = sensor.temperature {
-                    parts.push(format!("🌡 {t:.1}°"));
+                    readout.push(format!("🌡 {t:.1}°"));
                 }
             }
             if opts.show_humidity {
                 if let Some(h) = sensor.humidity {
-                    parts.push(format!("💧 {h:.0}%"));
+                    readout.push(format!("💧 {h:.0}%"));
                 }
             }
-            let mut classes = vec![
-                "vw-row".to_string(),
-                "vw-sensor".to_string(),
-                "dim-label".to_string(),
-            ];
-            classes.extend(offline_class);
-            left(Node::Label {
+            let mut children = vec![Node::Label {
                 id: None,
-                text: parts.join("  "),
-                classes,
-            })
+                text: name.to_string(),
+                classes: if offline {
+                    vec!["dim-label".into()]
+                } else {
+                    vec![]
+                },
+            }];
+            if !readout.is_empty() {
+                children.push(Node::Spacer);
+                children.push(Node::Label {
+                    id: None,
+                    text: readout.join("  "),
+                    classes: vec!["dim-label".into(), "numeric".into()],
+                });
+            }
+            children
         }
         _ => return None,
     };
-    Some(row)
+    Some(content)
+}
+
+/// One device as a native `boxed-list` row, or `None` when [`device_content`]
+/// declines (an unrendered/virtual device).
+fn device_row(dev: &DeviceState, opts: &RowOpts) -> Option<Node> {
+    Some(list_row(device_content(dev, opts)?))
 }
 
 fn main() {
@@ -949,24 +949,34 @@ mod tests {
         (m, rx)
     }
 
-    /// Every `Button` id and every `Box` id in a tree (the shell only emits
-    /// events for nodes that exist, so absence of an id ⇒ that interaction
-    /// can't fire).
+    /// Recurse into every child-bearing node kind. Shared by the tree walkers so
+    /// each only has to handle the nodes it collects — panels are now
+    /// [`Node::Expander`]s and bodies [`Node::ListBox`]es, so a walker that
+    /// stopped at `Box`/`Button`/`Revealer` would miss the whole tree.
+    fn children_of(node: &Node) -> Vec<&Node> {
+        match node {
+            Node::Box { children, .. } | Node::ListBox { children, .. } => children.iter().collect(),
+            Node::Button { child, .. } | Node::Revealer { child, .. } => vec![child],
+            Node::Expander {
+                header, children, ..
+            } => std::iter::once(header.as_ref()).chain(children).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Every id that addresses an event: `Button`/`Slider`/`Expander` ids (and
+    /// any `Box`/`ListBox` id along for the ride). The shell only emits events
+    /// for nodes that exist, so absence of an id ⇒ that interaction can't fire.
     fn ids(node: &Node) -> Vec<String> {
         fn walk(node: &Node, out: &mut Vec<String>) {
             match node {
-                Node::Box { id, children, .. } => {
-                    out.extend(id.clone());
-                    children.iter().for_each(|c| walk(c, out));
-                }
-                Node::Button { id, child, .. } => {
+                Node::Box { id, .. } | Node::ListBox { id, .. } => out.extend(id.clone()),
+                Node::Button { id, .. } | Node::Slider { id, .. } | Node::Expander { id, .. } => {
                     out.push(id.clone());
-                    walk(child, out);
                 }
-                Node::Slider { id, .. } => out.push(id.clone()),
-                Node::Revealer { child, .. } => walk(child, out),
                 _ => {}
             }
+            children_of(node).iter().for_each(|c| walk(c, out));
         }
         let mut out = Vec::new();
         walk(node, &mut out);
@@ -975,57 +985,69 @@ mod tests {
 
     /// Is there a brightness `Slider` node anywhere in the tree?
     fn has_slider(node: &Node) -> bool {
-        match node {
-            Node::Slider { .. } => true,
-            Node::Box { children, .. } => children.iter().any(has_slider),
-            Node::Button { child, .. } | Node::Revealer { child, .. } => has_slider(child),
-            _ => false,
-        }
+        matches!(node, Node::Slider { .. }) || children_of(node).iter().any(|c| has_slider(c))
     }
 
-    /// Every `Icon` name in a tree (e.g. the panel chevron `pan-end-symbolic`).
+    /// The `enabled` flag of the `Slider` with `id`, if present.
+    fn slider_enabled(node: &Node, id: &str) -> Option<bool> {
+        if let Node::Slider {
+            id: sid, enabled, ..
+        } = node
+        {
+            if sid == id {
+                return Some(*enabled);
+            }
+        }
+        children_of(node).iter().find_map(|c| slider_enabled(c, id))
+    }
+
+    /// The `expanded` flag of the `Expander` with `id`, if present. (The panel
+    /// chevron is now drawn host-side, so a test reads the model-driven
+    /// `expanded` here instead of looking for a `pan-*-symbolic` icon.)
+    fn expander_open(node: &Node, id: &str) -> Option<bool> {
+        if let Node::Expander {
+            id: eid, expanded, ..
+        } = node
+        {
+            if eid == id {
+                return Some(*expanded);
+            }
+        }
+        children_of(node).iter().find_map(|c| expander_open(c, id))
+    }
+
+    /// Every `Icon` name in a tree (e.g. a light's `display-brightness-symbolic`).
     fn icons(node: &Node) -> Vec<String> {
         fn walk(node: &Node, out: &mut Vec<String>) {
-            match node {
-                Node::Icon { name, .. } => out.push(name.clone()),
-                Node::Box { children, .. } => children.iter().for_each(|c| walk(c, out)),
-                Node::Button { child, .. } | Node::Revealer { child, .. } => walk(child, out),
-                _ => {}
+            if let Node::Icon { name, .. } = node {
+                out.push(name.clone());
             }
+            children_of(node).iter().for_each(|c| walk(c, out));
         }
         let mut out = Vec::new();
         walk(node, &mut out);
         out
     }
 
-    /// Is there a horizontal `vw-block` box (a KDL `block`) in the tree?
+    /// Is there a `block` row — a horizontal box whose children are ≥2 horizontal
+    /// cell boxes (a KDL `block` lays its members out side by side)?
     fn has_horizontal_block(node: &Node) -> bool {
-        match node {
-            Node::Box {
-                dir,
-                classes,
-                children,
-                ..
-            } => {
-                (matches!(dir, Dir::Horizontal) && classes.iter().any(|c| c == "vw-block"))
-                    || children.iter().any(has_horizontal_block)
-            }
-            Node::Button { child, .. } | Node::Revealer { child, .. } => {
-                has_horizontal_block(child)
-            }
-            _ => false,
-        }
+        let is_block = matches!(node, Node::Box { dir: Dir::Horizontal, .. })
+            && children_of(node)
+                .iter()
+                .filter(|c| matches!(c, Node::Box { dir: Dir::Horizontal, .. }))
+                .count()
+                >= 2;
+        is_block || children_of(node).iter().any(|c| has_horizontal_block(c))
     }
 
     /// Collect every label text in a tree (order = render order).
     fn texts(node: &Node) -> Vec<String> {
         fn walk(node: &Node, out: &mut Vec<String>) {
-            match node {
-                Node::Label { text, .. } => out.push(text.clone()),
-                Node::Box { children, .. } => children.iter().for_each(|c| walk(c, out)),
-                Node::Button { child, .. } | Node::Revealer { child, .. } => walk(child, out),
-                _ => {}
+            if let Node::Label { text, .. } = node {
+                out.push(text.clone());
             }
+            children_of(node).iter().for_each(|c| walk(c, out));
         }
         let mut out = Vec::new();
         walk(node, &mut out);
@@ -1049,12 +1071,12 @@ mod tests {
             all,
             vec![
                 "bedroom",
-                "● Skrivbord ⏻",
+                "Skrivbord",
                 "4.2 W",
-                "○ Sänglampa",
+                "Sänglampa",
                 "living_room",
                 "🌡 21.4°  💧 39%",
-                "● Taklampa",
+                "Taklampa",
             ]
         );
     }
@@ -1065,13 +1087,18 @@ mod tests {
             light("l1", "Taklampa", "living_room", true, Some(70)),
             sensor("s1", "Klimat", "living_room"),
         ]);
-        // Collapsed by default: trailing chevron points down (click to open).
+        // Collapsed by default: the Expander reports `expanded: false` (the host
+        // draws the chevron; the plugin only drives the flag).
         assert!(!m.expanded.contains("living_room"));
-        assert!(icons(&m.view()).iter().any(|i| i == "pan-down-symbolic"));
+        assert_eq!(
+            expander_open(&m.view(), "vw-panel-living_room"),
+            Some(false),
+            "collapsed by default"
+        );
         // Climate peeks in the header (temp + humidity), promoted out of the body.
         assert!(texts(&m.view()).iter().any(|t| t == "🌡 21.4°  💧 39%"));
 
-        // Click the header → expands (chevron flips up), no server command.
+        // Click the header → expands, no server command.
         let fx = m.update(Input::Event {
             node: "vw-panel-living_room".into(),
             kind: EventKind::Click,
@@ -1079,7 +1106,11 @@ mod tests {
         assert!(fx.is_empty(), "panel toggle is pure local UI");
         assert!(rx.try_recv().is_err(), "no command for a panel toggle");
         assert!(m.expanded.contains("living_room"));
-        assert!(icons(&m.view()).iter().any(|i| i == "pan-up-symbolic"));
+        assert_eq!(
+            expander_open(&m.view(), "vw-panel-living_room"),
+            Some(true),
+            "expanded after a header click"
+        );
 
         // Click again → collapses.
         let _ = m.update(Input::Event {
@@ -1282,7 +1313,7 @@ screen "wz" {
             "the server's virtual path emits no event echo — groups stay off the widget"
         );
         assert!(
-            all.iter().any(|t| t == "● Taklampa"),
+            all.iter().any(|t| t == "Taklampa"),
             "the physical light still renders: {all:?}"
         );
         // Defensively: even a synthetic event on a group id sends nothing.
@@ -1352,15 +1383,57 @@ screen "wz" {
     }
 
     #[test]
-    fn an_off_light_has_no_slider() {
-        // The brightness slider shows only when the light is on; an off light
-        // is toggle-only (turn it on first, then drag).
-        let (m, _rx) = model_with(vec![light("l1", "Taklampa", "x", false, Some(40))]);
+    fn light_row_uses_a_symbolic_icon_not_a_dot() {
+        // The de-dot (#…): on/off reads via a tinted symbolic icon, never a
+        // `●/○` glyph baked into the label text.
+        let (m, _rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(70))]);
         let view = m.view();
-        assert!(!has_slider(&view), "no slider while off");
         assert!(
-            !ids(&view).iter().any(|i| i == "vw-sl-l1"),
-            "no slider id while off"
+            icons(&view)
+                .iter()
+                .any(|i| i == "display-brightness-symbolic"),
+            "light shows a symbolic icon: {:?}",
+            icons(&view)
+        );
+        assert!(
+            !texts(&view)
+                .iter()
+                .any(|t| t.contains('●') || t.contains('○') || t.contains('◌')),
+            "no dot glyphs in label text: {:?}",
+            texts(&view)
+        );
+    }
+
+    #[test]
+    fn an_off_light_shows_a_disabled_slider() {
+        // The slider stays in the row even when the light is off — but rendered
+        // disabled (greyed, non-interactive) so the row keeps its shape instead
+        // of the slider popping in and out. Turn it on and it goes live.
+        let (mut m, _rx) = model_with(vec![light("l1", "Taklampa", "x", false, Some(40))]);
+        let view = m.view();
+        assert!(has_slider(&view), "slider present while off");
+        assert!(
+            ids(&view).iter().any(|i| i == "vw-sl-l1"),
+            "slider id present while off"
+        );
+        assert_eq!(
+            slider_enabled(&view, "vw-sl-l1"),
+            Some(false),
+            "off ⇒ disabled slider"
+        );
+
+        // Turn it on → same slider, now interactive.
+        let _ = m.update(Input::App(WsMsg::Devices(vec![light(
+            "l1",
+            "Taklampa",
+            "x",
+            true,
+            Some(40),
+        )])));
+        assert_eq!(
+            slider_enabled(&m.view(), "vw-sl-l1"),
+            Some(true),
+            "on ⇒ enabled slider"
         );
     }
 
@@ -1429,8 +1502,10 @@ screen "wz" {
             EventType::DeviceReachabilityChanged { reachable: false },
         );
         assert!(!m.devices[0].device_info.reachable);
+        // Offline no longer shows a `◌` glyph — the row dims (`dim-label` on the
+        // icon + name). The device still renders with its plain name.
         let all = texts(&m.view());
-        assert!(all.iter().any(|t| t == "◌ Taklampa"), "offline glyph shown");
+        assert!(all.iter().any(|t| t == "Taklampa"), "offline row shown: {all:?}");
     }
 
     #[test]
@@ -1490,7 +1565,7 @@ screen "wz" {
             "{all:?}"
         );
         // The light shows its CONFIG label, not the device's own name.
-        assert!(all.iter().any(|t| t == "● MAIN"), "config label: {all:?}");
+        assert!(all.iter().any(|t| t == "MAIN"), "config label: {all:?}");
         assert!(
             !all.iter().any(|t| t.contains("LR Shelf")),
             "device name suppressed: {all:?}"
@@ -1522,7 +1597,7 @@ screen "wohnzimmer" {
             "panel labelled by screen name: {all:?}"
         );
         assert!(
-            all.iter().any(|t| t == "● MAIN"),
+            all.iter().any(|t| t == "MAIN"),
             "device still shown: {all:?}"
         );
     }
@@ -1541,7 +1616,7 @@ screen "wohnzimmer" {
             all.iter().any(|t| t.contains("living_room")),
             "fell back: {all:?}"
         );
-        assert!(all.iter().any(|t| t == "● Taklampa"), "{all:?}");
+        assert!(all.iter().any(|t| t == "Taklampa"), "{all:?}");
         assert!(
             !all.iter().any(|t| t.contains("WZ")),
             "no config panel when falling back: {all:?}"
@@ -1585,7 +1660,7 @@ screen "wz" {
         let view = m.view();
         // Shown (with its glyph)…
         assert!(
-            texts(&view).iter().any(|t| t == "● MAIN"),
+            texts(&view).iter().any(|t| t == "MAIN"),
             "{:?}",
             texts(&view)
         );
@@ -1698,7 +1773,7 @@ screen "wz" {
             all.iter().any(|t| t.contains("living_room")),
             "fell back: {all:?}"
         );
-        assert!(all.iter().any(|t| t == "● Taklampa"), "home shown: {all:?}");
+        assert!(all.iter().any(|t| t == "Taklampa"), "home shown: {all:?}");
         assert!(
             !all.iter().any(|t| t == "MY HOME"),
             "banner not shown when falling back: {all:?}"
@@ -1722,7 +1797,7 @@ screen "wz" {
         let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
         let all = texts(&m.view());
         assert!(all.iter().any(|t| t == "MY HOME"), "banner shown: {all:?}");
-        assert!(all.iter().any(|t| t == "● MAIN"), "device shown: {all:?}");
+        assert!(all.iter().any(|t| t == "MAIN"), "device shown: {all:?}");
     }
 
     #[test]
@@ -1782,8 +1857,8 @@ screen "wz" {
         let view = m.view();
         assert!(has_horizontal_block(&view), "block is a horizontal box");
         let all = texts(&view);
-        assert!(all.iter().any(|t| t == "● Deko"), "{all:?}");
-        assert!(all.iter().any(|t| t == "○ ACC"), "{all:?}");
+        assert!(all.iter().any(|t| t == "Deko"), "{all:?}");
+        assert!(all.iter().any(|t| t == "ACC"), "{all:?}");
     }
 
     #[test]
@@ -1804,7 +1879,7 @@ screen "wz" {
         let (m, _rx) = model_with_config(vec![outlet("o1", "Desk", "lr", true)], kdl);
         let all = texts(&m.view());
         assert!(
-            all.iter().any(|t| t == "● Lamp ⏻"),
+            all.iter().any(|t| t == "Lamp"),
             "outlet glyph + name: {all:?}"
         );
         assert!(all.iter().any(|t| t == "4.2 W"), "live wattage: {all:?}");
@@ -1834,7 +1909,7 @@ screen "wz" {
             "virtual group skipped: {all:?}"
         );
         assert!(
-            all.iter().any(|t| t == "● MAIN"),
+            all.iter().any(|t| t == "MAIN"),
             "real light shown: {all:?}"
         );
     }

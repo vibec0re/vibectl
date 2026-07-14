@@ -1794,7 +1794,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#5b040b16b1b509fee1ae0fa496edbd2aa8ea2aa8"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#18032786d8ce3c3958181635675c0bdb67b04531"
 dependencies = [
  "hytte-plugin-proto",
  "tokio",
@@ -1804,7 +1804,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin-proto"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#5b040b16b1b509fee1ae0fa496edbd2aa8ea2aa8"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#18032786d8ce3c3958181635675c0bdb67b04531"
 dependencies = [
  "rmp-serde",
  "serde",
