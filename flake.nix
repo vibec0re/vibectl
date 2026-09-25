@@ -31,12 +31,23 @@
           pkg-config
         ];
 
+        # 🔥 One lockfile for every crate build. The widget pulls the hytte-plugin
+        # SDK straight from trollshell main, so the vendored lock carries a git
+        # source that needs a fixed hash (one covers every crate at that rev).
+        # Bump it together with `cargo update -p hytte-plugin`. 💖
+        cargoLock = {
+          lockFile = ./Cargo.lock;
+          outputHashes = {
+            "hytte-plugin-0.1.0" = "sha256-vIG4eApPxfsmZnV/aivmCEQlCQjoUS0soMHjtX8uU8Y=";
+          };
+        };
+
         # 🔥 Server build - USES NIXPKGS CACHE! 💖
         v1bectl_server = pkgs.rustPlatform.buildRustPackage {
           pname = "v1bectl_server";
           version = "0.1.0";
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          inherit cargoLock;
 
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
@@ -52,7 +63,7 @@
           pname = "v1bectl_tui";
           version = "0.1.0";
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          inherit cargoLock;
 
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
@@ -68,7 +79,7 @@
           pname = "v1bectl_cli";
           version = "0.1.0";
           src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
+          inherit cargoLock;
 
           buildInputs = commonBuildInputs;
           nativeBuildInputs = commonNativeBuildInputs;
@@ -77,6 +88,23 @@
           cargoTestFlags = [ "-p" "v1bectl_cli" ];
 
           doCheck = false;
+        };
+
+        # 🔥 trollshell sidebar widget 💖 — an out-of-process hytte plugin, so no
+        # GTK here: the shell renders its tree. Point
+        # `programs.trollshell.plugins.vibectl.package` at this.
+        v1bectl_widget = pkgs.rustPlatform.buildRustPackage {
+          pname = "v1bectl_widget";
+          version = "0.1.0";
+          src = ./.;
+          inherit cargoLock;
+
+          cargoBuildFlags = [ "-p" "v1bectl_widget" ];
+          cargoTestFlags = [ "-p" "v1bectl_widget" ];
+
+          doCheck = false;
+
+          meta.mainProgram = "v1bectl_widget";
         };
 
         # 🔥 Dev shell with rust-overlay for nice tooling 💖
@@ -121,12 +149,13 @@
       {
         # 🔥 PACKAGES 💖
         packages = {
-          inherit v1bectl_server v1bectl_tui v1bectl_cli v1bectl_web;
+          inherit v1bectl_server v1bectl_tui v1bectl_cli v1bectl_web v1bectl_widget;
 
           server = v1bectl_server;
           tui = v1bectl_tui;
           cli = v1bectl_cli;
           web = v1bectl_web;
+          widget = v1bectl_widget;
 
           default = v1bectl_server;
         };
@@ -361,6 +390,7 @@
         v1bectl_tui = self.packages.${prev.system}.tui;
         v1bectl_cli = self.packages.${prev.system}.cli;
         v1bectl_web = self.packages.${prev.system}.web;
+        v1bectl_widget = self.packages.${prev.system}.widget;
       };
     };
 }
