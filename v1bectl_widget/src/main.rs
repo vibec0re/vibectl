@@ -149,7 +149,7 @@ impl Plugin for VibeWidget {
     fn manifest() -> Manifest {
         // No host-state subscriptions, no shell capabilities: everything this
         // widget does goes over its own WebSocket.
-        Manifest::new("vibectl", Mount::SidebarLead)
+        Manifest::new("vibectl", Mount::SidebarLead).with_version(env!("CARGO_PKG_VERSION"))
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
