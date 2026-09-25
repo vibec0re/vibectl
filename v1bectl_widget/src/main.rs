@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
-use hytte_plugin::{CmdReceiver, CmdSender, Input, MsgStream, Plugin};
+use hytte_plugin::{nodes, CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
 use tokio::sync::mpsc;
 use v1bectl_state::{DeviceState, DeviceStateValue, DeviceType, EventType};
 
@@ -178,15 +178,29 @@ impl Plugin for VibeWidget {
                 let id = ev.device_id.clone();
                 self.apply_event(&id, ev.event_type);
             }
-            Input::Event { node, kind } => self.on_ui_event(&node, kind),
+            // `Input::Event` is `#[non_exhaustive]` (it gained `output`, the
+            // clicked monitor); ids are screen-agnostic here, so ignore it.
+            Input::Event { node, kind, .. } => self.on_ui_event(&node, kind),
             // No host state, no RunCommands, and nothing to do when our sidebar
-            // slot shows/hides — the WS keeps state live either way.
-            Input::Snapshot(_) | Input::EffectResult { .. } | Input::SlotVisible(_) => {}
+            // slot shows/hides — the WS keeps state live either way. The rest
+            // are pushes this manifest never subscribes to.
+            Input::Snapshot(_)
+            | Input::EffectResult { .. }
+            | Input::SlotVisible(_)
+            | Input::AudioSpectrum(_)
+            | Input::ConsentDecision { .. }
+            | Input::CalendarUpcoming(_)
+            | Input::SessionLocked(_)
+            | Input::NowPlaying(_)
+            | Input::DatasourceQuery { .. }
+            | Input::DatasourceResult { .. } => {}
         }
         Vec::new()
     }
 
-    fn view(&self) -> Node {
+    /// A sidebar card only — no drawer panel, shown on every monitor — so the
+    /// root node converts straight into the SDK's [`View`].
+    fn view(&self) -> View {
         // No header/status-line chrome: just the devices. The only non-device
         // line is the empty-state message, so the widget isn't blank before
         // devices load (or when the server is down).
@@ -211,7 +225,9 @@ impl Plugin for VibeWidget {
             scroll: false,
             classes: vec!["vw-root".into()],
             children,
+            tooltip: None,
         }
+        .into()
     }
 }
 
@@ -333,11 +349,7 @@ impl VibeWidget {
                     // One native `boxed-list` card per group, flattened onto the
                     // plugin card by the host's `.ts-plugin-card list.boxed-list`
                     // rule so groups read as separated lists on one surface.
-                    groups.push(Node::ListBox {
-                        id: None,
-                        classes: vec!["boxed-list".into()],
-                        children: rows,
-                    });
+                    groups.push(nodes::list(rows).class("boxed-list").build());
                 }
             }
             if !groups.is_empty() || climate.is_some() {
@@ -370,6 +382,7 @@ impl VibeWidget {
             id: None,
             text: name.to_string(),
             classes: vec!["heading".into()],
+            tooltip: None,
         }];
         if let Some(peek) = climate.and_then(Climate::peek) {
             // A `Spacer` right-pins the climate peek (safe here: it's confined to
@@ -379,6 +392,7 @@ impl VibeWidget {
                 id: None,
                 text: peek,
                 classes: vec!["dim-label".into(), "numeric".into()],
+                tooltip: None,
             });
         }
         Node::Expander {
@@ -390,10 +404,12 @@ impl VibeWidget {
                 scroll: false,
                 classes: vec![],
                 children: header_row,
+                tooltip: None,
             }),
             children: body,
             expanded: open,
             classes: vec![],
+            tooltip: None,
         }
     }
 
@@ -532,6 +548,7 @@ impl VibeWidget {
                 id: None,
                 text: template.clone(),
                 classes: vec!["dim-label".into()],
+                tooltip: None,
             }],
             Element::Block { elements } => elements
                 .iter()
@@ -544,6 +561,7 @@ impl VibeWidget {
                         scroll: false,
                         classes: vec![],
                         children: cell,
+                        tooltip: None,
                     })
                 })
                 .collect(),
@@ -583,11 +601,7 @@ fn boxed_list(rows: Vec<Node>) -> Vec<Node> {
     if rows.is_empty() {
         return Vec::new();
     }
-    vec![Node::ListBox {
-        id: None,
-        classes: vec!["boxed-list".into()],
-        children: rows,
-    }]
+    vec![nodes::list(rows).class("boxed-list").build()]
 }
 
 /// One list row: a horizontal box of `content`, materialized inside a native
@@ -601,6 +615,7 @@ fn list_row(content: Vec<Node>) -> Node {
         scroll: false,
         classes: vec![],
         children: content,
+        tooltip: None,
     }
 }
 
@@ -610,6 +625,7 @@ fn status_label(text: &str) -> Node {
         id: None,
         text: text.to_string(),
         classes: vec!["dim-label".into()],
+        tooltip: None,
     }
 }
 
@@ -714,6 +730,7 @@ fn toggle_or_label(
                 id: None,
                 name: icon.to_string(),
                 classes: vec![icon_state.to_string()],
+                tooltip: None,
             },
             Node::Label {
                 id: None,
@@ -723,8 +740,10 @@ fn toggle_or_label(
                 } else {
                     vec![]
                 },
+                tooltip: None,
             },
         ],
+        tooltip: None,
     };
     match button_id {
         // `flat` drops the button chrome so it reads as row content but still
@@ -808,6 +827,7 @@ fn device_content(dev: &DeviceState, opts: &RowOpts) -> Option<Vec<Node>> {
                     id: None,
                     text: format!("{w:.1} W"),
                     classes: vec!["dim-label".into(), "numeric".into()],
+                    tooltip: None,
                 });
             }
             children
@@ -832,6 +852,7 @@ fn device_content(dev: &DeviceState, opts: &RowOpts) -> Option<Vec<Node>> {
                 } else {
                     vec![]
                 },
+                tooltip: None,
             }];
             if !readout.is_empty() {
                 children.push(Node::Spacer);
@@ -839,6 +860,7 @@ fn device_content(dev: &DeviceState, opts: &RowOpts) -> Option<Vec<Node>> {
                     id: None,
                     text: readout.join("  "),
                     classes: vec!["dim-label".into(), "numeric".into()],
+                    tooltip: None,
                 });
             }
             children
@@ -955,7 +977,9 @@ mod tests {
     /// stopped at `Box`/`Button`/`Revealer` would miss the whole tree.
     fn children_of(node: &Node) -> Vec<&Node> {
         match node {
-            Node::Box { children, .. } | Node::ListBox { children, .. } => children.iter().collect(),
+            Node::Box { children, .. } | Node::ListBox { children, .. } => {
+                children.iter().collect()
+            }
             Node::Button { child, .. } | Node::Revealer { child, .. } => vec![child],
             Node::Expander {
                 header, children, ..
@@ -1032,12 +1056,25 @@ mod tests {
     /// Is there a `block` row — a horizontal box whose children are ≥2 horizontal
     /// cell boxes (a KDL `block` lays its members out side by side)?
     fn has_horizontal_block(node: &Node) -> bool {
-        let is_block = matches!(node, Node::Box { dir: Dir::Horizontal, .. })
-            && children_of(node)
-                .iter()
-                .filter(|c| matches!(c, Node::Box { dir: Dir::Horizontal, .. }))
-                .count()
-                >= 2;
+        let is_block = matches!(
+            node,
+            Node::Box {
+                dir: Dir::Horizontal,
+                ..
+            }
+        ) && children_of(node)
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    Node::Box {
+                        dir: Dir::Horizontal,
+                        ..
+                    }
+                )
+            })
+            .count()
+            >= 2;
         is_block || children_of(node).iter().any(|c| has_horizontal_block(c))
     }
 
@@ -1062,7 +1099,7 @@ mod tests {
             outlet("o1", "Skrivbord", "bedroom", true),
             sensor("s1", "Klimat", "living_room"),
         ]);
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         // One collapsible panel per room (alphabetical): a name + climate-peek
         // header (the room's sensor promoted out of the body — no duplicate
         // "Klimat" row), then its devices. All present in the tree; the
@@ -1091,32 +1128,26 @@ mod tests {
         // draws the chevron; the plugin only drives the flag).
         assert!(!m.expanded.contains("living_room"));
         assert_eq!(
-            expander_open(&m.view(), "vw-panel-living_room"),
+            expander_open(&m.view().tree, "vw-panel-living_room"),
             Some(false),
             "collapsed by default"
         );
         // Climate peeks in the header (temp + humidity), promoted out of the body.
-        assert!(texts(&m.view()).iter().any(|t| t == "🌡 21.4°  💧 39%"));
+        assert!(texts(&m.view().tree).iter().any(|t| t == "🌡 21.4°  💧 39%"));
 
         // Click the header → expands, no server command.
-        let fx = m.update(Input::Event {
-            node: "vw-panel-living_room".into(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event("vw-panel-living_room", EventKind::Click));
         assert!(fx.is_empty(), "panel toggle is pure local UI");
         assert!(rx.try_recv().is_err(), "no command for a panel toggle");
         assert!(m.expanded.contains("living_room"));
         assert_eq!(
-            expander_open(&m.view(), "vw-panel-living_room"),
+            expander_open(&m.view().tree, "vw-panel-living_room"),
             Some(true),
             "expanded after a header click"
         );
 
         // Click again → collapses.
-        let _ = m.update(Input::Event {
-            node: "vw-panel-living_room".into(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event("vw-panel-living_room", EventKind::Click));
         assert!(!m.expanded.contains("living_room"));
     }
 
@@ -1145,7 +1176,7 @@ screen "wz" {
             ],
             kdl,
         );
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(
             all.iter().any(|t| t == "🌡 21.4°  💧 39%"),
             "climate in header: {all:?}"
@@ -1185,7 +1216,7 @@ screen "wz" {
             ],
             kdl,
         );
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(all.iter().any(|t| t == "💧 39%"), "humidity peek: {all:?}");
         assert!(
             !all.iter().any(|t| t.contains('🌡')),
@@ -1220,7 +1251,7 @@ screen "wz" {
             ],
             kdl,
         );
-        let idset = ids(&m.view());
+        let idset = ids(&m.view().tree);
         assert!(
             idset.iter().any(|i| i == "vw-panel-screen-0"),
             "distinct keys: {idset:?}"
@@ -1230,10 +1261,7 @@ screen "wz" {
             "distinct keys: {idset:?}"
         );
         // Toggling the first leaves the second collapsed.
-        let _ = m.update(Input::Event {
-            node: "vw-panel-screen-0".into(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event("vw-panel-screen-0", EventKind::Click));
         assert!(m.expanded.contains("screen-0"));
         assert!(!m.expanded.contains("screen-1"), "panels are independent");
     }
@@ -1241,10 +1269,7 @@ screen "wz" {
     #[test]
     fn click_toggles_light_without_local_mutation() {
         let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(70))]);
-        let fx = m.update(Input::Event {
-            node: "vw-l-l1".into(),
-            kind: EventKind::Click,
-        });
+        let fx = m.update(Input::event("vw-l-l1", EventKind::Click));
         assert!(fx.is_empty(), "no shell effects, ever");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -1265,10 +1290,10 @@ screen "wz" {
     fn slider_move_sets_brightness_without_local_mutation() {
         let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
         // A `Slider` move (drag/scroll/keyboard) reports the new value.
-        let _ = m.update(Input::Event {
-            node: "vw-sl-l1".into(),
-            kind: EventKind::ValueChanged { value: 73.4 },
-        });
+        let _ = m.update(Input::event(
+            "vw-sl-l1",
+            EventKind::ValueChanged { value: 73.4 },
+        ));
         assert_eq!(
             rx.try_recv().unwrap(),
             Cmd::SetLight {
@@ -1288,10 +1313,7 @@ screen "wz" {
     fn slider_value_is_rounded_and_clamped_to_1_100() {
         let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(50))]);
         for (value, want) in [(250.0, 100u8), (0.2, 1), (49.6, 50)] {
-            let _ = m.update(Input::Event {
-                node: "vw-sl-l1".into(),
-                kind: EventKind::ValueChanged { value },
-            });
+            let _ = m.update(Input::event("vw-sl-l1", EventKind::ValueChanged { value }));
             assert!(
                 matches!(rx.try_recv().unwrap(), Cmd::SetLight { brightness: Some(b), .. } if b == want),
                 "value {value} → brightness {want}"
@@ -1307,7 +1329,7 @@ screen "wz" {
             group,
             light("l1", "Taklampa", "living_room", true, Some(70)),
         ]);
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(
             !all.iter().any(|t| t.contains("Bedroom Lights")),
             "the server's virtual path emits no event echo — groups stay off the widget"
@@ -1317,10 +1339,7 @@ screen "wz" {
             "the physical light still renders: {all:?}"
         );
         // Defensively: even a synthetic event on a group id sends nothing.
-        let _ = m.update(Input::Event {
-            node: "vw-l-g1".into(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event("vw-l-g1", EventKind::Click));
         let _ = rx; // no assertion on cmd here — group still has Light state
     }
 
@@ -1387,7 +1406,7 @@ screen "wz" {
         // The de-dot (#…): on/off reads via a tinted symbolic icon, never a
         // `●/○` glyph baked into the label text.
         let (m, _rx) = model_with(vec![light("l1", "Taklampa", "x", true, Some(70))]);
-        let view = m.view();
+        let view = m.view().tree;
         assert!(
             icons(&view)
                 .iter()
@@ -1410,7 +1429,7 @@ screen "wz" {
         // disabled (greyed, non-interactive) so the row keeps its shape instead
         // of the slider popping in and out. Turn it on and it goes live.
         let (mut m, _rx) = model_with(vec![light("l1", "Taklampa", "x", false, Some(40))]);
-        let view = m.view();
+        let view = m.view().tree;
         assert!(has_slider(&view), "slider present while off");
         assert!(
             ids(&view).iter().any(|i| i == "vw-sl-l1"),
@@ -1431,7 +1450,7 @@ screen "wz" {
             Some(40),
         )])));
         assert_eq!(
-            slider_enabled(&m.view(), "vw-sl-l1"),
+            slider_enabled(&m.view().tree, "vw-sl-l1"),
             Some(true),
             "on ⇒ enabled slider"
         );
@@ -1440,10 +1459,7 @@ screen "wz" {
     #[test]
     fn outlet_click_toggles() {
         let (mut m, mut rx) = model_with(vec![outlet("o1", "Skrivbord", "x", true)]);
-        let _ = m.update(Input::Event {
-            node: "vw-o-o1".into(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event("vw-o-o1", EventKind::Click));
         assert_eq!(
             rx.try_recv().unwrap(),
             Cmd::SetOutlet {
@@ -1504,8 +1520,11 @@ screen "wz" {
         assert!(!m.devices[0].device_info.reachable);
         // Offline no longer shows a `◌` glyph — the row dims (`dim-label` on the
         // icon + name). The device still renders with its plain name.
-        let all = texts(&m.view());
-        assert!(all.iter().any(|t| t == "Taklampa"), "offline row shown: {all:?}");
+        let all = texts(&m.view().tree);
+        assert!(
+            all.iter().any(|t| t == "Taklampa"),
+            "offline row shown: {all:?}"
+        );
     }
 
     #[test]
@@ -1523,10 +1542,7 @@ screen "wz" {
     #[test]
     fn unknown_node_events_are_ignored() {
         let (mut m, mut rx) = model_with(vec![light("l1", "Taklampa", "x", true, None)]);
-        let _ = m.update(Input::Event {
-            node: "not-ours".into(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event("not-ours", EventKind::Click));
         assert!(rx.try_recv().is_err(), "no command for foreign nodes");
     }
 
@@ -1558,7 +1574,7 @@ screen "wz" {
             ],
             kdl,
         );
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         // The screen title is now the panel header (chevron + title + climate).
         assert!(
             all.iter().any(|t| t.contains("NEST :: WOHNZIMMER")),
@@ -1591,7 +1607,7 @@ screen "wohnzimmer" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(
             all.iter().any(|t| t == "wohnzimmer"),
             "panel labelled by screen name: {all:?}"
@@ -1609,7 +1625,7 @@ screen "wohnzimmer" {
             vec![light("l1", "Taklampa", "living_room", true, Some(70))],
             kdl,
         );
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         // Nothing in the config resolves → auto room layout (never blank), as
         // room panels.
         assert!(
@@ -1629,10 +1645,7 @@ screen "wohnzimmer" {
         let (mut m, mut rx) =
             model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
         // The button id is keyed by the resolved device_id — clicks still route.
-        let _ = m.update(Input::Event {
-            node: "vw-l-l1".into(),
-            kind: EventKind::Click,
-        });
+        let _ = m.update(Input::event("vw-l-l1", EventKind::Click));
         assert_eq!(
             rx.try_recv().unwrap(),
             Cmd::SetLight {
@@ -1657,7 +1670,7 @@ screen "wz" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
-        let view = m.view();
+        let view = m.view().tree;
         // Shown (with its glyph)…
         assert!(
             texts(&view).iter().any(|t| t == "MAIN"),
@@ -1687,7 +1700,7 @@ screen "wz" {
             );
             let (m, _rx) =
                 model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], &kdl);
-            has_slider(&m.view())
+            has_slider(&m.view().tree)
         };
         assert!(has(true), "slider=true shows the brightness slider");
         assert!(!has(false), "slider=false hides it");
@@ -1709,7 +1722,7 @@ screen "wz" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![light("l1", "Deko", "lr", true, Some(60))], kdl);
-        let view = m.view();
+        let view = m.view().tree;
         let ids = ids(&view);
         assert!(
             ids.iter().any(|i| i == "vw-l-l1"),
@@ -1738,7 +1751,7 @@ screen "wz" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
-        let view = m.view();
+        let view = m.view().tree;
         let ids = ids(&view);
         assert!(!ids.iter().any(|i| i == "vw-l-l1"), "no toggle: {ids:?}");
         assert!(
@@ -1768,7 +1781,7 @@ screen "wz" {
             vec![light("l1", "Taklampa", "living_room", true, Some(70))],
             kdl,
         );
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(
             all.iter().any(|t| t.contains("living_room")),
             "fell back: {all:?}"
@@ -1795,7 +1808,7 @@ screen "wz" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![light("l1", "LR Shelf", "lr", true, Some(60))], kdl);
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(all.iter().any(|t| t == "MY HOME"), "banner shown: {all:?}");
         assert!(all.iter().any(|t| t == "MAIN"), "device shown: {all:?}");
     }
@@ -1814,7 +1827,7 @@ screen "wz" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![outlet("o1", "Desk", "lr", true)], kdl);
-        let view = m.view();
+        let view = m.view().tree;
         assert!(
             texts(&view).iter().any(|t| t.contains("Desk")),
             "readout shown: {:?}",
@@ -1854,7 +1867,7 @@ screen "wz" {
             ],
             kdl,
         );
-        let view = m.view();
+        let view = m.view().tree;
         assert!(has_horizontal_block(&view), "block is a horizontal box");
         let all = texts(&view);
         assert!(all.iter().any(|t| t == "Deko"), "{all:?}");
@@ -1877,7 +1890,7 @@ screen "wz" {
 }
 "#;
         let (m, _rx) = model_with_config(vec![outlet("o1", "Desk", "lr", true)], kdl);
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(
             all.iter().any(|t| t == "Lamp"),
             "outlet glyph + name: {all:?}"
@@ -1903,14 +1916,11 @@ screen "wz" {
             vec![group, light("l1", "LR Shelf", "lr", true, Some(60))],
             kdl,
         );
-        let all = texts(&m.view());
+        let all = texts(&m.view().tree);
         assert!(
             !all.iter().any(|t| t.contains("GROUP")),
             "virtual group skipped: {all:?}"
         );
-        assert!(
-            all.iter().any(|t| t == "MAIN"),
-            "real light shown: {all:?}"
-        );
+        assert!(all.iter().any(|t| t == "MAIN"), "real light shown: {all:?}");
     }
 }
