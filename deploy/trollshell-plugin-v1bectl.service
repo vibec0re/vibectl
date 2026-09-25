@@ -1,0 +1,19 @@
+# trollshell widget plugin for v1bectl (out-of-process; vibec0re/trollshell#35).
+# Pairs with the units in trollshell's etc/systemd/user/ — same lifecycle as
+# trollshell-plugin-clock-demo.service. Install as a *user* unit.
+[Unit]
+Description=v1bectl trollshell sidebar widget (out-of-process plugin)
+PartOf=niri-session.target
+Requisite=graphical-session.target
+After=graphical-session.target trollshell.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/v1bectl_widget
+# Where v1bectl_server listens (host:port); this is the default.
+Environment=V1BECTL_SERVER=127.0.0.1:31337
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=niri-session.target
