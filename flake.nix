@@ -38,7 +38,7 @@
         cargoLock = {
           lockFile = ./Cargo.lock;
           outputHashes = {
-            "hytte-plugin-0.1.0" = "sha256-vIG4eApPxfsmZnV/aivmCEQlCQjoUS0soMHjtX8uU8Y=";
+            "hytte-plugin-0.1.0" = "sha256-QkDPWOFPB5f8+ThuSEqHlehaJrzB0rkjR9Ig86YerPA=";
           };
         };
 
