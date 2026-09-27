@@ -281,6 +281,41 @@ impl VirtualDeviceManager {
         dangling
     }
 
+    /// Every button that more than one button controller binds, with those
+    /// controllers (sorted). Each press of such a button runs all of their
+    /// actions. A stale `button_test.toml` next to `button_ctrl.toml` did
+    /// that: the server loads every `virtual_devices/*.toml`, and both bound
+    /// `switch_hallway` (#34 review, nit 5). [`Self::start`] logs these.
+    pub async fn shared_buttons(&self) -> Vec<(DeviceId, Vec<DeviceId>)> {
+        let mut bound: HashMap<DeviceId, Vec<DeviceId>> = HashMap::new();
+        {
+            let devices = self.virtual_devices.read().await;
+            for device in devices.values() {
+                if !matches!(device.device_type(), VirtualDeviceType::ButtonController) {
+                    continue;
+                }
+                // A controller's only input is its button.
+                for button in device.input_devices() {
+                    bound
+                        .entry(button)
+                        .or_default()
+                        .push(device.device_id().clone());
+                }
+            }
+        }
+
+        let mut shared: Vec<(DeviceId, Vec<DeviceId>)> = bound
+            .into_iter()
+            .filter(|(_, controllers)| controllers.len() > 1)
+            .map(|(button, mut controllers)| {
+                controllers.sort();
+                (button, controllers)
+            })
+            .collect();
+        shared.sort();
+        shared
+    }
+
     /// The ids in `refs` the store has no device for, each once.
     async fn missing(&self, refs: Vec<DeviceId>) -> Vec<DeviceId> {
         let mut seen = HashSet::new();
@@ -708,8 +743,9 @@ impl VirtualDeviceManager {
 
     /// Start the manager: input tracking runs [`Self::handle_event`] for
     /// every event on the bus, in a background task. It also logs every
-    /// dangling reference (see [`Self::dangling_references`]). The server
-    /// calls this once all virtual devices are loaded.
+    /// dangling reference (see [`Self::dangling_references`]), and every
+    /// button more than one controller binds (see [`Self::shared_buttons`]).
+    /// The server calls this once all virtual devices are loaded.
     pub async fn start(&self) -> Result<(), VirtualDeviceError> {
         let manager = Arc::new(self.clone());
 
@@ -719,6 +755,14 @@ impl VirtualDeviceManager {
         self.tracking.store(true, Ordering::Release);
         for (virtual_id, missing) in self.dangling_references().await {
             warn_dangling(&virtual_id, &missing);
+        }
+        for (button, controllers) in self.shared_buttons().await {
+            tracing::warn!(
+                "⚠️ Button {} is bound by {} button controllers ({}): each press runs all of their actions",
+                button,
+                controllers.len(),
+                controllers.join(", ")
+            );
         }
 
         tokio::spawn(async move {
@@ -1589,6 +1633,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Log lines written while a test holds the subscriber, as text.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl CapturedLogs {
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync {
+            let logs = self.clone();
+            tracing_subscriber::fmt()
+                .with_writer(move || logs.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .finish()
+        }
+
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("logs")).into_owned()
+        }
+    }
+
+    /// #34 review, nit 5: two controllers on one button run two actions per
+    /// press. A stale `button_test.toml` next to the new `button_ctrl.toml`
+    /// did that, with no log line. `start` must warn about it. A button
+    /// bound once isn't reported, and removing one of the two clears it.
+    #[tokio::test]
+    async fn start_warns_about_a_button_two_controllers_bind() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        store.add_device(light_info("a"), off()).await;
+        for button in ["btn", "other"] {
+            add_switch(&store, button).await;
+        }
+        for (id, button) in [
+            ("ctrl_new", "btn"),
+            ("ctrl_stale", "btn"),
+            ("ctrl_other", "other"),
+        ] {
+            let (press_on, press_off) = (
+                serde_json::json!(["on", "a"]),
+                serde_json::json!(["off", "a"]),
+            );
+            manager
+                .add_virtual_device(Box::new(controller(
+                    id, button, press_on, press_off, &store, &bus,
+                )))
+                .await
+                .expect("register");
+        }
+        let both = vec!["ctrl_new".to_string(), "ctrl_stale".to_string()];
+        assert_eq!(
+            manager.shared_buttons().await,
+            vec![("btn".to_string(), both)]
+        );
+
+        let logs = CapturedLogs::default();
+        {
+            let _default = tracing::subscriber::set_default(logs.subscriber());
+            manager.start().await.expect("start");
+        }
+        let logs = logs.text();
+        assert!(
+            logs.contains("Button btn is bound by 2 button controllers (ctrl_new, ctrl_stale)"),
+            "start must warn about btn: {logs:?}"
+        );
+        assert!(
+            !logs.contains("Button other"),
+            "other is bound once: {logs:?}"
+        );
+
+        manager
+            .remove_virtual_device(&"ctrl_stale".to_string())
+            .await
+            .expect("remove");
+        assert!(manager.shared_buttons().await.is_empty());
     }
 
     /// #16: adding a virtual device announces it with `DeviceAdded`, and
