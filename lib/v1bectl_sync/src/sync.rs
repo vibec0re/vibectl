@@ -1042,6 +1042,11 @@ impl SyncEngine {
                                 device.device_id, e
                             ),
                         }
+                    } else {
+                        // ✅ Nothing to reconcile, but this may still be the
+                        // hub confirming a user write (#32).
+                        self.clear_confirmed(&device.device_id, &gateway_state)
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -1058,6 +1063,32 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    /// ✅ A pull found the store and the hub agreeing on `gateway_state`. If
+    /// that's the value a pending user write expects, this is the hub's
+    /// confirmation: drop the entry.
+    ///
+    /// With optimistic updates the store shows a write before the hub does,
+    /// so once the push lands the periodic pull finds the two equal and never
+    /// reaches [`Self::handle_gateway_state_change`], where confirmations are
+    /// otherwise taken. Without this, the entry lingered for the rest of its
+    /// window, and a physical-switch change in that time was ignored as "not
+    /// our change". There's nothing to echo: the store already had the value,
+    /// and the write echoed it. An entry expecting something else is left
+    /// alone; it still waits for its own value (a newer write, say).
+    async fn clear_confirmed(&self, device_id: &DeviceId, gateway_state: &DeviceStateValue) {
+        let mut pending = self.pending_confirmations.write().await;
+        let confirmed = pending.get(device_id).is_some_and(|confirmation| {
+            self.states_equal(&confirmation.expected_state, gateway_state)
+        });
+        if confirmed {
+            pending.remove(device_id);
+            debug!(
+                "✅ SYNC_DEBUG: UI change confirmed for {} - store and hub agree",
+                device_id
+            );
+        }
     }
 
     fn states_equal(&self, state1: &DeviceStateValue, state2: &DeviceStateValue) -> bool {

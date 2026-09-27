@@ -129,6 +129,44 @@ async fn hub_confirmation_clears_the_pending_entry() {
     rig.shutdown().await;
 }
 
+/// The same lifecycle through the periodic pull (#32). With optimistic
+/// updates the store shows the write before the hub does, so once the push
+/// lands, the pull finds the store and the hub equal and has nothing to
+/// reconcile. It must still take that as the confirmation: a physical
+/// switch right after must be taken, not ignored for the rest of the
+/// window. (The window is long, so it can't run out during the test.)
+#[tokio::test]
+async fn periodic_pull_confirmation_clears_the_pending_entry() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Apply, false),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: Duration::from_secs(60),
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    rig.write("a", on()).await;
+    rig.hub.wait("push", |log| log.sets_done >= 1).await;
+    // A whole cycle that finds `on` in the store and on the hub.
+    rig.full_pull_cycle().await;
+    assert_eq!(rig.stored("a").await, on(), "after the hub confirmed");
+
+    let flipped = light(false, 40);
+    rig.hub.report("a", flipped.clone());
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored("a").await,
+        flipped,
+        "the switch change after the confirmation was ignored: the pending \
+         entry outlived the periodic pull's confirmation"
+    );
+
+    rig.shutdown().await;
+}
+
 /// The window is bounded. With the hub still reporting the old value once
 /// it's up, GatewayWins reverts the write, whether the push went through
 /// (and the device never changed) or failed. The store isn't left
