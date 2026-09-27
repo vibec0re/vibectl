@@ -296,42 +296,49 @@ impl VirtualDeviceManager {
     /// Remove a virtual device. A `DeviceRemoved` event announces it, so
     /// clients drop it without a refetch (#16). Removing one the manager
     /// doesn't have does nothing, and announces nothing.
+    ///
+    /// It leaves the manager and the store under one hold of the
+    /// `virtual_devices` lock (#34 review, finding 2). So a write that takes
+    /// the lock, such as a button action, finds it in both or in neither.
+    /// It used to leave the store only after letting go, and an action that
+    /// ran in between took it for a physical light: it wrote the group's
+    /// state back into the store and queued it for the gateway, under an id
+    /// the hub doesn't know.
     pub async fn remove_virtual_device(
         &self,
         device_id: &DeviceId,
     ) -> Result<(), VirtualDeviceError> {
-        // Remove from devices
-        let removed_device = {
+        // Remove from devices, and from the store, in one hold
+        let (device, removed_from_store) = {
             let mut devices = self.virtual_devices.write().await;
-            devices.remove(device_id)
+            let Some(device) = devices.remove(device_id) else {
+                return Ok(());
+            };
+            (device, self.state_store.remove_device(device_id).await)
         };
 
-        if let Some(device) = removed_device {
-            // Clean up input mappings
-            {
-                let mut input_map = self.input_mappings.write().await;
-                for input_device_id in device.input_devices() {
-                    if let Some(virtual_ids) = input_map.get_mut(&input_device_id) {
-                        virtual_ids.retain(|id| id != device_id);
-                        if virtual_ids.is_empty() {
-                            input_map.remove(&input_device_id);
-                        }
+        // Clean up input mappings
+        {
+            let mut input_map = self.input_mappings.write().await;
+            for input_device_id in device.input_devices() {
+                if let Some(virtual_ids) = input_map.get_mut(&input_device_id) {
+                    virtual_ids.retain(|id| id != device_id);
+                    if virtual_ids.is_empty() {
+                        input_map.remove(&input_device_id);
                     }
                 }
             }
-
-            // Clean up output mappings
-            {
-                let mut output_map = self.output_mappings.write().await;
-                output_map.remove(device_id);
-            }
-
-            // Remove from state store
-            self.state_store.remove_device(device_id).await?;
-            self.publish_lifecycle(device_id, EventType::DeviceRemoved)
-                .await;
         }
 
+        // Clean up output mappings
+        {
+            let mut output_map = self.output_mappings.write().await;
+            output_map.remove(device_id);
+        }
+
+        removed_from_store?;
+        self.publish_lifecycle(device_id, EventType::DeviceRemoved)
+            .await;
         Ok(())
     }
 
@@ -518,6 +525,11 @@ impl VirtualDeviceManager {
     /// the sync engine and echoed. A physical one is written like a direct
     /// write.
     ///
+    /// A target the manager doesn't have is physical only if the store
+    /// doesn't mark it virtual, as the API tells them apart. A virtual one
+    /// is `DeviceNotFound`: the manager is its only writer, and the gateway
+    /// doesn't know it (#34 review, finding 2).
+    ///
     /// This takes the `virtual_devices` lock and holds it to the end, so the
     /// state the action starts from is still the target's when the write
     /// lands (see the type's docs). So don't call it with that lock held.
@@ -527,11 +539,20 @@ impl VirtualDeviceManager {
         let current = match devices.get(target) {
             Some(device) => device.current_state(),
             None => {
-                self.state_store
+                let stored = self
+                    .state_store
                     .get_device(target)
                     .await
-                    .ok_or_else(|| VirtualDeviceError::DeviceNotFound(target.clone()))?
-                    .state
+                    .ok_or_else(|| VirtualDeviceError::DeviceNotFound(target.clone()))?;
+                if stored
+                    .device_info
+                    .device_groups
+                    .iter()
+                    .any(|g| g == "virtual")
+                {
+                    return Err(VirtualDeviceError::DeviceNotFound(target.clone()));
+                }
+                stored.state
             }
         };
         let DeviceStateValue::Light(light) = &current else {
@@ -1566,6 +1587,117 @@ mod tests {
             pump(&manager, &mut rx).await.is_empty(),
             "nothing to announce"
         );
+    }
+
+    /// A sync engine on the dummy hub, attached to `manager`, that never
+    /// runs: a write it takes only shows as its sync status.
+    fn attach_engine(
+        manager: &VirtualDeviceManager,
+        store: &Arc<StateStore>,
+        bus: &Arc<EventBus>,
+    ) -> Arc<SyncEngine> {
+        let engine = Arc::new(SyncEngine::new(
+            store.clone(),
+            bus.clone(),
+            Arc::new(DummyGateway::new("basic_home")),
+            None,
+        ));
+        manager.attach_sync_engine(engine.clone());
+        engine
+    }
+
+    /// #34 review, finding 2: a button action that runs while its group is
+    /// being removed must not write the group as a physical light. The
+    /// removal took the group out of the manager, let go of the lock, and
+    /// only then took it out of the store. An action in between found it in
+    /// the store only, wrote the group's state back and queued it for the
+    /// gateway under its virtual id.
+    ///
+    /// The test holds the removal after it lets go of the device lock (at
+    /// the input mappings, the lock it takes next) and runs the action
+    /// there. The group must have left the store with the manager, and the
+    /// action must find nothing.
+    #[tokio::test]
+    async fn button_action_during_removal_never_writes_the_group_as_a_light() {
+        let (manager, store, bus) = started_group(Kind::Curves, [off(), off(), off()]).await;
+        let engine = attach_engine(&manager, &store, &bus);
+        let g = "g".to_string();
+        let on = ButtonAction::parse(&[serde_json::json!("on"), serde_json::json!("g")])
+            .expect("action");
+
+        let removal = {
+            let held = manager.input_mappings.read().await;
+            let removal = tokio::spawn({
+                let (manager, g) = (manager.clone(), g.clone());
+                async move { manager.remove_virtual_device(&g).await }
+            });
+            // The timeout only bounds a failure.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while manager.virtual_devices.read().await.contains_key(&g) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the removal never took g out of the manager");
+
+            assert!(
+                store.get_device(&g).await.is_none(),
+                "g has left the manager but not the store"
+            );
+            let result = manager.run_action(&on).await;
+            assert!(
+                matches!(&result, Err(VirtualDeviceError::DeviceNotFound(id)) if *id == g),
+                "the action must find no g: {result:?}"
+            );
+            drop(held);
+            removal
+        };
+        removal.await.expect("removal task").expect("remove");
+
+        assert!(
+            store.get_device(&g).await.is_none(),
+            "g is back in the store"
+        );
+        let status = engine.get_sync_status(&g).await;
+        assert!(status.is_none(), "g was queued for the gateway: {status:?}");
+        for id in ["a", "b", "c"] {
+            assert_eq!(stored(&store, id).await, off(), "{id} moved");
+        }
+    }
+
+    /// #34 review, finding 2: a button action's target that the store marks
+    /// virtual, but the manager doesn't have, isn't a physical light, as the
+    /// API tells them apart. The press finds nothing: it doesn't write the
+    /// group's state back or queue it for the gateway. The group is taken
+    /// out of the manager only, the first step of the old removal.
+    #[tokio::test]
+    async fn button_action_on_a_virtual_device_the_manager_lacks_writes_nothing() {
+        let (manager, store, bus) = started_group(Kind::Curves, [off(), off(), off()]).await;
+        let engine = attach_engine(&manager, &store, &bus);
+        let (press_on, press_off) = (
+            serde_json::json!(["on", "g"]),
+            serde_json::json!(["off", "g"]),
+        );
+        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        let g = "g".to_string();
+        manager.virtual_devices.write().await.remove(&g);
+        let before = stored(&store, "g").await;
+        let mut rx = bus.subscribe();
+
+        press(&store, &bus, true).await;
+        let events = pump(&manager, &mut rx).await;
+
+        assert_eq!(
+            stored(&store, "g").await,
+            before,
+            "g was written as a light"
+        );
+        assert!(echoes(&events, "g").is_empty(), "g was echoed");
+        let status = engine.get_sync_status(&g).await;
+        assert!(status.is_none(), "g was queued for the gateway: {status:?}");
+        for id in ["a", "b", "c"] {
+            assert_eq!(stored(&store, id).await, off(), "{id} moved");
+        }
     }
 
     /// #15: input tracking must outlive falling behind the bus. More events
