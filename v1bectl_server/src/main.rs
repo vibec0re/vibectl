@@ -365,6 +365,7 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                                 "press_off": cfg.press_off,
                                 "press_on_long": cfg.press_on_long,
                                 "press_off_long": cfg.press_off_long,
+                                "press_double": cfg.press_double,
                             }),
                         };
 
@@ -372,12 +373,11 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                         match v1bectl_virtual::ButtonController::new(
                             vd_config,
                             cfg.button.clone(),
-                            cfg.press_on.clone(),
-                            cfg.press_off.clone(),
-                            cfg.press_on_long.clone(),
-                            cfg.press_off_long.clone(),
-                            state_store.clone(),
-                            event_bus.clone(),
+                            &cfg.press_on,
+                            &cfg.press_off,
+                            cfg.press_on_long.as_deref(),
+                            cfg.press_off_long.as_deref(),
+                            cfg.press_double.as_deref(),
                         ) {
                             Ok(button_controller) => {
                                 // 🔥 REGISTER WITH VIRTUAL DEVICE MANAGER! 💖

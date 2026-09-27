@@ -14,7 +14,14 @@ pub struct EventProducer {
 
 #[derive(Debug, Clone)]
 pub enum EventScenario {
+    /// Now and then a random attribute or reachability event. It doesn't
+    /// press the switch at random any more: a press runs the
+    /// button controllers bound to it (#35), so at random it would switch
+    /// Bedroom Lights about every four minutes. Press it on demand with
+    /// `v1bectl_cli button <device_id>` instead.
     BasicHome,
+    /// Livelier, and it clicks the switch at random, about once a minute
+    /// (`ButtonPressed { SinglePress }`), which runs its controllers.
     AmbientActivity,
 }
 
@@ -89,18 +96,6 @@ impl EventProducer {
                                 },
                             }
                         }
-                        2 if device_id.contains("switch") => DeviceEvent {
-                            timestamp: SystemTime::now(),
-                            device_id: device_id.clone(),
-                            event_type: EventType::ButtonPressed {
-                                button_id: "main".to_string(),
-                                press_type: match rng.gen_range(0..3) {
-                                    0 => ButtonPressType::SinglePress,
-                                    1 => ButtonPressType::DoublePress,
-                                    _ => ButtonPressType::LongPress,
-                                },
-                            },
-                        },
                         3 if device_id.contains("motion") => DeviceEvent {
                             timestamp: SystemTime::now(),
                             device_id: device_id.clone(),

@@ -4,18 +4,35 @@ use crate::virtual_device::{
     VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
 };
 use async_trait::async_trait;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use v1bectl_sync::{
-    DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState, StateStore,
+    ButtonPressType, DeviceEvent, DeviceId, DeviceStateValue, EventType, LightState,
 };
+
+/// How long after its button's last `ButtonPressed` a
+/// [`ButtonController`] drops that button's switch echoes (see the type's
+/// docs: one press fires once).
+///
+/// The echo of a press comes from the sync engine's pull. So it trails the
+/// gesture by up to a pull interval (2 s) and the pull's own time, and the
+/// release of a long press trails it by as long as the button was held.
+/// 15 s covers two pulls and a long hold, with room to spare. It's short
+/// enough that a button whose gestures stop coming (the hub's event stream
+/// dropped) works off its echoes again within seconds.
+pub const ECHO_QUIET_PERIOD: Duration = Duration::from_secs(15);
+
+/// Where a [`ButtonController`] reads the time for its quiet period.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonCommand {
-    Inc, // Increment brightness
-    Dec, // Decrement brightness
-    Set, // Set specific value
-    On,  // Turn on
-    Off, // Turn off
+    Inc,    // Increment brightness
+    Dec,    // Decrement brightness
+    Set,    // Set specific value
+    On,     // Turn on
+    Off,    // Turn off
+    Toggle, // Off if lit, else on (#35)
 }
 
 impl ButtonCommand {
@@ -26,6 +43,7 @@ impl ButtonCommand {
             "set" => Some(Self::Set),
             "on" => Some(Self::On),
             "off" => Some(Self::Off),
+            "toggle" => Some(Self::Toggle),
             _ => None,
         }
     }
@@ -71,6 +89,17 @@ impl ButtonAction {
     }
 
     /// The state this action moves a light at `light` to.
+    ///
+    /// `on` keeps the light's level, and lights it at 100 if it has none
+    /// (0 or unknown). `off` keeps the level too, so the next `on` restores
+    /// it (#34). `toggle` is `off` for a lit light and `on` for any other.
+    /// Lit means on at a level above 0: a light that's on at 0 shows
+    /// nothing, so a toggle lights it instead of switching it off (the same
+    /// rule a group reads its members by, #34).
+    ///
+    /// It's pure: the manager hands it the target's state and writes the
+    /// result back under one hold of its lock, so two toggles in a row each
+    /// start from what the other left.
     #[must_use]
     pub fn apply(&self, mut light: LightState) -> LightState {
         match self.command {
@@ -93,17 +122,25 @@ impl ButtonAction {
                 light.brightness = Some(brightness);
                 light.is_on = brightness > 0;
             }
-            ButtonCommand::On => {
-                light.is_on = true;
-                if light.brightness.unwrap_or(0) == 0 {
-                    light.brightness = Some(100);
+            ButtonCommand::On => turn_on(&mut light),
+            ButtonCommand::Off => light.is_on = false,
+            ButtonCommand::Toggle => {
+                if light.is_on && light.brightness != Some(0) {
+                    light.is_on = false;
+                } else {
+                    turn_on(&mut light);
                 }
-            }
-            ButtonCommand::Off => {
-                light.is_on = false;
             }
         }
         light
+    }
+}
+
+/// `on`: lit, at its level, or at 100 if it has none.
+fn turn_on(light: &mut LightState) {
+    light.is_on = true;
+    if light.brightness.unwrap_or(0) == 0 {
+        light.brightness = Some(100);
     }
 }
 
@@ -177,8 +214,82 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
     transition(old, new)
 }
 
-/// Button Controller: runs an action when its button is pressed, and
-/// another when it's released.
+/// Button Controller: runs its actions when its button is pressed.
+///
+/// It has an action for each edge of a press, and one for each gesture a
+/// hub can recognise: `press_on` runs when the button goes down (a press),
+/// `press_off` when it comes back up (a release), `press_double` for a
+/// double press, and `press_on_long`, in place of `press_on`, for a press
+/// the hub reports as held (a long press). `press_off_long` is accepted and
+/// checked, but nothing runs it yet: no event source reports the end of a
+/// long press. A missing or empty action does nothing.
+///
+/// A press reaches it in one of two shapes, and each maps onto those
+/// actions like this (#35):
+///
+/// | Event from its button | What happened | Actions run, in order |
+/// |---|---|---|
+/// | switch echo, `is_pressed` `false` → `true` | the button went down | `press_on` |
+/// | switch echo, `is_pressed` `true` → `false` | the button came up | `press_off` |
+/// | switch echo that keeps `is_pressed` (a battery tick) | nothing | nothing |
+/// | `ButtonPressed { SinglePress }` | a click: down, then up | `press_on`, `press_off` |
+/// | `ButtonPressed { DoublePress }` | a double click | `press_double` (if there's none: `press_on`, `press_off`, `press_on`, `press_off`) |
+/// | `ButtonPressed { LongPress }` | a press, still held | `press_on_long` (`press_on` if there's none) |
+///
+/// The switch echo is the sync engine's `{"Switch": …}` state echo, and
+/// only a change of `is_pressed` is a press or a release (#34). A
+/// `ButtonPressed` is a gesture a hub recognised on its own and reports
+/// whole, over its event stream: a Dirigera remote's `clickPattern`, or the
+/// dummy's. Why each gesture maps the way it does:
+///
+/// - **A `SinglePress` is a press and a release.** A hub reports a click
+///   once the button is back up. It can't tell a click from a long press
+///   before the release, or from a double press before the double-click
+///   time is up. So a click has both edges, and runs both actions.
+/// - **A `DoublePress` runs its own action.** The hub folds the two clicks
+///   into one event, so a controller can give it a meaning of its own.
+///   Without a `press_double`, it runs what two clicks run: that's what it
+///   would have run had the hub reported two `SinglePress`es, and ignoring
+///   it would drop two real presses. With a `toggle` click, that's two
+///   toggles, which cancel out: give a toggling controller a
+///   `press_double`.
+/// - **A `LongPress` is a press that's still held.** A hub reports it while
+///   the button is still down, once it has been held long enough, and
+///   never reports the release. So only the press edge runs, with the long
+///   action. Running a release action would make one up, and with an
+///   `inc` on the long press and a `dec` on its release it would also undo
+///   the long press.
+///
+/// The event's `button_id` (which of the remote's buttons; `main` when the
+/// hub doesn't say) isn't matched: a controller binds a whole device.
+///
+/// What a click does is up to the actions. `toggle` on `press_on`, with no
+/// `press_off`, flips the lights with each click, as the shipped
+/// `button_ctrl.toml` does. A pair like `on` on `press_on` and `off` on
+/// `press_off` is hold-to-light instead: the lights are on while the
+/// button is down, so a click turns them on and off again.
+///
+/// **One press fires once.** A remote can report one press both ways: as a
+/// `ButtonPressed` over the hub's event stream, and as an `is_pressed`
+/// change that the sync engine's pull picks up and echoes after it. So for
+/// a quiet period after its button's last `ButtonPressed`
+/// ([`ECHO_QUIET_PERIOD`], 15 s), a controller runs nothing for that
+/// button's switch echoes (#35). While the event stream is up, the next
+/// real press comes as a `ButtonPressed` too, so the window drops only
+/// echoes. Once it has passed, the echoes run again. So a button that
+/// never reports a gesture (a switch that only has the flag, or a hub
+/// without an event stream) works off its echoes, as in #34, and so does
+/// one whose gestures stop coming (the hub's event stream dropped) once
+/// the window after the last one is over. It used to stop for good at the
+/// first gesture, and then a dropped stream left the button dead until a
+/// restart.
+///
+/// The gaps: an echo that comes before its press's `ButtonPressed`, with
+/// no window open, still runs. That's the first press after a quiet
+/// spell, if a pull lands while the button is down. With a `toggle` click
+/// it then runs twice, and the click does nothing. The release echo of a
+/// hold longer than the window runs too (`press_off`, which a toggling
+/// controller doesn't have).
 ///
 /// It makes no writes of its own. Once it's registered, the
 /// [`VirtualDeviceManager`](crate::VirtualDeviceManager) hands it its
@@ -192,42 +303,35 @@ pub struct ButtonController {
     button_id: String, // Button device to listen to
     press_on_action: Option<ButtonAction>,
     press_off_action: Option<ButtonAction>,
-    // kept: long-press actions are accepted and stored now; the long-press
-    // detection path is not wired up yet, so these aren't read.
-    #[allow(dead_code)]
-    press_on_long_action: Option<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
-    press_off_long_action: Option<Vec<serde_json::Value>>,
+    press_on_long_action: Option<ButtonAction>,
+    press_off_long_action: Option<ButtonAction>,
+    press_double_action: Option<ButtonAction>,
+    /// When its button last reported a gesture (`ButtonPressed`), if it
+    /// ever has. For `quiet_period` after that, its switch echoes run
+    /// nothing (see the type's docs: one press fires once).
+    last_gesture: Mutex<Option<Instant>>,
+    quiet_period: Duration,
+    clock: Clock,
 }
 
 impl ButtonController {
-    /// A controller for `button_id` that runs `press_on` on a press and
-    /// `press_off` on a release. Each is `[command, target, amount]` (see
-    /// [`ButtonAction::parse`]); an empty one does nothing, and a malformed
-    /// one fails here.
+    /// A controller for `button_id` that runs `press_on` on a press,
+    /// `press_off` on a release, `press_on_long` on a long press and
+    /// `press_double` on a double press (see the type's docs for what runs
+    /// when). Each is `[command, target, amount]` (see
+    /// [`ButtonAction::parse`]); a missing or empty one does nothing, and a
+    /// malformed one fails here, the long and double ones too.
     ///
-    /// `state_store` and `event_bus` aren't used any more (the manager
-    /// delivers the events and makes the writes). They stay so callers
-    /// don't have to change.
-    // kept: constructor takes the full set of button actions and dependencies;
-    // grouping them into a struct would change the public API.
-    #[allow(clippy::too_many_arguments)]
-    // kept by value: callers outside this PR's lane (v1bectl_server) pass an
-    // owned Vec (some via `cfg.press_on.clone()`); v1bectl_server joins the
-    // ratchet separately, so its call sites aren't touched here.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "v1bectl_server passes owned Vecs here and is outside this PR's lane"
-    )]
+    /// It takes no store or event bus: the manager delivers its button's
+    /// events and makes the writes (#16).
     pub fn new(
         config: VirtualDeviceConfig,
         button_id: String,
-        press_on: Vec<serde_json::Value>,
-        press_off: Vec<serde_json::Value>,
-        press_on_long: Option<Vec<serde_json::Value>>,
-        press_off_long: Option<Vec<serde_json::Value>>,
-        _state_store: Arc<StateStore>,
-        _event_bus: Arc<EventBus>,
+        press_on: &[serde_json::Value],
+        press_off: &[serde_json::Value],
+        press_on_long: Option<&[serde_json::Value]>,
+        press_off_long: Option<&[serde_json::Value]>,
+        press_double: Option<&[serde_json::Value]>,
     ) -> Result<Self, VirtualDeviceError> {
         let parse = |action: &[serde_json::Value]| {
             if action.is_empty() {
@@ -240,11 +344,92 @@ impl ButtonController {
         Ok(Self {
             config,
             button_id,
-            press_on_action: parse(&press_on)?,
-            press_off_action: parse(&press_off)?,
-            press_on_long_action: press_on_long,
-            press_off_long_action: press_off_long,
+            press_on_action: parse(press_on)?,
+            press_off_action: parse(press_off)?,
+            press_on_long_action: parse(press_on_long.unwrap_or_default())?,
+            press_off_long_action: parse(press_off_long.unwrap_or_default())?,
+            press_double_action: parse(press_double.unwrap_or_default())?,
+            last_gesture: Mutex::new(None),
+            quiet_period: ECHO_QUIET_PERIOD,
+            clock: Arc::new(Instant::now),
         })
+    }
+
+    /// The same controller, with a quiet period of `quiet_period` after
+    /// each gesture instead of [`ECHO_QUIET_PERIOD`].
+    #[must_use]
+    pub fn with_echo_quiet_period(mut self, quiet_period: Duration) -> Self {
+        self.quiet_period = quiet_period;
+        self
+    }
+
+    /// The same controller, reading the time for its quiet period from
+    /// `clock` instead of [`Instant::now`]. A test hands it a clock it moves
+    /// by hand, so the window passes without a sleep.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// The action for one edge of a press: `press_on` when the button goes
+    /// down, `press_off` when it comes back up.
+    fn edge(&self, is_pressed: bool) -> Option<&ButtonAction> {
+        if is_pressed {
+            self.press_on_action.as_ref()
+        } else {
+            self.press_off_action.as_ref()
+        }
+    }
+
+    /// The actions for a gesture the hub reports whole, in the order they
+    /// run. The type's docs have the table, and why.
+    fn gesture(&self, press_type: &ButtonPressType) -> Vec<&ButtonAction> {
+        let click = [self.edge(true), self.edge(false)];
+        match press_type {
+            ButtonPressType::SinglePress => click.into_iter().flatten().collect(),
+            ButtonPressType::DoublePress => match &self.press_double_action {
+                Some(double) => vec![double],
+                None => click.into_iter().chain(click).flatten().collect(),
+            },
+            ButtonPressType::LongPress => self
+                .press_on_long_action
+                .as_ref()
+                .or_else(|| self.edge(true))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// When its button last reported a gesture. The lock is only ever held
+    /// to read or swap it, so a poisoned one still holds a good value.
+    fn last_gesture(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.last_gesture
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A clock a test moves by hand, for a controller's quiet period: the
+/// window passes without a sleep.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestClock(Arc<Mutex<Instant>>);
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+
+    /// `controller`, reading the time from this clock.
+    pub(crate) fn drive(&self, controller: ButtonController) -> ButtonController {
+        let clock = self.clone();
+        controller.with_clock(move || *clock.0.lock().unwrap())
     }
 }
 
@@ -271,17 +456,38 @@ impl VirtualDevice for ButtonController {
         if event.device_id != self.button_id {
             return Vec::new();
         }
+        let now = (self.clock)();
+        if let EventType::ButtonPressed { press_type, .. } = &event.event_type {
+            if self.last_gesture().replace(now).is_none() {
+                tracing::info!(
+                    "🔘 Button {} reports its presses as ButtonPressed: {} ignores its switch echoes for {:?} after each one",
+                    self.button_id,
+                    self.config.device_id,
+                    self.quiet_period
+                );
+            }
+            tracing::debug!("🔘 Button {} reported a {:?}", self.button_id, press_type);
+            return self.gesture(press_type).into_iter().cloned().collect();
+        }
         let Some(is_pressed) = pressed(event) else {
             return Vec::new();
         };
+        let last_gesture = *self.last_gesture();
+        if let Some(since) = last_gesture
+            .map(|at| now.saturating_duration_since(at))
+            .filter(|since| *since < self.quiet_period)
+        {
+            // The same press as a `ButtonPressed` it has run.
+            tracing::debug!(
+                "🔘 Button {} pressed: {} (skipped: {:?} after its last ButtonPressed)",
+                self.button_id,
+                is_pressed,
+                since
+            );
+            return Vec::new();
+        }
         tracing::debug!("🔘 Button {} pressed: {}", self.button_id, is_pressed);
-
-        let action = if is_pressed {
-            &self.press_on_action
-        } else {
-            &self.press_off_action
-        };
-        action.iter().cloned().collect()
+        self.edge(is_pressed).into_iter().cloned().collect()
     }
 
     fn current_state(&self) -> DeviceStateValue {
@@ -296,9 +502,15 @@ impl VirtualDevice for ButtonController {
     fn output_devices(&self) -> Vec<DeviceId> {
         // The targets of its actions
         let mut devices = Vec::new();
-        for action in [&self.press_on_action, &self.press_off_action]
-            .into_iter()
-            .flatten()
+        for action in [
+            &self.press_on_action,
+            &self.press_off_action,
+            &self.press_on_long_action,
+            &self.press_off_long_action,
+            &self.press_double_action,
+        ]
+        .into_iter()
+        .flatten()
         {
             if !devices.contains(&action.target) {
                 devices.push(action.target.clone());
@@ -487,5 +699,261 @@ mod tests {
         for (case, event, want) in cases {
             assert_eq!(pressed(&event), want, "{case}");
         }
+    }
+
+    fn light(is_on: bool, brightness: Option<u8>) -> LightState {
+        LightState {
+            is_on,
+            brightness,
+            color_temp: Some(2700),
+            rgb_color: Some(v1bectl_sync::RgbColor {
+                r: 255,
+                g: 128,
+                b: 0,
+            }),
+        }
+    }
+
+    fn action(value: &Value) -> ButtonAction {
+        ButtonAction::parse(value.as_array().expect("action")).expect("parse")
+    }
+
+    /// #35 review, finding 1: `toggle` switches a lit light off and any
+    /// other on, and keeps everything else. Off keeps the level, so the
+    /// next toggle lights it there (#34); one with no level comes on at
+    /// 100. A light that's on at 0 isn't lit, so a toggle lights it.
+    #[test]
+    fn toggle_switches_a_lit_light_off_and_any_other_on_at_its_level() {
+        let toggle = action(&json!(["TOGGLE", "g"]));
+        assert_eq!(
+            (toggle.command, toggle.target.as_str(), toggle.amount),
+            (ButtonCommand::Toggle, "g", None),
+            "parsed, in any case"
+        );
+        for (case, from, want) in [
+            ("on", light(true, Some(75)), light(false, Some(75))),
+            (
+                "off at its level",
+                light(false, Some(75)),
+                light(true, Some(75)),
+            ),
+            ("off, no level", light(false, None), light(true, Some(100))),
+            ("off at 0", light(false, Some(0)), light(true, Some(100))),
+            (
+                "on at 0: unlit",
+                light(true, Some(0)),
+                light(true, Some(100)),
+            ),
+            ("on, no level", light(true, None), light(false, None)),
+        ] {
+            assert_eq!(toggle.apply(from), want, "toggle from {case}");
+        }
+    }
+
+    /// #35 review, finding 1: two toggles give the state they started from,
+    /// on or off, level and colour included.
+    #[test]
+    fn two_toggles_give_back_the_state_they_started_from() {
+        let toggle = action(&json!(["toggle", "g"]));
+        for from in [light(true, Some(75)), light(false, Some(40))] {
+            let once = toggle.apply(from.clone());
+            assert_ne!(once.is_on, from.is_on, "one toggle of {from:?}");
+            assert_eq!(toggle.apply(once), from, "two toggles of {from:?}");
+        }
+    }
+
+    /// A controller on `btn`: `inc a 10` on a press, `dec a 5` on a
+    /// release, on `clock`.
+    fn clocked(clock: &TestClock) -> ButtonController {
+        let config = VirtualDeviceConfig {
+            device_id: "ctrl".to_string(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: "ctrl".to_string(),
+            description: None,
+            enabled: true,
+            config: json!({}),
+        };
+        let [press_on, press_off] = [json!(["inc", "a", 10]), json!(["dec", "a", 5])]
+            .map(|v| v.as_array().cloned().unwrap());
+        let controller = ButtonController::new(
+            config,
+            "btn".to_string(),
+            &press_on,
+            &press_off,
+            None,
+            None,
+            None,
+        )
+        .expect("controller");
+        clock.drive(controller)
+    }
+
+    fn click() -> DeviceEvent {
+        DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: "btn".to_string(),
+            event_type: EventType::ButtonPressed {
+                button_id: "main".to_string(),
+                press_type: ButtonPressType::SinglePress,
+            },
+        }
+    }
+
+    /// The commands `controller` runs for `event`.
+    fn runs(controller: &ButtonController, event: &DeviceEvent) -> Vec<ButtonCommand> {
+        controller
+            .reactions(event)
+            .into_iter()
+            .map(|action| action.command)
+            .collect()
+    }
+
+    /// A press and its release as the sync engine echoes them: what runs
+    /// for each.
+    fn echo_press_and_release(controller: &ButtonController) -> [Vec<ButtonCommand>; 2] {
+        [
+            runs(
+                controller,
+                &attribute("state", switch(false, 85), switch(true, 85)),
+            ),
+            runs(
+                controller,
+                &attribute("state", switch(true, 85), switch(false, 85)),
+            ),
+        ]
+    }
+
+    const ECHO_RUNS: [&[ButtonCommand]; 2] = [&[ButtonCommand::Inc], &[ButtonCommand::Dec]];
+    const ECHO_SKIPPED: [&[ButtonCommand]; 2] = [&[], &[]];
+
+    /// #35 review, finding 2: a switch echo inside the quiet period after
+    /// a gesture runs nothing, up to the last instant of it. From the
+    /// moment it's over, echoes run again, and keep running while no
+    /// gesture comes: a button whose event stream dropped isn't dead. The
+    /// next gesture opens a new window.
+    #[test]
+    fn switch_echoes_run_nothing_for_the_quiet_period_after_a_gesture() {
+        let clock = TestClock::new();
+        let controller = clocked(&clock);
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "before any gesture"
+        );
+
+        assert_eq!(
+            runs(&controller, &click()),
+            [ButtonCommand::Inc, ButtonCommand::Dec]
+        );
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "right after it"
+        );
+        clock.advance(ECHO_QUIET_PERIOD.saturating_sub(Duration::from_millis(1)));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "at its last instant"
+        );
+
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "once it's over"
+        );
+        clock.advance(Duration::from_hours(1));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "an hour on, still no gesture"
+        );
+
+        assert_eq!(
+            runs(&controller, &click()),
+            [ButtonCommand::Inc, ButtonCommand::Dec]
+        );
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "after the next gesture"
+        );
+    }
+
+    /// #35 review, finding 2: the window runs from the *last* gesture, and
+    /// it's the configured one.
+    #[test]
+    fn the_quiet_period_runs_from_the_last_gesture() {
+        let clock = TestClock::new();
+        let controller = clocked(&clock);
+        runs(&controller, &click());
+        clock.advance(Duration::from_secs(10));
+        runs(&controller, &click());
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "20 s after the first gesture, 10 s after the second"
+        );
+        clock.advance(ECHO_QUIET_PERIOD.saturating_sub(Duration::from_secs(10)));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "the quiet period after the second"
+        );
+
+        let clock = TestClock::new();
+        let controller = clocked(&clock).with_echo_quiet_period(Duration::from_secs(1));
+        runs(&controller, &click());
+        assert_eq!(echo_press_and_release(&controller), ECHO_SKIPPED);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "a 1 s window is over after 1 s"
+        );
+    }
+
+    /// #35 review, finding 2: an event of another device opens no window.
+    #[test]
+    fn a_gesture_of_another_button_opens_no_window() {
+        let clock = TestClock::new();
+        let controller = clocked(&clock);
+        let other = DeviceEvent {
+            device_id: "other".to_string(),
+            ..click()
+        };
+        assert!(runs(&controller, &other).is_empty());
+        assert_eq!(echo_press_and_release(&controller), ECHO_RUNS);
+    }
+
+    /// #35: `press_double` is parsed when the controller is made, like the
+    /// others, so a malformed one fails `new`.
+    #[test]
+    fn a_malformed_double_action_fails_new() {
+        let config = VirtualDeviceConfig {
+            device_id: "ctrl".to_string(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: "ctrl".to_string(),
+            description: None,
+            enabled: true,
+            config: json!({}),
+        };
+        let press_on = [json!("toggle"), json!("a")];
+        let double = [json!("flip"), json!("a")];
+        let made = ButtonController::new(
+            config,
+            "btn".to_string(),
+            &press_on,
+            &[],
+            None,
+            None,
+            Some(&double),
+        );
+        assert!(
+            matches!(made, Err(VirtualDeviceError::Config(ref e)) if e.contains("flip")),
+            "made a controller with a double action it can't run"
+        );
     }
 }

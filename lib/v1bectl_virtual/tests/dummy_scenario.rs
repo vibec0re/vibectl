@@ -116,8 +116,13 @@ async fn shipped_virtual_devices_only_reference_dummy_devices() {
                 }
                 let actions = [Some(&c.press_on), Some(&c.press_off)]
                     .into_iter()
-                    .chain([c.press_on_long.as_ref(), c.press_off_long.as_ref()])
-                    .flatten();
+                    .chain([
+                        c.press_on_long.as_ref(),
+                        c.press_off_long.as_ref(),
+                        c.press_double.as_ref(),
+                    ])
+                    .flatten()
+                    .filter(|action| !action.is_empty());
                 for action in actions {
                     let Some(target) = action.get(1).and_then(|v| v.as_str()) else {
                         dangling.push(format!("{id}: action without a target: {action:?}"));
@@ -220,11 +225,19 @@ async fn shipped_button_controllers_bind_distinct_dummy_switches() {
     );
 }
 
-/// #16: a press of a shipped controller's button, against the dummy, must
-/// light the members of the group it targets. Driven through the manager
-/// as the server wires it, with tracking fed by hand.
-#[tokio::test]
-async fn shipped_button_controller_lights_its_group_against_dummy() {
+/// The shipped linear groups and button controllers, registered with a
+/// manager over the dummy's devices the way the server registers them, with
+/// tracking fed by hand.
+struct ShippedHome {
+    store: Arc<StateStore>,
+    bus: Arc<EventBus>,
+    manager: VirtualDeviceManager,
+    /// Each shipped linear group's member lights.
+    group_members: HashMap<String, Vec<String>>,
+    controllers: Vec<ButtonControllerConfig>,
+}
+
+async fn shipped_home() -> ShippedHome {
     let configs = shipped_configs().await;
     let (store, _) = dummy_home_store().await;
     let bus = Arc::new(EventBus::new(1000));
@@ -255,12 +268,11 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
         let controller = ButtonController::new(
             config,
             c.button.clone(),
-            c.press_on.clone(),
-            c.press_off.clone(),
-            c.press_on_long.clone(),
-            c.press_off_long.clone(),
-            store.clone(),
-            bus.clone(),
+            &c.press_on,
+            &c.press_off,
+            c.press_on_long.as_deref(),
+            c.press_off_long.as_deref(),
+            c.press_double.as_deref(),
         )
         .unwrap_or_else(|e| panic!("{}: {e}", c.device_id));
         manager
@@ -268,28 +280,102 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
             .await
             .expect("register controller");
     }
+    ShippedHome {
+        store,
+        bus,
+        manager,
+        group_members,
+        controllers,
+    }
+}
 
-    for c in &controllers {
+impl ShippedHome {
+    /// Input tracking, caught up: every event published since `rx`
+    /// subscribed, and the ones handling them publishes in turn.
+    async fn pump(
+        &self,
+        rx: &mut tokio::sync::broadcast::Receiver<DeviceEvent>,
+    ) -> Vec<DeviceEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            self.manager
+                .handle_event(&event)
+                .await
+                .expect("input tracking");
+            events.push(event);
+        }
+        events
+    }
+
+    /// `device_id`'s light state in the store, as `(is_on, brightness)`.
+    async fn light(&self, device_id: &str) -> (bool, Option<u8>) {
+        match self.store.get_device(&device_id.to_string()).await {
+            Some(DeviceState {
+                state: DeviceStateValue::Light(light),
+                ..
+            }) => (light.is_on, light.brightness),
+            other => panic!("{device_id} isn't a light in the store: {other:?}"),
+        }
+    }
+}
+
+/// `(is_on, brightness)` of each light state echoed for `device_id`.
+fn light_echoes(events: &[DeviceEvent], device_id: &str) -> Vec<(bool, Option<u8>)> {
+    events
+        .iter()
+        .filter(|e| e.device_id == device_id)
+        .filter_map(|e| match &e.event_type {
+            EventType::AttributeChanged {
+                attribute,
+                new_value,
+                ..
+            } if attribute == "state" => {
+                match serde_json::from_value::<DeviceStateValue>(new_value.clone()) {
+                    Ok(DeviceStateValue::Light(light)) => Some((light.is_on, light.brightness)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// #16: a press of a shipped controller's button, against the dummy, must
+/// light the members of the group it targets. Driven through the manager
+/// as the server wires it, with tracking fed by hand.
+#[tokio::test]
+async fn shipped_button_controller_lights_its_group_against_dummy() {
+    let home = shipped_home().await;
+    let (store, bus) = (&home.store, &home.bus);
+    for c in &home.controllers {
         let target = c.press_on[1].as_str().expect("target");
-        let members = group_members
+        let members = home
+            .group_members
             .get(target)
             .unwrap_or_else(|| panic!("{}: {target} isn't a shipped group", c.device_id));
-        // Every member off first, so lighting them is the press's doing.
-        for member in members {
-            store
-                .update_device_state(
-                    member,
-                    DeviceStateValue::Light(LightState {
-                        is_on: false,
-                        brightness: Some(0),
-                        color_temp: None,
-                        rgb_color: None,
-                    }),
-                )
-                .await
-                .unwrap();
-        }
+        // The group and every member off first, so lighting them is the
+        // press's doing. Through the group, as a client switches it off:
+        // a toggle goes by the group's state, and the group must read off.
         let mut rx = bus.subscribe();
+        let DeviceStateValue::Light(group) =
+            store.get_device(&target.to_string()).await.unwrap().state
+        else {
+            panic!("{target} isn't a light");
+        };
+        home.manager
+            .set_virtual_device_state(
+                &target.to_string(),
+                DeviceStateValue::Light(LightState {
+                    is_on: false,
+                    ..group
+                }),
+            )
+            .await
+            .expect("group off");
+        home.pump(&mut rx).await;
+        for member in members {
+            assert!(!home.light(member).await.0, "{member} is still on");
+        }
 
         // The press, as the sync engine reports it: stored, and echoed.
         let pressed = DeviceStateValue::Switch(SwitchState {
@@ -311,9 +397,7 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
             },
         })
         .await;
-        while let Ok(event) = rx.try_recv() {
-            manager.handle_event(&event).await.expect("input tracking");
-        }
+        home.pump(&mut rx).await;
 
         for member in members {
             let state = store.get_device(member).await.unwrap().state;
@@ -327,6 +411,94 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
                 c.button
             );
         }
+    }
+}
+
+/// #35: the shipped controller follows the gestures a hub reports whole
+/// (`ButtonPressed`), against the dummy. Its binding is `press_on = toggle`
+/// with no `press_off`, `press_double = set 100` and `press_on_long = inc
+/// 10`, on Bedroom Lights, which starts on at 75 (the dummy's kitchen
+/// light).
+/// - A click toggles: the group goes off and keeps its level, and so does
+///   every member. The next click lights them again, at that level (#35
+///   review, finding 1: a click used to run `on` then `off`, so it always
+///   ended off).
+/// - A long press runs `inc 10` only: the group goes a step brighter.
+/// - A double press runs `set 100` once: full brightness, every member on.
+///   Two clicks' worth of toggles would have cancelled out.
+#[tokio::test]
+async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
+    const GROUP: &str = "virtual_bedroom_lights";
+    let home = shipped_home().await;
+    let [c] = home.controllers.as_slice() else {
+        panic!("one shipped controller: {:?}", home.controllers);
+    };
+    let action = |value: serde_json::Value| Some(value.as_array().cloned().unwrap());
+    assert_eq!(
+        (
+            Some(c.press_on.clone()),
+            Some(c.press_off.clone()).filter(|a| !a.is_empty()),
+            c.press_double.clone(),
+            c.press_on_long.clone(),
+        ),
+        (
+            action(serde_json::json!(["toggle", GROUP])),
+            None,
+            action(serde_json::json!(["set", GROUP, 100])),
+            action(serde_json::json!(["inc", GROUP, 10])),
+        ),
+        "the binding this test drives"
+    );
+    let members = &home.group_members[GROUP];
+    assert_eq!(home.light(GROUP).await, (true, Some(75)), "group at start");
+    let report = |press_type| DeviceEvent {
+        timestamp: std::time::SystemTime::now(),
+        device_id: c.button.clone(),
+        event_type: EventType::ButtonPressed {
+            button_id: "main".to_string(),
+            press_type,
+        },
+    };
+    let mut rx = home.bus.subscribe();
+
+    for (click, want) in [("one click", false), ("the next click", true)] {
+        home.bus.publish(report(ButtonPressType::SinglePress)).await;
+        let events = home.pump(&mut rx).await;
+        assert_eq!(
+            light_echoes(&events, GROUP),
+            vec![(want, Some(75))],
+            "{click}: one toggle, keeping the level"
+        );
+        assert_eq!(home.light(GROUP).await, (want, Some(75)), "{click}");
+        for member in members {
+            assert_eq!(home.light(member).await.0, want, "{click}: {member}");
+            // A member the dummy starts off (the living room) has nothing
+            // to echo on the first click.
+            let echoed = light_echoes(&events, member);
+            assert!(
+                echoed.iter().all(|(is_on, _)| *is_on == want),
+                "{click}: {member} echoed {echoed:?}"
+            );
+        }
+    }
+
+    home.bus.publish(report(ButtonPressType::LongPress)).await;
+    let events = home.pump(&mut rx).await;
+    assert_eq!(
+        light_echoes(&events, GROUP),
+        vec![(true, Some(85))],
+        "a long press: inc 10, and nothing else"
+    );
+
+    home.bus.publish(report(ButtonPressType::DoublePress)).await;
+    let events = home.pump(&mut rx).await;
+    assert_eq!(
+        light_echoes(&events, GROUP),
+        vec![(true, Some(100))],
+        "a double press: set 100, once"
+    );
+    for member in members {
+        assert!(home.light(member).await.0, "{member} is off");
     }
 }
 
@@ -367,4 +539,39 @@ async fn shipped_light_groups_accept_writes_against_dummy() {
             .await
             .unwrap_or_else(|e| panic!("writing {id} failed: {e}"));
     }
+}
+
+/// #35: the API simulates a press only for a device the dummy simulates, so
+/// every device of every dummy scenario must carry the mark, and a device
+/// shaped the way a real hub reports one must not.
+#[tokio::test]
+async fn every_dummy_device_is_simulated() {
+    for scenario in ["basic_home", "large_home"] {
+        let devices = DummyGateway::new(scenario)
+            .discover_devices()
+            .await
+            .expect("discover");
+        assert!(!devices.is_empty(), "{scenario}: no devices");
+        for info in &devices {
+            assert!(
+                is_simulated(info),
+                "{scenario}: {} isn't marked simulated",
+                info.device_id
+            );
+        }
+    }
+
+    let mut devices = DummyGateway::new("basic_home")
+        .discover_devices()
+        .await
+        .expect("discover");
+    let real = DeviceInfo {
+        manufacturer: Some("IKEA".to_string()),
+        custom_attributes: HashMap::new(),
+        ..devices.remove(0)
+    };
+    assert!(
+        !is_simulated(&real),
+        "a real hub's device counts as simulated"
+    );
 }

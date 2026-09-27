@@ -812,16 +812,17 @@ mod tests {
     //! feeds it the bus, so each test decides exactly when tracking catches
     //! up, and nothing waits on a clock.
     use super::*;
+    use crate::button_controller::TestClock;
     use crate::{
         ButtonController, DummyGateway, LightGroup, LightGroupLinear, SceneController,
-        DEFAULT_GROUP_LEVEL,
+        DEFAULT_GROUP_LEVEL, ECHO_QUIET_PERIOD,
     };
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
     use tokio::sync::watch;
     use v1bectl_sync::{
-        Capability, Gateway, GatewayError, GatewayHealth, LightState, SwitchState, SyncConfig,
-        SyncStatus,
+        ButtonPressType, Capability, Gateway, GatewayError, GatewayHealth, LightState, SwitchState,
+        SyncConfig, SyncStatus,
     };
 
     fn light_info(device_id: &str) -> DeviceInfo {
@@ -998,8 +999,19 @@ mod tests {
         button: &str,
         press_on: serde_json::Value,
         press_off: serde_json::Value,
-        store: &Arc<StateStore>,
-        bus: &Arc<EventBus>,
+    ) -> ButtonController {
+        let none = serde_json::json!([]);
+        let actions = [press_on, press_off, none.clone(), none.clone(), none];
+        controller_with(device_id, button, actions)
+    }
+
+    /// A button controller `device_id` bound to `button`, with `actions`:
+    /// `[press_on, press_off, press_on_long, press_off_long,
+    /// press_double]`, each `[]` for none.
+    fn controller_with(
+        device_id: &str,
+        button: &str,
+        actions: [serde_json::Value; 5],
     ) -> ButtonController {
         let config = VirtualDeviceConfig {
             device_id: device_id.to_string(),
@@ -1009,16 +1021,16 @@ mod tests {
             enabled: true,
             config: serde_json::json!({}),
         };
-        let action = |value: serde_json::Value| value.as_array().cloned().expect("action");
+        let [press_on, press_off, press_on_long, press_off_long, press_double] =
+            actions.map(|value| value.as_array().cloned().expect("action"));
         ButtonController::new(
             config,
             button.to_string(),
-            action(press_on),
-            action(press_off),
-            None,
-            None,
-            store.clone(),
-            bus.clone(),
+            &press_on,
+            &press_off,
+            Some(&press_on_long),
+            Some(&press_off_long),
+            Some(&press_double),
         )
         .expect("controller")
     }
@@ -1028,16 +1040,13 @@ mod tests {
     /// release.
     async fn add_controller(
         manager: &VirtualDeviceManager,
-        store: &Arc<StateStore>,
-        bus: &Arc<EventBus>,
+        store: &StateStore,
         press_on: serde_json::Value,
         press_off: serde_json::Value,
     ) {
         add_switch(store, "btn").await;
         manager
-            .add_virtual_device(Box::new(controller(
-                "ctrl", "btn", press_on, press_off, store, bus,
-            )))
+            .add_virtual_device(Box::new(controller("ctrl", "btn", press_on, press_off)))
             .await
             .expect("register");
     }
@@ -1045,11 +1054,35 @@ mod tests {
     /// `btn` pressed (or released), as the sync engine reports it when the
     /// hub says so: stored, and echoed.
     async fn press(store: &StateStore, bus: &EventBus, is_pressed: bool) {
-        let btn = "btn".to_string();
-        let old = stored(store, &btn).await;
+        press_switch(store, bus, "btn", is_pressed).await;
+    }
+
+    /// `button` pressed (or released), as the sync engine reports it when
+    /// the hub says so: stored, and echoed.
+    async fn press_switch(store: &StateStore, bus: &EventBus, button: &str, is_pressed: bool) {
+        let button = button.to_string();
+        let old = stored(store, &button).await;
         let new = switch(is_pressed);
-        store.update_device_state(&btn, new.clone()).await.unwrap();
-        bus.publish(state_event(&btn, Some(&old), &new)).await;
+        store
+            .update_device_state(&button, new.clone())
+            .await
+            .unwrap();
+        bus.publish(state_event(&button, Some(&old), &new)).await;
+    }
+
+    /// `button` reports `press_type`, as a hub reports a gesture it
+    /// recognised over its event stream: a Dirigera remote's
+    /// `clickPattern`, or the dummy's (#35).
+    async fn report(bus: &EventBus, button: &str, press_type: ButtonPressType) {
+        bus.publish(DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: button.to_string(),
+            event_type: EventType::ButtonPressed {
+                button_id: "main".to_string(),
+                press_type,
+            },
+        })
+        .await;
     }
 
     /// Input tracking, caught up: hands the manager every event published so
@@ -1273,10 +1306,27 @@ mod tests {
             .add_virtual_device(Box::new(scene))
             .await
             .expect("register");
+        // #35 review, finding 4: every action of a controller is an output,
+        // the long and double ones too.
+        add_switch(&store, "btn").await;
+        let actions = [
+            serde_json::json!(["toggle", "a"]),
+            serde_json::json!([]),
+            serde_json::json!(["inc", "missing_long_light", 10]),
+            serde_json::json!(["dec", "missing_long_release_light", 10]),
+            serde_json::json!(["set", "missing_double_light", 100]),
+        ];
+        manager
+            .add_virtual_device(Box::new(controller_with("ctrl", "btn", actions)))
+            .await
+            .expect("register");
 
         assert_eq!(
             manager.dangling_references().await,
             vec![
+                ("ctrl".to_string(), "missing_double_light".to_string()),
+                ("ctrl".to_string(), "missing_long_light".to_string()),
+                ("ctrl".to_string(), "missing_long_release_light".to_string()),
                 ("g".to_string(), "missing_light".to_string()),
                 ("scene".to_string(), "missing_scene_light".to_string()),
             ]
@@ -1434,7 +1484,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let mut rx = bus.subscribe();
 
         press(&store, &bus, true).await;
@@ -1489,7 +1539,7 @@ mod tests {
             serde_json::json!(["set", "a", 30]),
             serde_json::json!(["dec", "a", 10]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let mut rx = bus.subscribe();
 
         press(&store, &bus, true).await;
@@ -1519,7 +1569,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         manager.start().await.expect("start");
         let mut rx = bus.subscribe();
 
@@ -1560,7 +1610,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let mut rx = bus.subscribe();
         let on = light(true, 60);
         manager
@@ -1598,6 +1648,353 @@ mod tests {
             light(false, 60),
             "the release must still turn the group off"
         );
+    }
+
+    /// #35: each gesture a hub reports whole (`ButtonPressed`) runs the
+    /// actions [`ButtonController`]'s table gives it, in order. Light `a`
+    /// starts on at 50, the press adds 20, the release takes 5 off, the
+    /// long press sets 90 and the double press sets 30, so each echo of `a`
+    /// shows which action ran:
+    /// - a click is a press and a release: 70, then 65;
+    /// - a double press runs `press_double` alone: 30;
+    /// - a double press on a controller without a double action is two
+    ///   clicks: 70, 65, 85, 80;
+    /// - a long press is a press still held: `press_on_long` only, 90. The
+    ///   long release (`off`) never runs: nothing reports it;
+    /// - a long press on a controller without a long action is the press
+    ///   edge: 70.
+    #[tokio::test]
+    async fn each_reported_gesture_runs_its_press_and_release_actions() {
+        use ButtonPressType::{DoublePress, LongPress, SinglePress};
+        let long = serde_json::json!(["set", "a", 90]);
+        let double = serde_json::json!(["set", "a", 30]);
+        let none = serde_json::json!([]);
+        for (case, press_type, [press_on_long, press_double], want) in [
+            ("a click", SinglePress, [&long, &double], vec![70, 65]),
+            ("a double press", DoublePress, [&long, &double], vec![30]),
+            (
+                "a double press, no double action",
+                DoublePress,
+                [&long, &none],
+                vec![70, 65, 85, 80],
+            ),
+            ("a long press", LongPress, [&long, &double], vec![90]),
+            (
+                "a long press, no long action",
+                LongPress,
+                [&none, &double],
+                vec![70],
+            ),
+        ] {
+            let store = StateStore::new();
+            let bus = Arc::new(EventBus::new(100));
+            store.add_device(light_info("a"), light(true, 50)).await;
+            add_switch(&store, "btn").await;
+            let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+            let actions = [
+                serde_json::json!(["inc", "a", 20]),
+                serde_json::json!(["dec", "a", 5]),
+                press_on_long.clone(),
+                serde_json::json!(["off", "a"]),
+                press_double.clone(),
+            ];
+            manager
+                .add_virtual_device(Box::new(controller_with("ctrl", "btn", actions)))
+                .await
+                .expect("register");
+            let mut rx = bus.subscribe();
+
+            report(&bus, "btn", press_type).await;
+            let events = pump(&manager, &mut rx).await;
+            let want: Vec<_> = want.into_iter().map(|level| light(true, level)).collect();
+            assert_eq!(echoes(&events, "a"), want, "{case}: the actions run");
+            assert_eq!(
+                Some(&stored(&store, "a").await),
+                want.last(),
+                "{case}: where a ends"
+            );
+        }
+    }
+
+    /// #35: a `ButtonPressed` of another device runs nothing. Only the
+    /// controller's own button's gestures do.
+    #[tokio::test]
+    async fn a_reported_gesture_of_another_button_runs_nothing() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        store.add_device(light_info("a"), light(true, 50)).await;
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let (press_on, press_off) = (
+            serde_json::json!(["inc", "a", 20]),
+            serde_json::json!(["dec", "a", 5]),
+        );
+        add_controller(&manager, &store, press_on, press_off).await;
+        add_switch(&store, "other").await;
+        let mut rx = bus.subscribe();
+
+        report(&bus, "other", ButtonPressType::SinglePress).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(stored(&store, "a").await, light(true, 50), "a moved");
+        assert_eq!(events.len(), 1, "only the report: {events:?}");
+    }
+
+    /// #35, dedupe: a real remote can report one press both ways, as a
+    /// `ButtonPressed` over the hub's event stream and as the `is_pressed`
+    /// change the sync engine's pull echoes after it. It must fire once.
+    /// Light `a` starts on at 50; the press adds 20 and the release takes
+    /// 5 off, so a click moves it by 15 and each echo that ran would show.
+    /// Two presses, each reported both ways, end at 80: 50 → 70 → 65, then
+    /// 85 → 80. A battery tick of the remote runs nothing either. The
+    /// controllers' clock doesn't move, so every echo is inside the quiet
+    /// period after the gesture before it.
+    ///
+    /// And the dedupe is per button: a controller on `plain`, a switch that
+    /// never reports a gesture, keeps running off its echoes (#34).
+    #[tokio::test]
+    async fn a_press_reported_both_ways_fires_once() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        for id in ["a", "b"] {
+            store.add_device(light_info(id), light(true, 50)).await;
+        }
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let clock = TestClock::new();
+        for (id, button, target) in [("ctrl", "btn", "a"), ("ctrl_plain", "plain", "b")] {
+            add_switch(&store, button).await;
+            let (press_on, press_off) = (
+                serde_json::json!(["inc", target, 20]),
+                serde_json::json!(["dec", target, 5]),
+            );
+            let controller = clock.drive(controller(id, button, press_on, press_off));
+            manager
+                .add_virtual_device(Box::new(controller))
+                .await
+                .expect("register");
+        }
+        let mut rx = bus.subscribe();
+
+        let mut echoed = Vec::new();
+        for _ in 0..2 {
+            // The hub's event first, then the pull catches the press.
+            report(&bus, "btn", ButtonPressType::SinglePress).await;
+            press(&store, &bus, true).await;
+            press(&store, &bus, false).await;
+            echoed.extend(echoes(&pump(&manager, &mut rx).await, "a"));
+        }
+        let btn = "btn".to_string();
+        let tick = switch_at(false, 84);
+        store.update_device_state(&btn, tick.clone()).await.unwrap();
+        bus.publish(state_event(&btn, Some(&switch(false)), &tick))
+            .await;
+        echoed.extend(echoes(&pump(&manager, &mut rx).await, "a"));
+
+        let want: Vec<_> = [70, 65, 85, 80].map(|level| light(true, level)).into();
+        assert_eq!(echoed, want, "each press must run its click once");
+        assert_eq!(stored(&store, "a").await, light(true, 80));
+
+        press_switch(&store, &bus, "plain", true).await;
+        press_switch(&store, &bus, "plain", false).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "b"),
+            vec![light(true, 70), light(true, 65)],
+            "a button that never reported a gesture must still fire on its echoes"
+        );
+    }
+
+    /// #35 review, finding 2: a button whose gestures stop coming (the
+    /// hub's event stream dropped) works off its switch echoes again once
+    /// the quiet period after its last gesture is over. It used to ignore
+    /// them for good after its first gesture, so it was dead from then on.
+    /// Light `a` starts on at 50; the press adds 10 and the release takes
+    /// 5 off, so each echo that ran shows.
+    #[tokio::test]
+    async fn a_button_whose_gestures_stop_works_off_its_echoes_again() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        store.add_device(light_info("a"), light(true, 50)).await;
+        add_switch(&store, "btn").await;
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let clock = TestClock::new();
+        let (press_on, press_off) = (
+            serde_json::json!(["inc", "a", 10]),
+            serde_json::json!(["dec", "a", 5]),
+        );
+        let controller = clock.drive(controller("ctrl", "btn", press_on, press_off));
+        manager
+            .add_virtual_device(Box::new(controller))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+        let levels = |events: Vec<DeviceEvent>| -> Vec<Option<u8>> {
+            echoes(&events, "a")
+                .into_iter()
+                .map(|state| match state {
+                    DeviceStateValue::Light(light) => light.brightness,
+                    other => panic!("a echoed {other:?}"),
+                })
+                .collect()
+        };
+
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        press(&store, &bus, true).await;
+        press(&store, &bus, false).await;
+        let ran = levels(pump(&manager, &mut rx).await);
+        assert_eq!(ran, [Some(60), Some(55)], "a click reported both ways");
+
+        // The event stream drops: only the pull's echoes come from now on.
+        for (case, by, want) in [
+            (
+                "just inside the window",
+                ECHO_QUIET_PERIOD.saturating_sub(Duration::from_millis(1)),
+                vec![],
+            ),
+            (
+                "once it's over",
+                Duration::from_millis(1),
+                vec![Some(65), Some(60)],
+            ),
+            (
+                "an hour on",
+                Duration::from_hours(1),
+                vec![Some(70), Some(65)],
+            ),
+        ] {
+            clock.advance(by);
+            press(&store, &bus, true).await;
+            press(&store, &bus, false).await;
+            let ran = levels(pump(&manager, &mut rx).await);
+            assert_eq!(ran, want, "the echoes of a press, {case}");
+        }
+
+        // The stream is back: the next gesture opens a new window.
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        press(&store, &bus, true).await;
+        press(&store, &bus, false).await;
+        let ran = levels(pump(&manager, &mut rx).await);
+        assert_eq!(
+            ran,
+            [Some(75), Some(70)],
+            "a click reported both ways again"
+        );
+        assert_eq!(stored(&store, "a").await, light(true, 70));
+    }
+
+    /// #35 review, finding 1: a controller that toggles on a click (as the
+    /// shipped `button_ctrl.toml` does: `toggle` on the press, no release)
+    /// flips its group with each click, through the group to its members.
+    /// On at 60, a click switches the group and every member off, and the
+    /// group keeps 60. All off, a click lights them at the group's level.
+    /// Either way the second click gives back the start, members included.
+    #[tokio::test]
+    async fn a_toggle_click_flips_the_group_and_two_give_back_the_start() {
+        let lit = light(true, 60);
+        for kind in KINDS {
+            for (case, members, flipped) in [
+                (
+                    "on at 60",
+                    [lit.clone(), lit.clone(), lit.clone()],
+                    light(false, 60),
+                ),
+                (
+                    "all off",
+                    [off(), off(), off()],
+                    light(true, DEFAULT_GROUP_LEVEL),
+                ),
+            ] {
+                let (manager, store, bus) = started_group(kind, members).await;
+                let (press_on, press_off) =
+                    (serde_json::json!(["toggle", "g"]), serde_json::json!([]));
+                add_controller(&manager, &store, press_on, press_off).await;
+                let mut start = Vec::new();
+                for id in ["g", "a", "b", "c"] {
+                    start.push(stored(&store, id).await);
+                }
+                let mut rx = bus.subscribe();
+
+                report(&bus, "btn", ButtonPressType::SinglePress).await;
+                let events = pump(&manager, &mut rx).await;
+                assert_eq!(
+                    echoes(&events, "g"),
+                    vec![flipped.clone()],
+                    "{kind:?}, {case}: one click, one write"
+                );
+                assert_eq!(stored(&store, "g").await, flipped, "{kind:?}, {case}");
+                let DeviceStateValue::Light(group) = &flipped else {
+                    unreachable!()
+                };
+                for id in ["a", "b", "c"] {
+                    let DeviceStateValue::Light(member) = stored(&store, id).await else {
+                        panic!("{id} isn't a light");
+                    };
+                    assert_eq!(
+                        member.is_on, group.is_on,
+                        "{kind:?}, {case}: {id} after a click: {member:?}"
+                    );
+                }
+
+                report(&bus, "btn", ButtonPressType::SinglePress).await;
+                pump(&manager, &mut rx).await;
+                let mut end = Vec::new();
+                for id in ["g", "a", "b", "c"] {
+                    end.push(stored(&store, id).await);
+                }
+                assert_eq!(end, start, "{kind:?}, {case}: two clicks");
+            }
+        }
+    }
+
+    /// #35 review, finding 1: toggles don't race. Nine clicks of a toggling
+    /// controller, handled all at once on four threads. Each toggle reads
+    /// the group and writes it back under one hold of the manager's lock,
+    /// so each starts from what the one before it left: the group's echoes
+    /// alternate off, on, off, …, and it ends off (nine is odd) at its
+    /// level, with every member off. A toggle that read the group and
+    /// wrote it under two holds would lose a flip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rapid_toggle_clicks_through_the_manager_do_not_race() {
+        const CLICKS: usize = 9;
+        let lit = light(true, 60);
+        let (manager, store, bus) =
+            started_group(Kind::Curves, [lit.clone(), lit.clone(), lit]).await;
+        let (press_on, press_off) = (serde_json::json!(["toggle", "g"]), serde_json::json!([]));
+        add_controller(&manager, &store, press_on, press_off).await;
+        let mut rx = bus.subscribe();
+        let click = DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: "btn".to_string(),
+            event_type: EventType::ButtonPressed {
+                button_id: "main".to_string(),
+                press_type: ButtonPressType::SinglePress,
+            },
+        };
+
+        let clicks: Vec<_> = (0..CLICKS)
+            .map(|_| {
+                let (manager, click) = (manager.clone(), click.clone());
+                tokio::spawn(async move { manager.handle_event(&click).await })
+            })
+            .collect();
+        for click in clicks {
+            click.await.expect("click task").expect("click");
+        }
+        let events = pump(&manager, &mut rx).await;
+
+        let group: Vec<bool> = echoes(&events, "g")
+            .into_iter()
+            .map(|state| {
+                matches!(
+                    state,
+                    DeviceStateValue::Light(LightState { is_on: true, .. })
+                )
+            })
+            .collect();
+        let alternating: Vec<bool> = (0..CLICKS).map(|click| click % 2 == 1).collect();
+        assert_eq!(group, alternating, "the group's echoes, one per click");
+        assert_eq!(stored(&store, "g").await, light(false, 60));
+        for id in ["a", "b", "c"] {
+            assert_eq!(stored(&store, id).await, off(), "{id}");
+        }
     }
 
     /// #34 review, nit 3: a member that's on at level 0 (the TUI's `-` can
@@ -1702,9 +2099,7 @@ mod tests {
                 serde_json::json!(["off", "a"]),
             );
             manager
-                .add_virtual_device(Box::new(controller(
-                    id, button, press_on, press_off, &store, &bus,
-                )))
+                .add_virtual_device(Box::new(controller(id, button, press_on, press_off)))
                 .await
                 .expect("register");
         }
@@ -1872,7 +2267,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let g = "g".to_string();
         manager.virtual_devices.write().await.remove(&g);
         let before = stored(&store, "g").await;

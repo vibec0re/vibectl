@@ -2,7 +2,10 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
-use v1bectl_sync::{DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, LightState, RgbColor};
+use v1bectl_sync::{
+    ButtonPressType, DeviceEvent, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, LightState,
+    RgbColor,
+};
 
 // Mirror the API types from the server
 #[derive(Serialize, Deserialize, Debug)]
@@ -44,6 +47,10 @@ enum ApiRequest {
     Subscribe {
         device_ids: Vec<String>,
     },
+    PressButton {
+        device_id: String,
+        press_type: ButtonPressType,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -64,11 +71,18 @@ enum ApiResponse {
     SubscriptionStarted {
         subscriber_id: String,
     },
+    ButtonPressed {
+        device_id: String,
+        press_type: ButtonPressType,
+    },
     Error {
         code: String,
         message: String,
     },
 }
+
+/// How long [`WebSocketClient::press_button`] waits for the server's answer.
+const PRESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub struct WebSocketClient {
     server_url: String,
@@ -133,6 +147,43 @@ impl WebSocketClient {
 
         match response {
             ApiResponse::LightUpdated { new_state } => Ok(new_state),
+            ApiResponse::Error { code, message } => {
+                anyhow::bail!("Server error {code}: {message}");
+            }
+            _ => anyhow::bail!("Unexpected response type"),
+        }
+    }
+
+    /// Ask the server to press `device_id` with `press_type`, as if by hand
+    /// (#35). It publishes the press, so the button controllers bound to
+    /// the switch run. Only the dummy gateway's switches can be pressed:
+    /// the server refuses any other device. Returns the press the server
+    /// published.
+    pub async fn press_button(
+        &self,
+        device_id: &str,
+        press_type: ButtonPressType,
+    ) -> anyhow::Result<(DeviceId, ButtonPressType)> {
+        let request = ApiRequest::PressButton {
+            device_id: device_id.to_string(),
+            press_type,
+        };
+        // A server from before #35 can't decode the request, and never
+        // answers it.
+        let response = tokio::time::timeout(PRESS_TIMEOUT, self.send_request(request))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "No answer from the server within {}s: it may be older than the `button` command",
+                    PRESS_TIMEOUT.as_secs()
+                )
+            })??;
+
+        match response {
+            ApiResponse::ButtonPressed {
+                device_id,
+                press_type,
+            } => Ok((device_id, press_type)),
             ApiResponse::Error { code, message } => {
                 anyhow::bail!("Server error {code}: {message}");
             }

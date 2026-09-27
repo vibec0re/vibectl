@@ -18,11 +18,12 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use v1bectl_sync::{
-    recv_lossy, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus, EventType,
-    Gateway, LightState, OutletState, RgbColor, SceneState, StateStore, SyncEngine,
+    recv_lossy, ButtonPressType, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus,
+    EventType, Gateway, LightState, OutletState, RgbColor, SceneState, StateStore, SyncEngine,
 };
 use v1bectl_virtual::{
-    LightGroup, SceneController, VirtualDeviceConfig, VirtualDeviceManager, VirtualDeviceType,
+    is_simulated, LightGroup, SceneController, VirtualDeviceConfig, VirtualDeviceManager,
+    VirtualDeviceType,
 };
 
 #[derive(Clone)]
@@ -91,6 +92,18 @@ enum ApiRequest {
         device_ids: Vec<String>,
     },
     Ping, // 🔥 KEEPALIVE PING! CHOOOM FIX! 💖
+    /// Press `device_id`, a switch the dummy gateway simulates, as if by
+    /// hand (#35): the server publishes the `ButtonPressed` a hub would,
+    /// so the button controllers bound to it run. The answer is
+    /// `ButtonPressed`, or an `Error`: `PRESS_UNSUPPORTED` for a device the
+    /// dummy doesn't simulate (every device of a real hub, whose remotes are
+    /// pressed by hand; a virtual device), `WRONG_TYPE` for a simulated
+    /// device that isn't a switch, and `NOT_FOUND`. It's a new variant
+    /// only, so clients that don't know it are unaffected.
+    PressButton {
+        device_id: String,
+        press_type: ButtonPressType,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -122,6 +135,11 @@ enum ApiResponse {
         subscriber_id: String,
     },
     Pong, // 🔥 KEEPALIVE PONG! CHOOOM FIX! 💖
+    /// `PressButton` published its press.
+    ButtonPressed {
+        device_id: String,
+        press_type: ButtonPressType,
+    },
     Error {
         code: String,
         message: String,
@@ -706,6 +724,61 @@ impl AxumServer {
                 debug!("🏓 Received PING, sending PONG!");
                 ApiResponse::Pong
             }
+            ApiRequest::PressButton {
+                device_id,
+                press_type,
+            } => self.press_button(device_id, press_type).await,
+        }
+    }
+
+    /// `ApiRequest::PressButton`: press `device_id` with `press_type`, the
+    /// way a hub reports a press over its event stream. The `ButtonPressed`
+    /// goes on the bus, and input tracking runs the controllers bound to
+    /// the switch from there, as for a real remote (#35).
+    ///
+    /// Only a switch the dummy gateway simulates can be pressed like this
+    /// (see [`is_simulated`]). `v1bectl_server` hands this server a
+    /// `dyn Gateway`, which can't say what it is, so it goes by the device.
+    /// A real hub's devices are never simulated, so against one every press
+    /// is refused: its remotes are pressed by hand, and the server mustn't
+    /// make up a press the hub never saw.
+    async fn press_button(&self, device_id: String, press_type: ButtonPressType) -> ApiResponse {
+        let Some(device) = self.state_store.get_device(&device_id).await else {
+            return ApiResponse::Error {
+                code: "NOT_FOUND".to_string(),
+                message: "Device not found".to_string(),
+            };
+        };
+        if !is_simulated(&device.device_info) {
+            return ApiResponse::Error {
+                code: "PRESS_UNSUPPORTED".to_string(),
+                message: format!(
+                    "{device_id} isn't a simulated switch: only the dummy gateway's switches \
+                     can be pressed from here (v1bectl_server dummy). Press a real remote by hand."
+                ),
+            };
+        }
+        if !matches!(device.state, DeviceStateValue::Switch(_)) {
+            return ApiResponse::Error {
+                code: "WRONG_TYPE".to_string(),
+                message: "Device is not a switch".to_string(),
+            };
+        }
+
+        info!("🔘 Simulating a {:?} of {}", press_type, device_id);
+        self.event_bus
+            .publish(DeviceEvent {
+                timestamp: std::time::SystemTime::now(),
+                device_id: device_id.clone(),
+                event_type: EventType::ButtonPressed {
+                    button_id: "main".to_string(),
+                    press_type: press_type.clone(),
+                },
+            })
+            .await;
+        ApiResponse::ButtonPressed {
+            device_id,
+            press_type,
         }
     }
 }
@@ -932,10 +1005,16 @@ mod tests {
     //! test decides exactly when tracking catches up, after every write or
     //! only after several, and nothing waits on a clock.
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
-    use v1bectl_sync::SyncStatus;
-    use v1bectl_virtual::{DummyGateway, LightGroupLinear};
+    use v1bectl_sync::{
+        Capability, DeviceId, DeviceType, GatewayError, GatewayHealth, SwitchState, SyncStatus,
+    };
+    use v1bectl_virtual::{
+        ButtonController, DummyGateway, LightGroupLinear, VirtualDeviceTomlConfig,
+    };
 
     const GROUP: &str = "virtual_bedroom_lights";
     /// (member, its brightness when the group is on at 50%): the linear
@@ -1339,6 +1418,382 @@ mod tests {
             "group was re-derived from a colour-only difference"
         );
         assert!(echoes(&events, GROUP).is_empty(), "group re-echoed");
+    }
+
+    /// The shipped `virtual_devices/button_ctrl.toml`, read from the file
+    /// and registered the way `v1bectl_server` registers it: it binds the
+    /// dummy's switch to Bedroom Lights. `toggle` on a click, `set 100` on
+    /// a double press, `inc 10` on a long press.
+    async fn add_shipped_controller(home: &Home) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../virtual_devices");
+        let configs = v1bectl_virtual::load_virtual_devices_from_dir(&dir)
+            .await
+            .expect("load virtual_devices/");
+        let Some(c) = configs.into_iter().find_map(|config| match config {
+            VirtualDeviceTomlConfig::ButtonController(c)
+                if c.device_id == "ctrl_lightgroup_bed" =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }) else {
+            panic!("button_ctrl.toml no longer ships ctrl_lightgroup_bed");
+        };
+        assert_eq!(c.button, SWITCH, "the button the shipped controller binds");
+        let config = VirtualDeviceConfig {
+            device_id: c.device_id.clone(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: c.name.clone(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        let controller = ButtonController::new(
+            config,
+            c.button.clone(),
+            &c.press_on,
+            &c.press_off,
+            c.press_on_long.as_deref(),
+            c.press_off_long.as_deref(),
+            c.press_double.as_deref(),
+        )
+        .expect("controller");
+        home.manager
+            .add_virtual_device(Box::new(controller))
+            .await
+            .expect("register controller");
+    }
+
+    /// The dummy `basic_home` scenario's switch.
+    const SWITCH: &str = "switch_hallway";
+
+    async fn press(
+        server: &AxumServer,
+        device_id: &str,
+        press_type: ButtonPressType,
+    ) -> ApiResponse {
+        let request = ApiRequest::PressButton {
+            device_id: device_id.to_string(),
+            press_type,
+        };
+        server.handle_api_request(request, String::new()).await
+    }
+
+    /// #35: `PressButton` on the dummy's switch, through the API handler.
+    /// It's answered, its `ButtonPressed` goes on the bus, and the
+    /// controller bound to the switch runs from there, as for a real
+    /// remote. Bedroom Lights starts on at 75 (the dummy's kitchen light).
+    /// A click toggles it off, keeping 75, and its members with it (#35
+    /// review, finding 1: it used to run `on` then `off`, so a click always
+    /// ended off). The next click lights it again at 75. A long press takes
+    /// it to 85 and a double press to 100, and each member write is queued
+    /// for the gateway.
+    #[tokio::test]
+    async fn press_button_runs_the_controller_bound_to_the_dummy_switch() {
+        let home = home().await;
+        add_shipped_controller(&home).await;
+        let group = light(&home.store, GROUP).await;
+        assert_eq!(
+            (group.is_on, group.brightness),
+            (true, Some(75)),
+            "at start"
+        );
+        let mut rx = home.bus.subscribe();
+
+        let response = press(&home.server, SWITCH, ButtonPressType::SinglePress).await;
+        assert!(
+            matches!(
+                &response,
+                ApiResponse::ButtonPressed {
+                    device_id,
+                    press_type: ButtonPressType::SinglePress,
+                } if device_id == SWITCH
+            ),
+            "unexpected response: {response:?}"
+        );
+        let events = pump(&home, &mut rx).await;
+        assert!(
+            matches!(
+                events.first(),
+                Some(DeviceEvent {
+                    device_id,
+                    event_type: EventType::ButtonPressed {
+                        press_type: ButtonPressType::SinglePress,
+                        ..
+                    },
+                    ..
+                }) if device_id == SWITCH
+            ),
+            "the press must go on the bus first: {:?}",
+            events.first()
+        );
+        assert_eq!(
+            levels(&events, GROUP),
+            vec![(false, Some(75))],
+            "a click: toggled off, keeping the level"
+        );
+        assert_members_off(&home.store).await;
+
+        for (press_type, want, case) in [
+            (
+                ButtonPressType::SinglePress,
+                (true, Some(75)),
+                "the next click: back on at 75",
+            ),
+            (
+                ButtonPressType::LongPress,
+                (true, Some(85)),
+                "a long press: inc 10",
+            ),
+            (
+                ButtonPressType::DoublePress,
+                (true, Some(100)),
+                "a double press: set 100",
+            ),
+        ] {
+            let response = press(&home.server, SWITCH, press_type).await;
+            assert!(
+                matches!(response, ApiResponse::ButtonPressed { .. }),
+                "unexpected response: {response:?}"
+            );
+            let events = pump(&home, &mut rx).await;
+            assert_eq!(levels(&events, GROUP), vec![want], "{case}");
+        }
+        for (member, _) in MEMBERS_AT_50 {
+            let state = light(&home.store, member).await;
+            assert!(state.is_on, "{member} should be on: {state:?}");
+            let status = home.engine.get_sync_status(&member.to_string()).await;
+            assert!(
+                matches!(status, Some(SyncStatus::PendingSync { .. })),
+                "member {member} write never queued for the gateway: {status:?}"
+            );
+        }
+    }
+
+    /// A stand-in for a real hub: one remote, shaped the way
+    /// `DirigeraGateway` maps a controller (made by IKEA, a `Switch`, no
+    /// custom attributes), so not simulated. The methods are written out
+    /// the way `#[async_trait]` expands them: `v1bectl_api` has no
+    /// `async-trait` dependency of its own.
+    struct RealHub;
+
+    const REMOTE: &str = "44444444-4444-4444-4444-444444444444_1";
+
+    type HubFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, GatewayError>> + Send + 'a>>;
+
+    impl Gateway for RealHub {
+        fn discover_devices<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> HubFuture<'async_trait, Vec<DeviceInfo>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                Ok(vec![DeviceInfo {
+                    device_id: REMOTE.to_string(),
+                    name: "Remote".to_string(),
+                    device_type: DeviceType::Switch,
+                    capabilities: vec![Capability::BatteryLevel],
+                    device_groups: vec![],
+                    manufacturer: Some("IKEA".to_string()),
+                    model: Some("controller".to_string()),
+                    firmware_version: None,
+                    battery_powered: true,
+                    reachable: true,
+                    last_seen: 0,
+                    custom_attributes: HashMap::new(),
+                }])
+            })
+        }
+
+        fn get_device_state<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _device_id: &'life1 DeviceId,
+        ) -> HubFuture<'async_trait, DeviceStateValue>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                Ok(DeviceStateValue::Switch(SwitchState {
+                    is_pressed: false,
+                    last_pressed: None,
+                    battery_level: Some(85),
+                }))
+            })
+        }
+
+        fn set_device_state<'life0, 'life1, 'async_trait>(
+            &'life0 self,
+            _device_id: &'life1 DeviceId,
+            _state: DeviceStateValue,
+        ) -> HubFuture<'async_trait, ()>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn health_check<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> HubFuture<'async_trait, GatewayHealth>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async {
+                Ok(GatewayHealth {
+                    reachable: true,
+                    response_time_ms: 0,
+                    connected_devices: 1,
+                    last_error: None,
+                })
+            })
+        }
+    }
+
+    /// #35: against a real hub, `PressButton` is refused with
+    /// `PRESS_UNSUPPORTED`, even for its remote, and nothing goes on the
+    /// bus: a real remote is pressed by hand.
+    #[tokio::test]
+    async fn press_button_is_refused_on_a_real_hub() {
+        let hub: Arc<dyn Gateway> = Arc::new(RealHub);
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        for info in hub.discover_devices().await.expect("discover") {
+            let state = hub
+                .get_device_state(&info.device_id)
+                .await
+                .expect("initial state");
+            store.add_device(info, state).await;
+        }
+        let server = AxumServer::new(0, store, Arc::clone(&bus), hub);
+        let mut rx = bus.subscribe();
+
+        let response = press(&server, REMOTE, ButtonPressType::SinglePress).await;
+        assert!(
+            matches!(
+                &response,
+                ApiResponse::Error { code, message }
+                    if code == "PRESS_UNSUPPORTED" && message.contains(REMOTE)
+            ),
+            "unexpected response: {response:?}"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "a refused press went on the bus"
+        );
+    }
+
+    /// #35: on the dummy, only a switch can be pressed. A light is
+    /// `WRONG_TYPE`, a virtual device `PRESS_UNSUPPORTED` (the dummy doesn't
+    /// simulate it) and an unknown id `NOT_FOUND`. None of them publishes
+    /// anything.
+    #[tokio::test]
+    async fn press_button_refuses_what_isnt_a_dummy_switch() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+        for (device_id, want) in [
+            ("light_kitchen", "WRONG_TYPE"),
+            (GROUP, "PRESS_UNSUPPORTED"),
+            ("no_such_device", "NOT_FOUND"),
+        ] {
+            let response = press(&home.server, device_id, ButtonPressType::SinglePress).await;
+            assert!(
+                matches!(&response, ApiResponse::Error { code, .. } if code == want),
+                "{device_id}: want {want}, got {response:?}"
+            );
+            assert!(
+                matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+                "{device_id}: a refused press went on the bus"
+            );
+        }
+    }
+
+    /// #35: `PressButton` and its answer go over CBOR by variant name, as
+    /// the CLI's own copy of these types (`v1bectl_cli`'s
+    /// `websocket_client.rs`) encodes and decodes them. It lists fewer
+    /// variants, in another order, which is why only the names may matter.
+    /// A request from a client that doesn't know the new variant still
+    /// decodes.
+    #[test]
+    fn press_button_goes_over_cbor_as_the_cli_sends_it() {
+        #[derive(Serialize)]
+        enum CliRequest {
+            GetDeviceState {
+                device_id: String,
+            },
+            PressButton {
+                device_id: String,
+                press_type: ButtonPressType,
+            },
+        }
+        #[derive(Deserialize, Debug)]
+        enum CliResponse {
+            Pong,
+            ButtonPressed {
+                device_id: String,
+                press_type: ButtonPressType,
+            },
+        }
+        fn cbor(value: &impl Serialize) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            ciborium::into_writer(value, &mut bytes).expect("encode");
+            bytes
+        }
+
+        let request: ApiRequest = ciborium::from_reader(
+            cbor(&CliRequest::PressButton {
+                device_id: SWITCH.to_string(),
+                press_type: ButtonPressType::DoublePress,
+            })
+            .as_slice(),
+        )
+        .expect("the server decodes the CLI's PressButton");
+        assert!(
+            matches!(
+                &request,
+                ApiRequest::PressButton {
+                    device_id,
+                    press_type: ButtonPressType::DoublePress,
+                } if device_id == SWITCH
+            ),
+            "{request:?}"
+        );
+        let older: ApiRequest = ciborium::from_reader(
+            cbor(&CliRequest::GetDeviceState {
+                device_id: SWITCH.to_string(),
+            })
+            .as_slice(),
+        )
+        .expect("an older request still decodes");
+        assert!(
+            matches!(older, ApiRequest::GetDeviceState { .. }),
+            "{older:?}"
+        );
+
+        let response: CliResponse = ciborium::from_reader(
+            cbor(&ApiResponse::ButtonPressed {
+                device_id: SWITCH.to_string(),
+                press_type: ButtonPressType::LongPress,
+            })
+            .as_slice(),
+        )
+        .expect("the CLI decodes the server's ButtonPressed");
+        assert!(
+            matches!(
+                &response,
+                CliResponse::ButtonPressed {
+                    device_id,
+                    press_type: ButtonPressType::LongPress,
+                } if device_id == SWITCH
+            ),
+            "{response:?}"
+        );
     }
 
     /// #15: the WebSocket forwarder must outlive falling behind the bus. It

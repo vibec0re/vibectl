@@ -11,7 +11,7 @@ mod websocket_client;
 use clap::{Parser, Subcommand};
 use tabled::{Table, Tabled};
 use tracing::Level;
-use v1bectl_sync::{DeviceStateValue, EventType};
+use v1bectl_sync::{ButtonPressType, DeviceStateValue, EventType};
 use websocket_client::WebSocketClient;
 
 #[derive(Parser)]
@@ -49,6 +49,15 @@ enum Commands {
         #[arg(long)]
         color_temp: Option<u16>,
     },
+    /// Press a switch of the dummy gateway (`v1bectl_server dummy`), as if
+    /// by hand: the button controllers bound to it run
+    Button {
+        /// Device ID of the switch, e.g. `switch_hallway`
+        device_id: String,
+        /// The press: a click, a double click, or a long press
+        #[arg(long, value_enum, default_value_t = Press::Single)]
+        press: Press,
+    },
     /// Subscribe to device events in real-time
     Subscribe {
         /// Device IDs to subscribe to (empty = all devices)
@@ -66,6 +75,28 @@ enum Commands {
         #[arg(long)]
         host: Option<String>,
     },
+}
+
+/// A press for `button --press`, as the hub reports it (see
+/// `v1bectl_virtual::ButtonController` for what each runs).
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum Press {
+    /// A click: `press_on`, then `press_off`
+    Single,
+    /// A double click: `press_double` (or two clicks, if there's none)
+    Double,
+    /// A press still held: `press_on_long` (or `press_on`)
+    Long,
+}
+
+impl From<Press> for ButtonPressType {
+    fn from(press: Press) -> Self {
+        match press {
+            Press::Single => Self::SinglePress,
+            Press::Double => Self::DoublePress,
+            Press::Long => Self::LongPress,
+        }
+    }
 }
 
 #[derive(Tabled)]
@@ -202,6 +233,10 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 anyhow::bail!("{device_id} is not a light device");
             }
+        }
+        Commands::Button { device_id, press } => {
+            let (device_id, press_type) = client.press_button(&device_id, press.into()).await?;
+            println!("✓ Pressed {device_id}: {press_type:?}");
         }
         Commands::Subscribe { device_ids, json } => {
             use futures_util::stream::StreamExt;
