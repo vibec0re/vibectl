@@ -1,10 +1,32 @@
+//! 🔥 The sync engine: keeps the [`StateStore`] and the gateway in step.
+//!
+//! - **Push.** A user write ([`SyncEngine::apply_optimistic_update`]) goes
+//!   into the store right away (with [`SyncConfig::optimistic_updates`]) and
+//!   into the sync buffer. The buffer worker drains the buffer every 50 ms
+//!   and sends each device's value to the gateway, one device at a time.
+//! - **Pull.** Every [`SyncConfig::pull_interval`] the pull worker reads
+//!   every device from the gateway and reconciles the store with it
+//!   ([`SyncConfig::conflict_resolution`]). A user write the hub hasn't
+//!   confirmed yet is shielded from that for [`SyncConfig::protection_window`].
+//! - **Retry.** A failed push is retried with exponential backoff
+//!   ([`SyncConfig::base_retry_delay`]).
+//!
+//! # Throttling
+//!
+//! There is no request-rate limiter. The throttle is per-device
+//! coalescing: the sync buffer keeps only the latest value per device, so
+//! however fast a client writes (a dragged slider, say), each drain sends at
+//! most one PATCH per device, and a device gets at most one buffered PATCH
+//! per buffer tick (20 per second at 50 ms). Retries of failed pushes come
+//! on top of that.
+
 use crate::events::*;
 use crate::gateway::*;
 use crate::store::*;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{watch, RwLock, Semaphore};
+use tokio::sync::{watch, RwLock};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 use v1bectl_state::*;
@@ -15,31 +37,6 @@ pub struct OptimisticState {
     pub client_state: DeviceStateValue,
     pub pending_sync: bool,
     pub updated_at: Instant,
-}
-
-// 🔥 RATE LIMITER FOR GATEWAY!
-#[derive(Debug)]
-pub struct RateLimiter {
-    semaphore: Arc<Semaphore>,
-    // kept: records the configured rate for debugging/introspection; the limit is
-    // enforced via the semaphore's permit count set from this value in `new`.
-    #[allow(dead_code)]
-    max_per_second: u32,
-}
-
-impl RateLimiter {
-    pub fn new(max_per_second: u32) -> Self {
-        Self {
-            semaphore: Arc::new(Semaphore::new(max_per_second as usize)),
-            max_per_second,
-        }
-    }
-
-    pub async fn acquire(&self) {
-        let _permit = self.semaphore.acquire().await.unwrap();
-        // Rate limiting is handled by semaphore permit count
-        // Permits will auto-release when dropped
-    }
 }
 
 // 🔥 SYNC BUFFER - OVERWRITES WITH LATEST VALUES! NO SPAM! <3
@@ -78,9 +75,8 @@ pub struct SyncEngine {
     shutdown_tx: watch::Sender<bool>,
     // 🔥 OPTIMISTIC UPDATE TRACKING!
     optimistic_states: Arc<RwLock<HashMap<DeviceId, OptimisticState>>>,
-    // 🔥 RATE LIMITING FOR GATEWAY!
-    gateway_rate_limiter: Arc<RwLock<RateLimiter>>,
-    // 🔥 SYNC BUFFER - CONSTANTLY OVERWRITES, SYNCS AT MAX RATE! <3
+    // 🔥 SYNC BUFFER - CONSTANTLY OVERWRITES, ONE PUSH PER DEVICE PER TICK! <3
+    // This coalescing is the gateway throttle (see the module docs).
     sync_buffer: Arc<RwLock<HashMap<DeviceId, SyncBufferEntry>>>,
     // 🔥 PENDING CONFIRMATIONS - UI CHANGES GET PROTECTION WINDOW! 💖
     pending_confirmations: Arc<RwLock<HashMap<DeviceId, PendingConfirmation>>>,
@@ -149,7 +145,6 @@ pub struct SyncConfig {
     pub conflict_resolution: ConflictResolution,
     // 🔥 NEW VIBEOPTIMIZATION SETTINGS!
     pub optimistic_updates: bool,
-    pub gateway_rate_limit: u32,     // Max requests per second to gateway
     pub client_priority_boost: bool, // Prioritize client-initiated changes
     /// 🛡️ How long a user write is shielded from pulls that still report the
     /// old value. It starts at the write and restarts when the push goes out,
@@ -177,7 +172,6 @@ impl Default for SyncConfig {
             conflict_resolution: ConflictResolution::GatewayWins, // 🔥 PHYSICAL SWITCHES WIN! <3
             // 🔥 VIBEOPTIMIZED DEFAULTS!
             optimistic_updates: true,    // INSTANT UI FEEDBACK!
-            gateway_rate_limit: 10,      // 🔥 10 req/s - FAST but still safe!
             client_priority_boost: true, // TUI FEELS INSTANT!
             protection_window: Duration::from_secs(5), // 🛡️ UI changes are PROTECTED!
         }
@@ -202,9 +196,6 @@ impl SyncEngine {
             retry_queue: Arc::new(RwLock::new(HashMap::new())),
             sync_status: Arc::new(RwLock::new(HashMap::new())),
             optimistic_states: Arc::new(RwLock::new(HashMap::new())),
-            gateway_rate_limiter: Arc::new(RwLock::new(RateLimiter::new(
-                config.gateway_rate_limit,
-            ))),
             sync_buffer: Arc::new(RwLock::new(HashMap::new())),
             pending_confirmations: Arc::new(RwLock::new(HashMap::new())), // 🔥 UI PROTECTION! 💖
             config,
@@ -284,7 +275,7 @@ impl SyncEngine {
                 },
             );
             debug!(
-                "💖 BUFFER UPDATED for {} - will sync at max 2/sec!",
+                "💖 BUFFER UPDATED for {} - the next drain sends the latest value!",
                 task.device_id
             );
         } else {
@@ -528,7 +519,6 @@ impl SyncEngine {
                 self.refresh_protection(&device_id, &entry.state).await;
             }
 
-            // Execute with rate limiting
             if let Err(e) = self.execute_sync_task(&task).await {
                 // 🛡️ The pending confirmation stays and runs out on its own,
                 // `protection_window` after this attempt. With the defaults
@@ -640,19 +630,6 @@ impl SyncEngine {
                     started_at: chrono::Utc::now().timestamp_millis() as u64,
                 },
             );
-        }
-
-        // 🔥 RATE LIMIT GATEWAY OPERATIONS!
-        let needs_rate_limit = matches!(
-            &task.task_type,
-            SyncTaskType::PushToGateway { .. }
-                | SyncTaskType::PullFromGateway
-                | SyncTaskType::ForceRefresh
-        );
-
-        if needs_rate_limit {
-            debug!("⏱️ Acquiring rate limit permit for gateway operation");
-            self.gateway_rate_limiter.read().await.acquire().await;
         }
 
         let result = match &task.task_type {
