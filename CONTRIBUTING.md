@@ -16,7 +16,6 @@ No Nix? A standard **stable Rust** toolchain works too. You'll additionally need
 
 - `pkg-config` + OpenSSL dev headers — for the gateway/server crates
 - `trunk` + the `wasm32-unknown-unknown` target — for the web UI (`v1bectl_web`)
-- GTK4 / libadwaita dev libraries — for the desktop app (`v1bectl_gtk`)
 
 ## Working without hardware 🧪
 
@@ -30,13 +29,13 @@ cargo run -p v1bectl_server -- dummy --scenario basic_home
 ## Before you open a PR ✅
 
 CI runs the checks below. Please make sure they pass locally for the native
-crates (the `gtk` and `web` crates need extra system toolchains, so CI skips
-them — build those locally if your change touches them):
+crates (the `web` crate needs an extra system toolchain, so CI skips
+it — build it locally if your change touches it):
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --exclude v1bectl_gtk --exclude v1bectl_web --all-targets -- -D warnings
-cargo test  --workspace --exclude v1bectl_gtk --exclude v1bectl_web
+cargo clippy --workspace --exclude v1bectl_web --all-targets -- -D warnings
+cargo test  --workspace --exclude v1bectl_web
 ```
 
 ## Commit style ✨

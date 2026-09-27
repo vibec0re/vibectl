@@ -61,7 +61,6 @@ v1bectl/
 │   └── v1bectl_api/          # WebSocket/TCP API server
 ├── v1bectl_tui/              # Terminal UI (ratatui)
 ├── v1bectl_web/              # Web UI (Yew/WASM)
-├── v1bectl_gtk/              # GTK4 desktop app
 └── v1bectl_widget/           # trollshell sidebar widget (out-of-process hytte-plugin)
 ```
 

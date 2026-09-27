@@ -17,7 +17,7 @@
 
 ## 🎯 What is this?
 
-**v1bectl** is a high-performance, async-first control system for an [IKEA Dirigera](https://www.ikea.com/) smart home. A central server keeps an in-memory model of your devices, syncs it bidirectionally with the Dirigera hub, and streams real-time updates to any number of clients — a CLI, a terminal UI, a web app, and a GTK desktop app — over WebSocket.
+**v1bectl** is a high-performance, async-first control system for an [IKEA Dirigera](https://www.ikea.com/) smart home. A central server keeps an in-memory model of your devices, syncs it bidirectionally with the Dirigera hub, and streams real-time updates to any number of clients — a CLI, a terminal UI, and a web app — over WebSocket.
 
 It also has a **virtual device** system (light groups, button controllers) for automation that the hub can't do on its own, and a `DummyGateway` so you can develop and test with **no hardware at all**.
 
@@ -29,7 +29,7 @@ It also has a **virtual device** system (light groups, button controllers) for a
 - ♻️ Bidirectional sync with the Dirigera hub (~5s reconcile, with retry/backoff)
 - 🔌 Device support: lights (on/off, brightness, color temperature), outlets, sensors (temp/humidity/motion), and battery remotes/buttons
 - 🧩 Virtual devices — group several lights into one, drive groups from a physical button, define scenes (configured in TOML)
-- 🖥️ Four clients: **CLI**, **TUI** (ratatui), **Web** (Yew/WASM), and **GTK4** desktop
+- 🖥️ Three clients: **CLI**, **TUI** (ratatui), and **Web** (Yew/WASM)
 - 🧪 `DummyGateway` with scenarios for hardware-free development
 - ❄️ Reproducible builds via a **Nix flake** (+ a NixOS module for deployment)
 
@@ -38,10 +38,10 @@ Runs on port **31337** by default (1337 → leet → elite 🔥).
 ## 🏗️ Architecture
 
 ```
-┌──────────────────────┐     ┌────────────────┐     ┌──────────────┐
-│ CLI · TUI · Web · GTK │────▶│  v1bectl server │◀───▶│   Dirigera   │
-│       clients         │ WS  │   (port 31337)  │     │   gateway    │
-└──────────────────────┘     └────────┬───────┘     └──────────────┘
+┌──────────────────┐     ┌────────────────┐     ┌──────────────┐
+│ CLI · TUI · Web  │────▶│  v1bectl server │◀───▶│   Dirigera   │
+│     clients      │ WS  │   (port 31337)  │     │   gateway    │
+└──────────────────┘     └────────┬───────┘     └──────────────┘
                                        │
                                 ┌──────┴───────┐
                                 │ Virtual Device │
@@ -60,7 +60,6 @@ Runs on port **31337** by default (1337 → leet → elite 🔥).
 | `v1bectl_cli` | Command-line client |
 | `v1bectl_tui` | Terminal UI (ratatui) |
 | `v1bectl_web` | Web UI (Yew / WASM) |
-| `v1bectl_gtk` | GTK4 desktop app |
 | `v1bectl_widget` | trollshell sidebar widget (out-of-process plugin over [hytte-plugin](https://github.com/vibec0re/trollshell)) |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
@@ -77,7 +76,6 @@ nix develop      # toolchain shell (Rust, wasm target, trunk, openssl, pkg-confi
 
 - `pkg-config` + OpenSSL dev headers (server/gateway)
 - `trunk` + the `wasm32-unknown-unknown` target (web UI)
-- GTK4 / libadwaita dev libraries (desktop app)
 
 You'll also want either an **IKEA Dirigera hub** or the built-in **dummy** gateway.
 
@@ -119,9 +117,6 @@ cargo run -p v1bectl_tui
 
 # Web UI (serves on http://localhost:8080)
 cd v1bectl_web && trunk serve
-
-# GTK4 desktop app
-cargo run -p v1bectl_gtk
 ```
 
 A `Makefile` wraps the common commands (`make server`, `make tui`, `make web`,
@@ -138,13 +133,13 @@ example device IDs for your own Dirigera device IDs (find them with
 ## 🛠️ Development
 
 ```bash
-cargo test  --workspace --exclude v1bectl_gtk --exclude v1bectl_web
-cargo clippy --workspace --exclude v1bectl_gtk --exclude v1bectl_web --all-targets -- -D warnings
+cargo test  --workspace --exclude v1bectl_web
+cargo clippy --workspace --exclude v1bectl_web --all-targets -- -D warnings
 cargo fmt --all
 ```
 
-CI runs these on every push/PR. The `gtk` and `web` crates need extra system
-toolchains, so CI skips them — build those locally if you touch them.
+CI runs these on every push/PR. The `web` crate needs an extra system
+toolchain, so CI skips it — build it locally if you touch it.
 Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## 📚 Docs
