@@ -56,3 +56,17 @@ futures-util = "0.3"
 
 # Testing
 mockall = "0.12"
+
+# 🔥 Pedantic ratchet, mirrored from trollshell's table. Crates opt in with
+# `[lints]\nworkspace = true` as they get clean — tui, cli, gateway, widget,
+# server, state are in as of this PR. virtual, api, sync, and web follow
+# once their own fix rounds land. See issue #5.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
