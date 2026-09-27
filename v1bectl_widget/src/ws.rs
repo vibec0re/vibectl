@@ -28,7 +28,7 @@ pub fn server_url() -> String {
     if addr.starts_with("ws://") || addr.starts_with("wss://") {
         addr
     } else {
-        format!("ws://{}/", addr)
+        format!("ws://{addr}/")
     }
 }
 
@@ -247,6 +247,12 @@ async fn run_conn(
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
     msg_tx: &mpsc::UnboundedSender<WsMsg>,
 ) -> Option<()> {
+    // Read-side watchdog: a healthy connection has inbound traffic at least
+    // every keepalive round (the server Pongs our Ping), so a long silence
+    // means a half-open TCP connection — reconnect instead of sitting
+    // "Online" with dead controls until the kernel notices.
+    const SILENCE_LIMIT: Duration = Duration::from_secs(90);
+
     let (mut sink, mut source) = stream.split();
 
     if msg_tx.send(WsMsg::Status(Conn::Online)).is_err() {
@@ -266,12 +272,6 @@ async fn run_conn(
     let mut keepalive = interval(Duration::from_secs(30));
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     keepalive.tick().await; // consume the immediate first tick
-
-    // Read-side watchdog: a healthy connection has inbound traffic at least
-    // every keepalive round (the server Pongs our Ping), so a long silence
-    // means a half-open TCP connection — reconnect instead of sitting
-    // "Online" with dead controls until the kernel notices.
-    const SILENCE_LIMIT: Duration = Duration::from_secs(90);
     let mut last_inbound = Instant::now();
 
     loop {
@@ -403,7 +403,7 @@ mod tests {
                 battery_powered: false,
                 reachable: true,
                 last_seen: 0,
-                custom_attributes: Default::default(),
+                custom_attributes: std::collections::HashMap::default(),
             },
             state: v1bectl_state::DeviceStateValue::Empty,
             last_updated: 0,

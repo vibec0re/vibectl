@@ -7,12 +7,13 @@
 //! devices the server doesn't know), the widget falls back to that auto
 //! layout, so the sidebar is never blank.
 //!
-//! The schema mirrors `v1bectl_gtk`'s `config` module (the canonical
-//! `kdl`-crate parser), trimmed to the `screen` blocks: the widget takes its
-//! server address from `$V1BECTL_SERVER` (see `ws::server_url`), so any
-//! `server` / `window` nodes a shared file carries are simply ignored here.
-//! Keeping the shape identical means the *same*
-//! `~/.config/v1bectl/screens.kdl` drives all three clients.
+//! The schema mirrors the shared `screens.kdl` format (see the repo-root
+//! `screens.kdl`; `v1bectl_web/src/screens.rs` parses the same shape by
+//! hand rather than with the `kdl` crate), trimmed to the `screen` blocks:
+//! the widget takes its server address from `$V1BECTL_SERVER` (see
+//! `ws::server_url`), so any `server` / `window` nodes a shared file carries
+//! are simply ignored here. Keeping the shape identical means the *same*
+//! `~/.config/v1bectl/screens.kdl` drives both clients.
 
 use std::path::PathBuf;
 
@@ -168,15 +169,16 @@ fn parse_screen(node: &kdl::KdlNode) -> Result<Screen, String> {
     // `title` child, if any — no default: an absent `title` renders no header.
     let title = children.and_then(|c| c.get("title")).and_then(first_string);
 
-    let groups = children
-        .map(|c| {
+    let groups = children.map_or_else(
+        || Ok(vec![]),
+        |c| {
             c.nodes()
                 .iter()
                 .filter(|n| n.name().value() == "group")
                 .map(parse_group)
                 .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_else(|| Ok(vec![]))?;
+        },
+    )?;
 
     Ok(Screen {
         name,
@@ -186,15 +188,15 @@ fn parse_screen(node: &kdl::KdlNode) -> Result<Screen, String> {
 }
 
 fn parse_group(node: &kdl::KdlNode) -> Result<Group, String> {
-    let elements = node
-        .children()
-        .map(|c| {
+    let elements = node.children().map_or_else(
+        || Ok(vec![]),
+        |c| {
             c.nodes()
                 .iter()
                 .map(parse_element)
                 .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_else(|| Ok(vec![]))?;
+        },
+    )?;
     Ok(Group { elements })
 }
 
@@ -245,15 +247,15 @@ fn parse_text(node: &kdl::KdlNode) -> Result<Element, String> {
 }
 
 fn parse_block(node: &kdl::KdlNode) -> Result<Element, String> {
-    let elements = node
-        .children()
-        .map(|c| {
+    let elements = node.children().map_or_else(
+        || Ok(vec![]),
+        |c| {
             c.nodes()
                 .iter()
                 .map(parse_element)
                 .collect::<Result<Vec<_>, _>>()
-        })
-        .unwrap_or_else(|| Ok(vec![]))?;
+        },
+    )?;
     Ok(Element::Block { elements })
 }
 
