@@ -35,22 +35,23 @@ impl EventProducer {
         )
     }
 
-    pub async fn start(self: Arc<Self>) {
+    pub fn start(self: Arc<Self>) {
         let scenario = self.scenario.clone();
         match scenario {
             EventScenario::BasicHome => {
-                self.run_basic_home().await;
+                self.run_basic_home();
             }
             EventScenario::AmbientActivity => {
-                self.run_ambient_activity().await;
+                self.run_ambient_activity();
             }
         }
     }
 
-    async fn run_basic_home(self: Arc<Self>) {
+    fn run_basic_home(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_millis(500));
             use rand::SeedableRng;
+
+            let mut interval = interval(Duration::from_millis(500));
             let mut rng = rand::rngs::StdRng::from_entropy();
 
             loop {
@@ -137,10 +138,15 @@ impl EventProducer {
         });
     }
 
-    async fn run_ambient_activity(self: Arc<Self>) {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat if/else chain producing one synthetic event per device kind"
+    )]
+    fn run_ambient_activity(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut interval = interval(Duration::from_secs(2));
             use rand::SeedableRng;
+
+            let mut interval = interval(Duration::from_secs(2));
             let mut rng = rand::rngs::StdRng::from_entropy();
 
             loop {

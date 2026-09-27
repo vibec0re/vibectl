@@ -1,18 +1,21 @@
-use crate::virtual_device::*;
+use crate::virtual_device::{
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use v1bectl_sync::*;
+use v1bectl_sync::{DeviceId, DeviceState, DeviceStateValue, LightState, StateStore};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BrightnessCurve {
-    /// Breakpoints as (group_brightness, device_brightness) pairs
+    /// Breakpoints as (`group_brightness`, `device_brightness`) pairs
     pub breakpoints: Vec<(u8, u8)>,
 }
 
 impl BrightnessCurve {
     /// Interpolate device brightness from group brightness using curve
+    #[must_use]
     pub fn interpolate(&self, group_brightness: u8) -> u8 {
         if self.breakpoints.is_empty() {
             return group_brightness;
@@ -41,9 +44,19 @@ impl BrightnessCurve {
                     return db1;
                 }
 
-                let ratio = (group_brightness - gb1) as f32 / (gb2 - gb1) as f32;
-                let interpolated = db1 as f32 + ratio * (db2 as f32 - db1 as f32);
-                return interpolated.round() as u8;
+                let ratio = f32::from(group_brightness - gb1) / f32::from(gb2 - gb1);
+                let interpolated = f32::from(db1) + ratio * (f32::from(db2) - f32::from(db1));
+                // `ratio` is in [0.0, 1.0] (checked above) and db1/db2 are
+                // u8, so `interpolated` is bounded within [db1, db2] (or
+                // [db2, db1]) and the round-trip back to u8 never truncates
+                // or loses sign; clippy can't see that boundedness.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "interpolated is a linear interpolation between two u8 endpoints, always in u8 range"
+                )]
+                let result = interpolated.round() as u8;
+                return result;
             }
         }
 
@@ -156,7 +169,7 @@ impl LightGroup {
         // Parse configuration
         let lights: Vec<DeviceId> =
             serde_json::from_value(config.config.get("lights").cloned().unwrap_or_default())
-                .map_err(|e| VirtualDeviceError::Config(format!("Invalid lights config: {}", e)))?;
+                .map_err(|e| VirtualDeviceError::Config(format!("Invalid lights config: {e}")))?;
 
         let brightness_curves: HashMap<DeviceId, BrightnessCurve> = serde_json::from_value(
             config
@@ -165,14 +178,13 @@ impl LightGroup {
                 .cloned()
                 .unwrap_or_default(),
         )
-        .map_err(|e| VirtualDeviceError::Config(format!("Invalid brightness curves: {}", e)))?;
+        .map_err(|e| VirtualDeviceError::Config(format!("Invalid brightness curves: {e}")))?;
 
         // Validate that all lights have curves
         for light_id in &lights {
             if !brightness_curves.contains_key(light_id) {
                 return Err(VirtualDeviceError::Config(format!(
-                    "Missing brightness curve for light: {}",
-                    light_id
+                    "Missing brightness curve for light: {light_id}"
                 )));
             }
         }

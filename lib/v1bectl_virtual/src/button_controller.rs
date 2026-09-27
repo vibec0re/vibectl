@@ -1,9 +1,13 @@
 // 🔥 BUTTON CONTROLLER - REACTS TO BUTTON EVENTS! 💖
 
-use crate::virtual_device::*;
+use crate::virtual_device::{
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState, StateStore,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonCommand {
@@ -53,7 +57,7 @@ impl ButtonAction {
             .as_str()
             .ok_or_else(|| VirtualDeviceError::Config("Device ID must be string".to_string()))?;
         let command = ButtonCommand::from_str(cmd_str)
-            .ok_or_else(|| VirtualDeviceError::Config(format!("Unknown command: {}", cmd_str)))?;
+            .ok_or_else(|| VirtualDeviceError::Config(format!("Unknown command: {cmd_str}")))?;
         let amount = action
             .get(2)
             .and_then(serde_json::Value::as_u64)
@@ -67,6 +71,7 @@ impl ButtonAction {
     }
 
     /// The state this action moves a light at `light` to.
+    #[must_use]
     pub fn apply(&self, mut light: LightState) -> LightState {
         match self.command {
             ButtonCommand::Inc => {
@@ -210,8 +215,8 @@ impl ButtonController {
     pub fn new(
         config: VirtualDeviceConfig,
         button_id: String,
-        press_on: Vec<serde_json::Value>,
-        press_off: Vec<serde_json::Value>,
+        press_on: &[serde_json::Value],
+        press_off: &[serde_json::Value],
         press_on_long: Option<Vec<serde_json::Value>>,
         press_off_long: Option<Vec<serde_json::Value>>,
         _state_store: Arc<StateStore>,
@@ -228,8 +233,8 @@ impl ButtonController {
         Ok(Self {
             config,
             button_id,
-            press_on_action: parse(&press_on)?,
-            press_off_action: parse(&press_off)?,
+            press_on_action: parse(press_on)?,
+            press_off_action: parse(press_off)?,
             press_on_long_action: press_on_long,
             press_off_long_action: press_off_long,
         })
@@ -300,6 +305,7 @@ impl VirtualDevice for ButtonController {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use v1bectl_sync::SwitchState;
 
     fn switch(is_pressed: bool, battery_level: u8) -> Value {
         serde_json::to_value(DeviceStateValue::Switch(SwitchState {
@@ -326,6 +332,10 @@ mod tests {
     /// release, in every shape `pressed` reads. Without an old value, only
     /// `is_pressed: true` counts (see [`transition`]).
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat table of (case, event, want) triples covering every event shape `pressed` reads; splitting it up would just scatter the table"
+    )]
     fn only_an_is_pressed_transition_is_a_press_or_a_release() {
         let switch_state = |is_pressed| {
             DeviceStateValue::Switch(SwitchState {

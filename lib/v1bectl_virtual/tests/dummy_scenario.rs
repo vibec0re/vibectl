@@ -255,8 +255,8 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
         let controller = ButtonController::new(
             config,
             c.button.clone(),
-            c.press_on.clone(),
-            c.press_off.clone(),
+            &c.press_on,
+            &c.press_off,
             c.press_on_long.clone(),
             c.press_off_long.clone(),
             store.clone(),

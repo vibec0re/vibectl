@@ -1,10 +1,14 @@
-use crate::virtual_device::*;
+use crate::virtual_device::{
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    DeviceId, DeviceStateValue, LightState, SceneState, SensorState, StateStore, SwitchState,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene {
@@ -47,7 +51,7 @@ impl SceneController {
         // Parse configuration
         let scenes: HashMap<String, Scene> =
             serde_json::from_value(config.config.get("scenes").cloned().unwrap_or_default())
-                .map_err(|e| VirtualDeviceError::Config(format!("Invalid scenes config: {}", e)))?;
+                .map_err(|e| VirtualDeviceError::Config(format!("Invalid scenes config: {e}")))?;
 
         let transition_duration_ms: u64 = serde_json::from_value(
             config
@@ -56,7 +60,7 @@ impl SceneController {
                 .cloned()
                 .unwrap_or(serde_json::Value::Number(serde_json::Number::from(1000))),
         )
-        .map_err(|e| VirtualDeviceError::Config(format!("Invalid transition duration: {}", e)))?;
+        .map_err(|e| VirtualDeviceError::Config(format!("Invalid transition duration: {e}")))?;
 
         Ok(Self {
             config,
@@ -99,18 +103,24 @@ impl SceneController {
                 }
 
                 for step in 0..=steps {
+                    // `steps` is a fade duration in 100ms increments; not
+                    // provably bounded to f32's 23-bit mantissa, but scene
+                    // fades are seconds-to-minutes long in practice.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "steps is a fade-duration/100ms step count, far below f32's precision limit in practice"
+                    )]
                     let progress = step as f32 / steps as f32;
 
                     for (device_id, target_state) in &scene.device_states {
-                        let current_state = self
-                            .state_store
-                            .get_device(device_id)
-                            .await
-                            .map(|ds| ds.state)
-                            .unwrap_or_else(|| self.get_default_state_for_target(target_state));
+                        let current_state =
+                            self.state_store.get_device(device_id).await.map_or_else(
+                                || Self::get_default_state_for_target(target_state),
+                                |ds| ds.state,
+                            );
 
                         let interpolated_state =
-                            self.interpolate_states(&current_state, target_state, progress);
+                            Self::interpolate_states(&current_state, target_state, progress);
                         self.state_store
                             .update_device_state(device_id, interpolated_state)
                             .await?;
@@ -140,7 +150,7 @@ impl SceneController {
     }
 
     /// Get default state for a target device type
-    fn get_default_state_for_target(&self, target_state: &DeviceStateValue) -> DeviceStateValue {
+    fn get_default_state_for_target(target_state: &DeviceStateValue) -> DeviceStateValue {
         match target_state {
             DeviceStateValue::Light(_) => DeviceStateValue::Light(LightState {
                 is_on: false,
@@ -156,7 +166,7 @@ impl SceneController {
             DeviceStateValue::Sensor(_) => DeviceStateValue::Sensor(SensorState {
                 temperature: None,
                 humidity: None,
-                last_updated: chrono::Utc::now().timestamp_millis() as u64,
+                last_updated: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             }),
             _ => target_state.clone(),
         }
@@ -164,7 +174,6 @@ impl SceneController {
 
     /// Interpolate between two device states
     fn interpolate_states(
-        &self,
         current: &DeviceStateValue,
         target: &DeviceStateValue,
         progress: f32,
@@ -174,8 +183,16 @@ impl SceneController {
                 let interpolated_brightness = if let (Some(c), Some(t)) =
                     (current_light.brightness, target_light.brightness)
                 {
-                    let interpolated = c as f32 + progress * (t as f32 - c as f32);
-                    Some(interpolated.round() as u8)
+                    let interpolated = f32::from(c) + progress * (f32::from(t) - f32::from(c));
+                    // interpolated is a weighted average of two u8 values,
+                    // so it's always within u8 range; clippy can't see that.
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "weighted average of two u8 brightness values, always in u8 range"
+                    )]
+                    let brightness = interpolated.round() as u8;
+                    Some(brightness)
                 } else {
                     target_light.brightness
                 };
@@ -183,8 +200,15 @@ impl SceneController {
                 let interpolated_temp = if let (Some(c), Some(t)) =
                     (current_light.color_temp, target_light.color_temp)
                 {
-                    let interpolated = c as f32 + progress * (t as f32 - c as f32);
-                    Some(interpolated.round() as u16)
+                    let interpolated = f32::from(c) + progress * (f32::from(t) - f32::from(c));
+                    // Same reasoning as brightness above, for u16 color temp.
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        reason = "weighted average of two u16 color-temp values, always in u16 range"
+                    )]
+                    let color_temp = interpolated.round() as u16;
+                    Some(color_temp)
                 } else {
                     target_light.color_temp
                 };
@@ -269,8 +293,7 @@ impl VirtualDevice for SceneController {
             Ok(())
         } else {
             Err(VirtualDeviceError::Config(format!(
-                "Scene not found: {}",
-                scene_name
+                "Scene not found: {scene_name}"
             )))
         }
     }
@@ -293,25 +316,6 @@ mod tests {
 
     #[test]
     fn test_light_state_interpolation() {
-        let controller = SceneController {
-            config: VirtualDeviceConfig {
-                device_id: "test".to_string(),
-                device_type: VirtualDeviceType::SceneController,
-                name: "Test".to_string(),
-                description: None,
-                enabled: true,
-                config: serde_json::Value::Object(serde_json::Map::new()),
-            },
-            scenes: HashMap::new(),
-            current_scene: None,
-            transition_duration: Duration::from_secs(1),
-            current_state: VirtualSceneState {
-                scene_name: "none".to_string(),
-                is_active: false,
-            },
-            state_store: StateStore::new(),
-        };
-
         let current = DeviceStateValue::Light(LightState {
             is_on: true,
             brightness: Some(20),
@@ -327,7 +331,7 @@ mod tests {
         });
 
         // Test midpoint interpolation
-        let interpolated = controller.interpolate_states(&current, &target, 0.5);
+        let interpolated = SceneController::interpolate_states(&current, &target, 0.5);
         if let DeviceStateValue::Light(light) = interpolated {
             assert_eq!(light.brightness, Some(50));
             assert_eq!(light.color_temp, Some(3350));

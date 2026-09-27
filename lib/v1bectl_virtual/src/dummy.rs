@@ -7,7 +7,11 @@ use tokio::sync::{broadcast, RwLock};
 use tokio::time::sleep;
 use tracing::{debug, info};
 use v1bectl_gateway::Gateway;
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    recv_lossy, Capability, DeviceEvent, DeviceId, DeviceInfo, DeviceStateValue, DeviceType,
+    EventStream, GatewayError, GatewayHealth, LightState, MotionSensorState, OutletState, RgbColor,
+    SensorState, SwitchState, Timestamp,
+};
 
 pub struct DummyGateway {
     devices: Arc<RwLock<HashMap<DeviceId, MockDevice>>>,
@@ -92,7 +96,7 @@ impl DummyGateway {
                 }
             });
 
-            event_producer.start().await;
+            event_producer.start();
         });
 
         info!(
@@ -104,9 +108,8 @@ impl DummyGateway {
 
     fn load_scenario_static(devices: &mut HashMap<DeviceId, MockDevice>, scenario: &str) {
         match scenario {
-            "basic_home" => Self::load_basic_home_scenario_static(devices),
+            "basic_home" | "unreliable_network" => Self::load_basic_home_scenario_static(devices),
             "large_home" => Self::load_large_home_scenario_static(devices),
-            "unreliable_network" => Self::load_basic_home_scenario_static(devices),
             _ => {
                 tracing::warn!("Unknown scenario '{}', using basic_home", scenario);
                 Self::load_basic_home_scenario_static(devices);
@@ -114,6 +117,10 @@ impl DummyGateway {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat list of mock device registrations, one call per device; splitting it up would just scatter the fixture data"
+    )]
     fn load_basic_home_scenario_static(devices: &mut HashMap<DeviceId, MockDevice>) {
         Self::add_mock_device_static(
             devices,
@@ -217,7 +224,7 @@ impl DummyGateway {
             DeviceStateValue::Sensor(SensorState {
                 temperature: Some(22.5),
                 humidity: Some(45.2),
-                last_updated: chrono::Utc::now().timestamp_millis() as u64,
+                last_updated: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             }),
         );
 
@@ -241,8 +248,8 @@ impl DummyGateway {
         for i in 1..=20 {
             Self::add_mock_device_static(
                 devices,
-                &format!("light_room_{}", i),
-                &format!("Room {} Light", i),
+                &format!("light_room_{i}"),
+                &format!("Room {i} Light"),
                 DeviceType::Light,
                 vec![Capability::OnOff, Capability::Brightness],
                 DeviceStateValue::Light(LightState {
@@ -255,16 +262,23 @@ impl DummyGateway {
         }
 
         for i in 1..=10 {
+            // `i` is a small loop counter (1..=10), always exactly
+            // representable in f32.
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "i is 1..=10, always exactly representable in f32"
+            )]
+            let temperature = 20.0 + (i as f32 * 0.5);
             Self::add_mock_device_static(
                 devices,
-                &format!("sensor_zone_{}", i),
-                &format!("Zone {} Sensor", i),
+                &format!("sensor_zone_{i}"),
+                &format!("Zone {i} Sensor"),
                 DeviceType::Sensor,
                 vec![Capability::Temperature],
                 DeviceStateValue::Sensor(SensorState {
-                    temperature: Some(20.0 + (i as f32 * 0.5)),
+                    temperature: Some(temperature),
                     humidity: None,
-                    last_updated: chrono::Utc::now().timestamp_millis() as u64,
+                    last_updated: chrono::Utc::now().timestamp_millis().cast_unsigned(),
                 }),
             );
         }
@@ -292,7 +306,7 @@ impl DummyGateway {
                 DeviceStateValue::Switch(_) | DeviceStateValue::MotionSensor(_)
             ),
             reachable: true,
-            last_seen: chrono::Utc::now().timestamp_millis() as u64,
+            last_seen: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             custom_attributes: HashMap::new(),
         };
 
@@ -301,12 +315,12 @@ impl DummyGateway {
             MockDevice {
                 info,
                 state: initial_state,
-                last_updated: chrono::Utc::now().timestamp_millis() as u64,
+                last_updated: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             },
         );
     }
 
-    fn should_fail(&self, rate: f32) -> bool {
+    fn should_fail(rate: f32) -> bool {
         use rand::Rng;
         let mut rng = rand::thread_rng();
         rng.gen::<f32>() < rate
@@ -335,7 +349,7 @@ impl Gateway for DummyGateway {
     ) -> Result<DeviceStateValue, GatewayError> {
         sleep(self.response_delays.get_device).await;
 
-        if self.should_fail(self.failure_config.get_failure_rate) {
+        if Self::should_fail(self.failure_config.get_failure_rate) {
             return Err(GatewayError::DeviceUnreachable(device_id.clone()));
         }
 
@@ -357,7 +371,7 @@ impl Gateway for DummyGateway {
     ) -> Result<(), GatewayError> {
         sleep(self.response_delays.set_device).await;
 
-        if self.should_fail(self.failure_config.set_failure_rate) {
+        if Self::should_fail(self.failure_config.set_failure_rate) {
             return Err(GatewayError::DeviceUnreachable(device_id.clone()));
         }
 
@@ -368,21 +382,20 @@ impl Gateway for DummyGateway {
         let mut devices = self.devices.write().await;
         if let Some(device) = devices.get_mut(device_id) {
             // 🔥 FIX: MERGE state instead of replacing! This fixes brightness control!
-            match (&mut device.state, &state) {
-                (DeviceStateValue::Light(current), DeviceStateValue::Light(new)) => {
-                    // 🔥 IMPORTANT: The API already handles partial updates!
-                    // When brightness is changed without is_on, the API preserves is_on
-                    // So here we just replace the whole state as it's already merged!
-                    *current = new.clone();
-                    debug!("🔥 Updated light {} - New state: {:?}", device_id, current);
-                }
-                _ => {
-                    // For non-light devices, replace the whole state
-                    device.state = state.clone();
-                    debug!("Set device {} state: {:?}", device_id, state);
-                }
+            if let (DeviceStateValue::Light(current), DeviceStateValue::Light(new)) =
+                (&mut device.state, &state)
+            {
+                // 🔥 IMPORTANT: The API already handles partial updates!
+                // When brightness is changed without is_on, the API preserves is_on
+                // So here we just replace the whole state as it's already merged!
+                *current = new.clone();
+                debug!("🔥 Updated light {} - New state: {:?}", device_id, current);
+            } else {
+                // For non-light devices, replace the whole state
+                device.state = state.clone();
+                debug!("Set device {} state: {:?}", device_id, state);
             }
-            device.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+            device.last_updated = chrono::Utc::now().timestamp_millis().cast_unsigned();
             Ok(())
         } else {
             Err(GatewayError::DeviceNotFound(device_id.clone()))
@@ -395,10 +408,20 @@ impl Gateway for DummyGateway {
 
         let devices = self.devices.read().await;
 
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "health-check latency in ms; a dummy sleep of 10ms never approaches u64::MAX"
+        )]
+        let response_time_ms = start.elapsed().as_millis() as u64;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "mock device count, always far below u32::MAX"
+        )]
+        let connected_devices = devices.len() as u32;
         Ok(GatewayHealth {
             reachable: true,
-            response_time_ms: start.elapsed().as_millis() as u64,
-            connected_devices: devices.len() as u32,
+            response_time_ms,
+            connected_devices,
             last_error: None,
         })
     }

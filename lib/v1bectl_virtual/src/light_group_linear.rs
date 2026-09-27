@@ -1,11 +1,13 @@
 // 🔥 LINEAR LIGHT GROUP - IMPROVED BRIGHTNESS MAPPING! 💖
 
 use crate::light_group::{fanned_out, initial_group_state, re_derive, resolve_write};
-use crate::virtual_device::*;
+use crate::virtual_device::{
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
-use v1bectl_sync::*;
+use v1bectl_sync::{DeviceId, DeviceState, DeviceStateValue, LightState, StateStore};
 
 /// Light Group with Linear Brightness Mapping
 /// Maps input brightness (0-100) to member-specific ranges [min, max]
@@ -28,8 +30,7 @@ impl LightGroupLinear {
         for name in members.keys() {
             if !brightness_ranges.contains_key(name) {
                 return Err(VirtualDeviceError::Config(format!(
-                    "Missing brightness range for member: {}",
-                    name
+                    "Missing brightness range for member: {name}"
                 )));
             }
         }
@@ -52,12 +53,19 @@ impl LightGroupLinear {
             }
 
             // Map 1-100 to min-max range
-            let range = (*max as f32) - (*min as f32);
-            let normalized = (group_brightness as f32) / 100.0;
-            let mapped = (*min as f32) + (normalized * range);
+            let range = f32::from(*max) - f32::from(*min);
+            let normalized = f32::from(group_brightness) / 100.0;
+            let mapped = f32::from(*min) + (normalized * range);
 
-            // Clamp to valid range
-            mapped.round().clamp(0.0, 100.0) as u8
+            // Clamp to valid range, then cast: the clamp bounds `mapped` to
+            // [0.0, 100.0], so the cast to u8 never truncates or loses sign.
+            #[expect(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "just clamped to [0.0, 100.0] above, so this is always in u8 range"
+            )]
+            let result = mapped.round().clamp(0.0, 100.0) as u8;
+            result
         } else {
             group_brightness // Fallback to direct mapping
         }
