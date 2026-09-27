@@ -17,6 +17,9 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+# 🔓 Builds the WebSocket's TLS connector (the hub's cert is self-signed).
+# Same crate tokio-tungstenite's `native-tls` feature already pulls in.
+native-tls = "0.2"
 futures-util = { workspace = true }
 
 [dev-dependencies]

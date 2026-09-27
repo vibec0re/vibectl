@@ -4,9 +4,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite};
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, ClientRequestBuilder};
+use tokio_tungstenite::Connector;
 use tracing::{debug, error, info, warn};
 use v1bectl_sync::{
     ButtonPressType, Capability, DeviceEvent, DeviceId, DeviceInfo, DeviceStateValue, DeviceType,
@@ -33,6 +35,8 @@ pub struct DirigeraGateway {
     #[allow(dead_code)]
     timeout: Duration,
     event_sender: broadcast::Sender<DeviceEvent>,
+    /// The one WebSocket listener feeding `event_sender` (see `event_stream`).
+    ws_listener: WsListener,
 }
 
 // Dirigera API response structures
@@ -150,6 +154,7 @@ impl DirigeraGateway {
             access_token: access_token.to_string(),
             timeout,
             event_sender,
+            ws_listener: WsListener::default(),
         }
     }
 
@@ -762,180 +767,957 @@ impl Gateway for DirigeraGateway {
         }
     }
 
+    /// Stream live events from the hub's `wss://{host}:8443/v1` endpoint. 🔥
+    ///
+    /// # TLS trust 🔓
+    ///
+    /// The Dirigera hub serves a **self-signed** certificate, so the event
+    /// stream makes the same trust decision as the REST client built in
+    /// [`DirigeraGateway::new`]: `danger_accept_invalid_certs(true)`. The link
+    /// is still encrypted, but the hub's identity is not verified, so anything
+    /// that can impersonate the hub on the local network can feed us events.
+    /// That matches the project's "local network only" stance; pinning the
+    /// hub's certificate fingerprint on first use would be a later hardening.
+    ///
+    /// # Reconnects 🔁
+    ///
+    /// A background task keeps the stream alive: after a failed connect (or a
+    /// connect/handshake that hangs for more than 10 s), a close from the hub,
+    /// or a read error, it reconnects with capped exponential backoff — 1 s,
+    /// doubling up to 60 s, and back to 1 s once a connection has stayed up for
+    /// 30 s. It runs for the lifetime of the process, and stops only once every
+    /// receiver of the gateway's event stream has been dropped. Events the hub
+    /// sends while we're disconnected are lost: the sync engine's periodic
+    /// pull catches up on device state, but button presses in that gap are
+    /// not replayed.
+    ///
+    /// # One hub connection per gateway 🔒
+    ///
+    /// Each call returns a new receiver of the gateway's one event channel,
+    /// as `DummyGateway` does, so calling it more than once is fine: every
+    /// caller sees each event once. Only the first call opens the WebSocket
+    /// and starts the background task; later calls subscribe to that task's
+    /// stream. If the task has stopped because every receiver was dropped,
+    /// the next call starts a new one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GatewayError::InternalError`] if the WebSocket request (host
+    /// or token not valid in a URI / header) or the TLS connector can't be
+    /// built. Connection problems are not errors here; they are retried in the
+    /// background.
     async fn event_stream(&self) -> Result<EventStream, GatewayError> {
-        info!("🔥 STARTING DIRIGERA WEBSOCKET EVENT STREAM! 🚀");
+        self.subscribe_events(ReconnectPolicy::DIRIGERA)
+    }
+}
 
-        // Create WebSocket request with auth header
-        let request = tungstenite::http::Request::builder()
-            .uri(&self.ws_url)
-            .header("Authorization", format!("Bearer {}", self.access_token))
-            .header("Sec-WebSocket-Protocol", "v1.user")
-            .body(())
-            .map_err(|e| GatewayError::InternalError(format!("Failed to build WS request: {e}")))?;
+// 🔥 DIRIGERA WEBSOCKET EVENT STREAM — TLS, RECONNECT LOOP, FRAME PARSING 💖
 
-        // Clone values for the spawned task
-        let ws_url = self.ws_url.clone();
-        let event_sender = self.event_sender.clone();
+impl DirigeraGateway {
+    /// [`Gateway::event_stream`] with an explicit reconnect `policy`, so the
+    /// tests can run it with millisecond backoff.
+    fn subscribe_events(&self, policy: ReconnectPolicy) -> Result<EventStream, GatewayError> {
+        let request = dirigera_ws_request(&self.ws_url, &self.access_token)?;
+        let connector = dirigera_ws_connector().map_err(|e| {
+            GatewayError::InternalError(format!("Failed to build WS TLS connector: {e}"))
+        })?;
 
-        // Spawn WebSocket listener task
-        tokio::spawn(async move {
-            info!("🚀 Connecting to Dirigera WebSocket at: {}", ws_url);
+        // Subscribe *before* spawning, so the listener can never see zero
+        // receivers on its first check and mistake a fresh stream for an
+        // abandoned one.
+        let (events, start_listener) = self.ws_listener.subscribe(&self.event_sender);
+        if start_listener {
+            info!("🔥 STARTING DIRIGERA WEBSOCKET EVENT STREAM! 🚀");
+            tokio::spawn(run_dirigera_ws(
+                self.ws_url.clone(),
+                request,
+                connector,
+                policy,
+                self.event_sender.clone(),
+                self.ws_listener.clone(),
+            ));
+        } else {
+            debug!("🔧 Dirigera WebSocket listener already running - sharing its event stream");
+        }
 
-            match connect_async(request).await {
-                Ok((ws_stream, _)) => {
+        Ok(events)
+    }
+}
+
+/// Whether a gateway's WebSocket listener task is running. 🔒
+///
+/// There is at most one listener per gateway. Subscribing, and the listener's
+/// decision to stop, both happen under this one lock. A caller that
+/// subscribes just as the last old receiver goes away therefore either keeps
+/// the running listener alive or starts a new one; it never ends up on a
+/// channel that nobody feeds.
+#[derive(Debug, Clone, Default)]
+struct WsListener {
+    running: Arc<Mutex<bool>>,
+}
+
+impl WsListener {
+    /// Subscribe to `events`. The `bool` is `true` when no listener was
+    /// running: it is now marked as running, and the caller must start it.
+    fn subscribe(&self, events: &broadcast::Sender<DeviceEvent>) -> (EventStream, bool) {
+        let mut running = self.lock();
+        let receiver = events.subscribe();
+        let start = !std::mem::replace(&mut *running, true);
+        (receiver, start)
+    }
+
+    /// For the listener: if nobody is subscribed to `events` any more, mark
+    /// the listener as stopped and return `true`, so it exits.
+    fn stop_if_unheard(&self, events: &broadcast::Sender<DeviceEvent>) -> bool {
+        let mut running = self.lock();
+        if events.receiver_count() == 0 {
+            *running = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        *self.lock()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        // A bool can't be left half-written, so a poisoned lock is still
+        // safe to use.
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// How the event-stream listener paces its reconnects. 🔁
+#[derive(Debug, Clone, Copy)]
+struct ReconnectPolicy {
+    /// Delay before the first retry; doubles after every failed or
+    /// short-lived connection.
+    base_delay: Duration,
+    /// Ceiling for the doubling.
+    max_delay: Duration,
+    /// A connection that stayed up at least this long resets the delay to
+    /// `base_delay`.
+    stable_after: Duration,
+    /// Upper bound for TCP connect + TLS + WebSocket handshake, so a hub that
+    /// accepts the socket but never answers can't stall the loop forever.
+    connect_timeout: Duration,
+}
+
+impl ReconnectPolicy {
+    /// Production pacing: 1 s doubling to 60 s, reset after 30 s of uptime.
+    const DIRIGERA: Self = Self {
+        base_delay: Duration::from_secs(1),
+        max_delay: Duration::from_mins(1),
+        stable_after: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(10),
+    };
+
+    /// How long to wait before the next connect attempt. 🔁
+    ///
+    /// `prev` is the wait before the attempt that just ended (`None` if it was
+    /// the first); `connected_for` is how long that attempt's connection
+    /// stayed up (`None` if it never connected). A connection that lasted at
+    /// least `stable_after` resets the wait to `base_delay`. Anything else, a
+    /// failed connect or a short-lived connection, doubles `prev`, capped at
+    /// `max_delay`.
+    fn after_attempt(self, prev: Option<Duration>, connected_for: Option<Duration>) -> Duration {
+        let stable = connected_for.is_some_and(|uptime| uptime >= self.stable_after);
+        match prev {
+            Some(prev) if !stable => prev.saturating_mul(2).min(self.max_delay),
+            _ => self.base_delay,
+        }
+    }
+}
+
+/// Why a connected event-stream session ended.
+enum WsSessionEnd {
+    /// The hub sent a Close frame, or the stream ended.
+    Closed,
+    /// Reading from the socket failed.
+    Failed(tungstenite::Error),
+    /// Every receiver of the event channel is gone; nobody wants events.
+    NoReceivers,
+}
+
+type DirigeraWsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// The handshake request for the hub's event stream. 🔧
+///
+/// A [`ClientRequestBuilder`] rather than a finished request: every connect
+/// turns it into a fresh request, so each attempt gets its own
+/// `Sec-WebSocket-Key` plus the `Host` / `Upgrade` / `Connection` /
+/// `Sec-WebSocket-Version` headers that tungstenite's handshake insists on.
+///
+/// It offers **no** `Sec-WebSocket-Protocol`. The public Dirigera clients
+/// (`Leggin/dirigera`, `lpgera/dirigera`) connect with just the bearer token,
+/// and tungstenite fails the handshake outright (`SubProtocol error: Server
+/// sent no subprotocol`) when it offered one the server doesn't echo back.
+///
+/// Validated once up front, so a malformed host or token makes
+/// `event_stream` fail instead of retrying in the background forever.
+fn dirigera_ws_request(
+    ws_url: &str,
+    access_token: &str,
+) -> Result<ClientRequestBuilder, GatewayError> {
+    let uri: tungstenite::http::Uri = ws_url
+        .parse()
+        .map_err(|e| GatewayError::InternalError(format!("Failed to build WS request: {e}")))?;
+    let request = ClientRequestBuilder::new(uri)
+        .with_header("Authorization", format!("Bearer {access_token}"));
+    request
+        .clone()
+        .into_client_request()
+        .map_err(|e| GatewayError::InternalError(format!("Failed to build WS request: {e}")))?;
+    Ok(request)
+}
+
+/// TLS for the event stream: the same trust decision as the REST client. 🔓
+///
+/// The hub's certificate is self-signed, so certificate (and with it,
+/// hostname) verification is off, exactly like `danger_accept_invalid_certs`
+/// on the `reqwest` clients.
+fn dirigera_ws_connector() -> Result<Connector, native_tls::Error> {
+    let tls = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true) // Dirigera uses self-signed certs
+        .build()?;
+    Ok(Connector::NativeTls(tls))
+}
+
+/// One connect attempt: TCP, TLS through `connector`, WebSocket handshake.
+///
+/// The error is boxed: `tungstenite::Error` is 136 bytes, which trips
+/// `clippy::result_large_err` on newer toolchains (CI runs latest stable).
+async fn connect_dirigera_ws(
+    request: &ClientRequestBuilder,
+    connector: &Connector,
+    connect_timeout: Duration,
+) -> Result<DirigeraWsStream, Box<tungstenite::Error>> {
+    let handshake = tokio_tungstenite::connect_async_tls_with_config(
+        request.clone(),
+        None,
+        false,
+        Some(connector.clone()),
+    );
+    let (ws_stream, _response) = tokio::time::timeout(connect_timeout, handshake)
+        .await
+        .map_err(|_| {
+            tungstenite::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no WebSocket handshake within {connect_timeout:?}"),
+            ))
+        })??;
+    Ok(ws_stream)
+}
+
+/// Keep the hub's event stream connected until nobody is listening. 🔁
+///
+/// Connect, pump frames into `event_sender`, and on any failure or close
+/// wait out the backoff from `policy` and go again. Whether to stop is
+/// decided through `listener` (see [`WsListener`]).
+async fn run_dirigera_ws(
+    ws_url: String,
+    request: ClientRequestBuilder,
+    connector: Connector,
+    policy: ReconnectPolicy,
+    event_sender: broadcast::Sender<DeviceEvent>,
+    listener: WsListener,
+) {
+    let mut prev_delay = None;
+
+    loop {
+        if listener.stop_if_unheard(&event_sender) {
+            info!("🛑 Nobody is listening to Dirigera events anymore - stopping the WebSocket listener");
+            return;
+        }
+
+        info!("🚀 Connecting to Dirigera WebSocket at: {ws_url}");
+        let connected_for =
+            match connect_dirigera_ws(&request, &connector, policy.connect_timeout).await {
+                Ok(ws_stream) => {
                     info!("✅ WebSocket connected to Dirigera hub!");
-                    let (_, mut read) = ws_stream.split();
+                    let connected_at = Instant::now();
 
-                    while let Some(msg) = read.next().await {
-                        match msg {
-                            Ok(tungstenite::Message::Text(text)) => {
-                                // 🔥 LOG ALL WEBSOCKET MESSAGES TO SEE WHAT DIRIGERA SENDS! 💖
-                                info!("📡 DIRIGERA WEBSOCKET RAW: {}", text);
-
-                                // Parse Dirigera event
-                                if let Ok(ws_event) = serde_json::from_str::<DirigeraWsEvent>(&text)
-                                {
-                                    if let Some(device_id) = ws_event.device_id {
-                                        // Convert to our event format
-                                        let event_type = match ws_event.event_type.as_str() {
-                                            "deviceStateChanged" => {
-                                                // 🔥 CHECK FOR BUTTON/SWITCH PRESS EVENTS! 💖
-                                                if let Some(data) = &ws_event.data {
-                                                    // Check if this is a button press event
-                                                    if let Some(is_pressed) = data
-                                                        .get("isPressed")
-                                                        .and_then(serde_json::Value::as_bool)
-                                                    {
-                                                        info!("🔘 DIRIGERA BUTTON PRESS DETECTED: Device {} - Pressed: {}", device_id, is_pressed);
-                                                    }
-
-                                                    // Check for button specific fields
-                                                    if data.get("buttonEvent").is_some()
-                                                        || data.get("clickPattern").is_some()
-                                                    {
-                                                        let button_id = data
-                                                            .get("buttonId")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("main")
-                                                            .to_string();
-
-                                                        let press_type = if let Some(pattern) = data
-                                                            .get("clickPattern")
-                                                            .and_then(|v| v.as_str())
-                                                        {
-                                                            match pattern {
-                                                                "singlePress" => {
-                                                                    ButtonPressType::SinglePress
-                                                                }
-                                                                "doublePress" => {
-                                                                    ButtonPressType::DoublePress
-                                                                }
-                                                                "longPress" => {
-                                                                    ButtonPressType::LongPress
-                                                                }
-                                                                _ => ButtonPressType::SinglePress,
-                                                            }
-                                                        } else {
-                                                            ButtonPressType::SinglePress
-                                                        };
-
-                                                        info!("🎯 DIRIGERA BUTTON EVENT: Device {} - Button {} - Type: {:?}", 
-                                                            device_id, button_id, press_type);
-
-                                                        EventType::ButtonPressed {
-                                                            button_id,
-                                                            press_type,
-                                                        }
-                                                    } else {
-                                                        // Regular state change
-                                                        EventType::AttributeChanged {
-                                                            attribute: "state".to_string(),
-                                                            old_value: serde_json::Value::Null,
-                                                            new_value: data.clone(),
-                                                        }
-                                                    }
-                                                } else {
-                                                    EventType::AttributeChanged {
-                                                        attribute: "state".to_string(),
-                                                        old_value: serde_json::Value::Null,
-                                                        new_value: serde_json::Value::Null,
-                                                    }
-                                                }
-                                            }
-                                            "deviceDiscovered" | "deviceAdded" => {
-                                                EventType::DeviceAdded {
-                                                    device_type: "unknown".to_string(),
-                                                }
-                                            }
-                                            "deviceRemoved" => EventType::DeviceRemoved,
-                                            "deviceReachabilityChanged" => {
-                                                let reachable = ws_event
-                                                    .data
-                                                    .as_ref()
-                                                    .and_then(|d| d.get("isReachable"))
-                                                    .and_then(serde_json::Value::as_bool)
-                                                    .unwrap_or(true);
-                                                EventType::DeviceReachabilityChanged { reachable }
-                                            }
-                                            "sceneUpdated" | "sceneTriggered" => {
-                                                // 🔥 SCENE TRIGGERED - WORKAROUND FOR BUTTON EVENTS! 💖
-                                                // Since Dirigera doesn't expose button events, we use scene triggers
-                                                let scene_id = ws_event
-                                                    .data
-                                                    .as_ref()
-                                                    .and_then(|d| d.get("sceneId").or(d.get("id")))
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("unknown")
-                                                    .to_string();
-
-                                                info!("🎬 SCENE TRIGGERED: {} - This might be from a button press!", scene_id);
-
-                                                EventType::SceneActivated { scene_id }
-                                            }
-                                            _ => {
-                                                // For other events, treat as attribute change
-                                                EventType::AttributeChanged {
-                                                    attribute: ws_event.event_type.clone(),
-                                                    old_value: serde_json::Value::Null,
-                                                    new_value: ws_event
-                                                        .data
-                                                        .clone()
-                                                        .unwrap_or(serde_json::Value::Null),
-                                                }
-                                            }
-                                        };
-
-                                        let device_event = DeviceEvent {
-                                            timestamp: SystemTime::now(),
-                                            device_id,
-                                            event_type,
-                                        };
-
-                                        debug!("🔧 DIRIGERA EVENT: {:?}", device_event);
-                                        let _ = event_sender.send(device_event);
-                                    }
-                                }
-                            }
-                            Ok(tungstenite::Message::Close(_)) => {
-                                warn!("WebSocket closed by Dirigera hub");
-                                break;
-                            }
-                            Err(e) => {
-                                error!("WebSocket error: {}", e);
-                                break;
-                            }
-                            _ => {}
-                        }
+                    match pump_dirigera_ws(ws_stream, &event_sender).await {
+                        WsSessionEnd::Closed => warn!("💔 WebSocket closed by Dirigera hub"),
+                        WsSessionEnd::Failed(e) => error!("❌ WebSocket error: {e}"),
+                        // Stop, or reconnect at once if someone subscribed in
+                        // the meantime: the check at the top decides, under the
+                        // listener lock.
+                        WsSessionEnd::NoReceivers => continue,
                     }
+                    Some(connected_at.elapsed())
                 }
                 Err(e) => {
-                    error!("❌ Failed to connect WebSocket: {}", e);
+                    error!("❌ Failed to connect WebSocket: {e}");
+                    None
+                }
+            };
+
+        let delay = policy.after_attempt(prev_delay, connected_for);
+        info!("⏰ Retrying Dirigera WebSocket in {delay:?}");
+        tokio::time::sleep(delay).await;
+        prev_delay = Some(delay);
+    }
+}
+
+/// Read one connected session until it closes, fails, or loses its audience.
+async fn pump_dirigera_ws(
+    mut ws_stream: DirigeraWsStream,
+    event_sender: &broadcast::Sender<DeviceEvent>,
+) -> WsSessionEnd {
+    while let Some(msg) = ws_stream.next().await {
+        match msg {
+            Ok(tungstenite::Message::Text(text)) => {
+                // 🔥 LOG ALL WEBSOCKET MESSAGES TO SEE WHAT DIRIGERA SENDS! 💖
+                info!("📡 DIRIGERA WEBSOCKET RAW: {}", text);
+
+                if let Some(device_event) = parse_dirigera_ws_event(&text) {
+                    debug!("🔧 DIRIGERA EVENT: {:?}", device_event);
+                    if event_sender.send(device_event).is_err() {
+                        return WsSessionEnd::NoReceivers;
+                    }
+                }
+            }
+            Ok(tungstenite::Message::Close(_)) => return WsSessionEnd::Closed,
+            Err(e) => return WsSessionEnd::Failed(e),
+            Ok(_) => {}
+        }
+    }
+    WsSessionEnd::Closed
+}
+
+/// Turn one Dirigera WebSocket text frame into a [`DeviceEvent`].
+///
+/// Frames that don't parse, or that carry no `deviceId`, yield `None`.
+fn parse_dirigera_ws_event(text: &str) -> Option<DeviceEvent> {
+    // Parse Dirigera event
+    let ws_event = serde_json::from_str::<DirigeraWsEvent>(text).ok()?;
+    let device_id = ws_event.device_id?;
+
+    // Convert to our event format
+    let event_type = match ws_event.event_type.as_str() {
+        "deviceStateChanged" => device_state_changed_event_type(&device_id, ws_event.data.as_ref()),
+        "deviceDiscovered" | "deviceAdded" => EventType::DeviceAdded {
+            device_type: "unknown".to_string(),
+        },
+        "deviceRemoved" => EventType::DeviceRemoved,
+        "deviceReachabilityChanged" => {
+            let reachable = ws_event
+                .data
+                .as_ref()
+                .and_then(|d| d.get("isReachable"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(true);
+            EventType::DeviceReachabilityChanged { reachable }
+        }
+        "sceneUpdated" | "sceneTriggered" => {
+            // 🔥 SCENE TRIGGERED - WORKAROUND FOR BUTTON EVENTS! 💖
+            // Since Dirigera doesn't expose button events, we use scene triggers
+            let scene_id = ws_event
+                .data
+                .as_ref()
+                .and_then(|d| d.get("sceneId").or(d.get("id")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+
+            info!(
+                "🎬 SCENE TRIGGERED: {} - This might be from a button press!",
+                scene_id
+            );
+
+            EventType::SceneActivated { scene_id }
+        }
+        _ => {
+            // For other events, treat as attribute change
+            EventType::AttributeChanged {
+                attribute: ws_event.event_type.clone(),
+                old_value: serde_json::Value::Null,
+                new_value: ws_event.data.clone().unwrap_or(serde_json::Value::Null),
+            }
+        }
+    };
+
+    Some(DeviceEvent {
+        timestamp: SystemTime::now(),
+        device_id,
+        event_type,
+    })
+}
+
+/// The [`EventType`] for a `deviceStateChanged` frame: a button press when the
+/// payload says so, otherwise a plain state change.
+fn device_state_changed_event_type(device_id: &str, data: Option<&serde_json::Value>) -> EventType {
+    // 🔥 CHECK FOR BUTTON/SWITCH PRESS EVENTS! 💖
+    if let Some(data) = data {
+        // Check if this is a button press event
+        if let Some(is_pressed) = data.get("isPressed").and_then(serde_json::Value::as_bool) {
+            info!(
+                "🔘 DIRIGERA BUTTON PRESS DETECTED: Device {} - Pressed: {}",
+                device_id, is_pressed
+            );
+        }
+
+        // Check for button specific fields
+        if data.get("buttonEvent").is_some() || data.get("clickPattern").is_some() {
+            let button_id = data
+                .get("buttonId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("main")
+                .to_string();
+
+            let press_type =
+                if let Some(pattern) = data.get("clickPattern").and_then(|v| v.as_str()) {
+                    match pattern {
+                        "doublePress" => ButtonPressType::DoublePress,
+                        "longPress" => ButtonPressType::LongPress,
+                        _ => ButtonPressType::SinglePress, // "singlePress" and anything unknown
+                    }
+                } else {
+                    ButtonPressType::SinglePress
+                };
+
+            info!(
+                "🎯 DIRIGERA BUTTON EVENT: Device {} - Button {} - Type: {:?}",
+                device_id, button_id, press_type
+            );
+
+            EventType::ButtonPressed {
+                button_id,
+                press_type,
+            }
+        } else {
+            // Regular state change
+            EventType::AttributeChanged {
+                attribute: "state".to_string(),
+                old_value: serde_json::Value::Null,
+                new_value: data.clone(),
+            }
+        }
+    } else {
+        EventType::AttributeChanged {
+            attribute: "state".to_string(),
+            old_value: serde_json::Value::Null,
+            new_value: serde_json::Value::Null,
+        }
+    }
+}
+
+// 🔥 VIBEC0RE TESTS — DIRIGERA EVENT STREAM VS A FAKE SELF-SIGNED HUB 💖
+//
+// The fake hub is a blocking std TLS WebSocket server on 127.0.0.1 with a
+// checked-in, TEST-ONLY self-signed `localhost` certificate; how it was made
+// is in tests/fixtures/README.md.
+#[cfg(test)]
+mod event_stream_tests {
+    use super::*;
+    use std::net::{SocketAddr, TcpListener};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+    use tungstenite::http::{HeaderValue, StatusCode};
+
+    const CERT_PEM: &[u8] = include_bytes!("../tests/fixtures/selfsigned-localhost.crt.pem");
+    const KEY_PEM: &[u8] = include_bytes!("../tests/fixtures/selfsigned-localhost.key.pem");
+    const TEST_TOKEN: &str = "test-token";
+
+    /// Millisecond backoff so reconnect tests finish fast.
+    const FAST: ReconnectPolicy = ReconnectPolicy {
+        base_delay: Duration::from_millis(10),
+        max_delay: Duration::from_millis(80),
+        stable_after: Duration::from_secs(30),
+        connect_timeout: Duration::from_secs(2),
+    };
+    /// Generous upper bound for anything the tests wait on.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// What the fake hub does with one accepted connection.
+    enum Session {
+        /// Accept the TCP connection and drop it before TLS, like a hub whose
+        /// web server isn't up yet: the client's attempt fails.
+        Reject,
+        /// Send the frames, then close the connection from the hub's side.
+        SendThenClose(Vec<String>),
+        /// Send the frames, then keep the connection open until the client leaves.
+        SendThenHold(Vec<String>),
+    }
+
+    struct FakeHub {
+        addr: SocketAddr,
+        /// Sessions that completed their TLS + WebSocket handshake.
+        served: Arc<AtomicUsize>,
+        /// Connections dropped by a `Session::Reject`.
+        rejected: Arc<AtomicUsize>,
+        /// Handshake failures the hub saw, so a RED test says *why*.
+        errors: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl FakeHub {
+        fn url(&self) -> String {
+            format!("wss://{}/v1", self.addr)
+        }
+
+        fn errors(&self) -> Vec<String> {
+            self.errors.lock().unwrap().clone()
+        }
+    }
+
+    fn bind_localhost() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("bind fake hub")
+    }
+
+    /// Serve `sessions` in order on `listener`, one connection each. Failed
+    /// handshakes are recorded and don't use up a session.
+    fn spawn_fake_hub(listener: TcpListener, sessions: Vec<Session>) -> FakeHub {
+        let addr = listener.local_addr().unwrap();
+        let identity =
+            native_tls::Identity::from_pkcs8(CERT_PEM, KEY_PEM).expect("fixture identity");
+        let acceptor = native_tls::TlsAcceptor::new(identity).expect("TLS acceptor");
+        let served = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+
+        let (served_in, rejected_in) = (Arc::clone(&served), Arc::clone(&rejected));
+        let errors_in = Arc::clone(&errors);
+        std::thread::spawn(move || {
+            let mut sessions = sessions.into_iter().peekable();
+            for tcp in listener.incoming() {
+                let Some(session) = sessions.peek() else {
+                    break;
+                };
+                let result = tcp.map_err(|e| format!("accept: {e}")).and_then(|tcp| {
+                    serve_session(&acceptor, tcp, session, &served_in, &rejected_in)
+                });
+                match result {
+                    Ok(()) => {
+                        sessions.next();
+                        if sessions.peek().is_none() {
+                            break; // drop the listener: later connects are refused
+                        }
+                    }
+                    Err(e) => errors_in.lock().unwrap().push(e),
                 }
             }
         });
 
-        // Return a receiver for events
-        Ok(self.event_sender.subscribe())
+        FakeHub {
+            addr,
+            served,
+            rejected,
+            errors,
+        }
+    }
+
+    fn serve_session(
+        acceptor: &native_tls::TlsAcceptor,
+        tcp: std::net::TcpStream,
+        session: &Session,
+        served: &AtomicUsize,
+        rejected: &AtomicUsize,
+    ) -> Result<(), String> {
+        let (frames, close) = match session {
+            Session::Reject => {
+                drop(tcp);
+                rejected.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            Session::SendThenClose(frames) => (frames, true),
+            Session::SendThenHold(frames) => (frames, false),
+        };
+
+        let tls = acceptor
+            .accept(tcp)
+            .map_err(|e| format!("TLS handshake: {e}"))?;
+        let mut ws = tungstenite::accept_hdr(tls, check_dirigera_handshake)
+            .map_err(|e| format!("WebSocket handshake: {e}"))?;
+        served.fetch_add(1, Ordering::SeqCst);
+
+        for frame in frames {
+            ws.send(tungstenite::Message::Text(frame.clone()))
+                .map_err(|e| format!("send: {e}"))?;
+        }
+        if close {
+            let _ = ws.close(None);
+        }
+        // Drain until the client answers the close or goes away.
+        while ws.read().is_ok() {}
+        Ok(())
+    }
+
+    /// Accept only what the hub accepts: our bearer token. Like the hub as
+    /// the public clients see it, the `101` reply carries no
+    /// `Sec-WebSocket-Protocol`, whatever the client offered.
+    #[expect(
+        clippy::result_large_err,
+        reason = "signature fixed by tungstenite's server handshake `Callback`"
+    )]
+    fn check_dirigera_handshake(
+        request: &Request,
+        response: Response,
+    ) -> Result<Response, ErrorResponse> {
+        let auth = request
+            .headers()
+            .get("Authorization")
+            .and_then(|v: &HeaderValue| v.to_str().ok());
+        if auth != Some(format!("Bearer {TEST_TOKEN}").as_str()) {
+            let mut reject = ErrorResponse::new(Some("bad token".into()));
+            *reject.status_mut() = StatusCode::UNAUTHORIZED;
+            return Err(reject);
+        }
+        Ok(response)
+    }
+
+    /// A `deviceStateChanged` frame in the shape `parse_dirigera_ws_event` reads.
+    fn state_changed_frame(device_id: &str, light_level: u8) -> String {
+        serde_json::json!({
+            "id": format!("evt-{device_id}-{light_level}"),
+            "time": "2026-09-27T12:00:00.000Z",
+            "specversion": "1.1.0",
+            "source": "urn:com:ikea:homesmart:iotc:zigbee",
+            "type": "deviceStateChanged",
+            "deviceId": device_id,
+            "data": state_data(device_id, light_level),
+        })
+        .to_string()
+    }
+
+    fn state_data(device_id: &str, light_level: u8) -> serde_json::Value {
+        serde_json::json!({
+            "id": device_id,
+            "attributes": { "isOn": true, "lightLevel": light_level },
+        })
+    }
+
+    /// Run the real reconnect loop against `url` with the `FAST` policy.
+    fn start_listener(url: String) -> (EventStream, tokio::task::JoinHandle<()>) {
+        let request = dirigera_ws_request(&url, TEST_TOKEN).expect("WS request");
+        let connector = dirigera_ws_connector().expect("TLS connector");
+        let (event_sender, _) = broadcast::channel(16);
+        let listener = WsListener::default();
+        let (events, _) = listener.subscribe(&event_sender);
+        let task = tokio::spawn(run_dirigera_ws(
+            url,
+            request,
+            connector,
+            FAST,
+            event_sender,
+            listener,
+        ));
+        (events, task)
+    }
+
+    /// A real `DirigeraGateway` whose event stream goes to `ws_url`.
+    fn gateway_for(ws_url: String) -> DirigeraGateway {
+        let mut gateway = DirigeraGateway::new("127.0.0.1", TEST_TOKEN, WAIT);
+        gateway.ws_url = ws_url;
+        gateway
+    }
+
+    async fn next_event(events: &mut EventStream, hub: &FakeHub) -> DeviceEvent {
+        match tokio::time::timeout(WAIT, events.recv()).await {
+            Ok(Ok(event)) => event,
+            Ok(Err(e)) => panic!("event channel failed: {e}"),
+            Err(elapsed) => panic!(
+                "no DeviceEvent ({elapsed} after {WAIT:?}); fake hub saw: {:?}",
+                hub.errors()
+            ),
+        }
+    }
+
+    // (a) The self-signed cert is accepted and a frame becomes a DeviceEvent.
+    #[tokio::test]
+    async fn event_stream_trusts_the_hubs_self_signed_cert() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![state_changed_frame(
+                "light_1", 42,
+            )])],
+        );
+
+        let request = dirigera_ws_request(&hub.url(), TEST_TOKEN).expect("WS request");
+        let connector = dirigera_ws_connector().expect("TLS connector");
+        let ws_stream = connect_dirigera_ws(&request, &connector, FAST.connect_timeout)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "handshake with the self-signed fake hub failed: {e}; hub saw: {:?}",
+                    hub.errors()
+                )
+            });
+
+        let (event_sender, mut events) = broadcast::channel(16);
+        tokio::spawn(async move { pump_dirigera_ws(ws_stream, &event_sender).await });
+
+        let event = next_event(&mut events, &hub).await;
+        assert_eq!(event.device_id, "light_1");
+        assert_eq!(
+            event.event_type,
+            EventType::AttributeChanged {
+                attribute: "state".to_string(),
+                old_value: serde_json::Value::Null,
+                new_value: state_data("light_1", 42),
+            }
+        );
+    }
+
+    // The hub replies `101` without `Sec-WebSocket-Protocol`. Had the client
+    // offered one (it used to offer `v1.user`), tungstenite would fail every
+    // handshake with "SubProtocol error: Server sent no subprotocol".
+    #[tokio::test]
+    async fn event_stream_connects_to_a_hub_that_sends_no_subprotocol() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![state_changed_frame(
+                "light_1", 42,
+            )])],
+        );
+
+        let request = dirigera_ws_request(&hub.url(), TEST_TOKEN).expect("WS request");
+        let connector = dirigera_ws_connector().expect("TLS connector");
+        let result = connect_dirigera_ws(&request, &connector, FAST.connect_timeout).await;
+        if let Err(e) = result {
+            panic!(
+                "handshake with a hub that sends no subprotocol failed: {e}; hub saw: {:?}",
+                hub.errors()
+            );
+        }
+
+        let offered = request.into_client_request().expect("WS request");
+        assert_eq!(
+            offered.headers().get("Sec-WebSocket-Protocol"),
+            None,
+            "don't offer a subprotocol the hub may not echo"
+        );
+    }
+
+    // The fake hub really checks the token, so the tests above prove we send it.
+    #[tokio::test]
+    async fn fake_hub_rejects_a_wrong_token() {
+        let hub = spawn_fake_hub(bind_localhost(), vec![Session::SendThenHold(vec![])]);
+
+        let request = dirigera_ws_request(&hub.url(), "wrong-token").expect("WS request");
+        let connector = dirigera_ws_connector().expect("TLS connector");
+        let result = connect_dirigera_ws(&request, &connector, FAST.connect_timeout).await;
+        let Err(e) = result else {
+            panic!("the fake hub accepted a wrong token");
+        };
+        assert!(e.to_string().contains("401"), "{e}");
+    }
+
+    // (b) The hub closes the stream; the listener reconnects for the next frame.
+    #[tokio::test]
+    async fn event_stream_reconnects_after_the_hub_closes_it() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![
+                Session::SendThenClose(vec![state_changed_frame("light_1", 10)]),
+                Session::SendThenHold(vec![state_changed_frame("light_2", 20)]),
+            ],
+        );
+        let (mut events, _task) = start_listener(hub.url());
+
+        assert_eq!(next_event(&mut events, &hub).await.device_id, "light_1");
+        assert_eq!(next_event(&mut events, &hub).await.device_id, "light_2");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 2);
+    }
+
+    // (c) The hub isn't up yet: at first nothing listens (connects are
+    // refused), then it drops the first connection it accepts. The listener
+    // keeps retrying until an attempt gets through.
+    #[tokio::test]
+    async fn event_stream_retries_until_the_hub_is_up() {
+        // Reserve a free port, then release it so nothing is listening there.
+        let addr = bind_localhost().local_addr().unwrap();
+        let (mut events, _task) = start_listener(format!("wss://{addr}/v1"));
+
+        // Refused for sure right now; this await also lets the listener
+        // make its first (refused) attempts.
+        assert!(tokio::net::TcpStream::connect(addr).await.is_err());
+        tokio::time::sleep(FAST.base_delay * 8).await;
+
+        let listener = TcpListener::bind(addr).expect("re-bind the reserved port");
+        let hub = spawn_fake_hub(
+            listener,
+            vec![
+                Session::Reject,
+                Session::SendThenHold(vec![state_changed_frame("light_1", 42)]),
+            ],
+        );
+
+        assert_eq!(next_event(&mut events, &hub).await.device_id, "light_1");
+        // The hub serves its sessions in order, so the frame proves that an
+        // earlier attempt was rejected and the listener tried again: this
+        // test can't pass on a first-try connect.
+        assert_eq!(hub.rejected.load(Ordering::SeqCst), 1, "rejected attempts");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1, "served sessions");
+    }
+
+    // Once every receiver is gone, the listener stops instead of reconnecting.
+    #[tokio::test]
+    async fn event_stream_stops_once_every_receiver_is_gone() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![
+                Session::SendThenClose(vec![state_changed_frame("light_1", 10)]),
+                Session::SendThenHold(vec![state_changed_frame("light_2", 20)]),
+            ],
+        );
+        let (mut events, task) = start_listener(hub.url());
+
+        assert_eq!(next_event(&mut events, &hub).await.device_id, "light_1");
+        drop(events);
+
+        tokio::time::timeout(WAIT, task)
+            .await
+            .expect("listener should stop without receivers")
+            .expect("listener task should not panic");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1, "must not reconnect");
+    }
+
+    // A second `event_stream()` call must not open a second hub connection.
+    #[tokio::test]
+    async fn event_stream_twice_opens_one_hub_connection() {
+        // A bare TCP listener that counts connections and holds them open, so
+        // a client's TLS handshake just waits and never retries during the
+        // test (the connect timeout below is longer than the test).
+        let listener = bind_localhost();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for tcp in listener.incoming().flatten() {
+                held.push(tcp);
+                if accepted_tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let hold = ReconnectPolicy {
+            connect_timeout: WAIT,
+            ..FAST
+        };
+
+        let gateway = gateway_for(format!("wss://{addr}/v1"));
+        let _first = gateway.subscribe_events(hold).expect("first event_stream");
+        let _second = gateway.subscribe_events(hold).expect("second event_stream");
+
+        tokio::time::timeout(WAIT, accepted.recv())
+            .await
+            .expect("the listener should connect to the hub");
+        let second_connection =
+            tokio::time::timeout(Duration::from_millis(300), accepted.recv()).await;
+        assert!(
+            second_connection.is_err(),
+            "a second event_stream() call opened a second hub connection"
+        );
+    }
+
+    // Every caller gets each event once, from the one shared connection.
+    #[tokio::test]
+    async fn every_event_stream_caller_gets_each_event_once() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![
+                state_changed_frame("light_1", 10),
+                state_changed_frame("light_2", 20),
+            ])],
+        );
+        let gateway = gateway_for(hub.url());
+        let mut first = gateway.subscribe_events(FAST).expect("first event_stream");
+        let mut second = gateway.subscribe_events(FAST).expect("second event_stream");
+
+        for events in [&mut first, &mut second] {
+            assert_eq!(next_event(events, &hub).await.device_id, "light_1");
+            assert_eq!(next_event(events, &hub).await.device_id, "light_2");
+            assert!(events.is_empty(), "no duplicate events");
+        }
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1);
+    }
+
+    // Once the listener has stopped for lack of receivers, the next
+    // `event_stream()` call starts a new one instead of returning a dead stream.
+    #[tokio::test]
+    async fn event_stream_after_the_listener_stopped_starts_a_new_one() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![state_changed_frame(
+                "light_1", 42,
+            )])],
+        );
+        let gateway = gateway_for(hub.url());
+
+        // `#[tokio::test]` runs on one thread, so the spawned listener can't
+        // run before this receiver is dropped: its first check sees nobody
+        // listening and it stops without connecting.
+        drop(gateway.subscribe_events(FAST).expect("first event_stream"));
+        tokio::time::timeout(WAIT, async {
+            while gateway.ws_listener.is_running() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("listener should stop without receivers");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 0);
+
+        let mut events = gateway.subscribe_events(FAST).expect("second event_stream");
+        assert_eq!(next_event(&mut events, &hub).await.device_id, "light_1");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1);
+    }
+
+    /// A connect attempt that never got through (`connected_for: None`).
+    const FAILED: Option<Duration> = None;
+
+    /// The waits, in whole seconds, that `ReconnectPolicy::DIRIGERA` puts
+    /// after each attempt in `attempts`, fed back in as the loop does.
+    fn dirigera_waits(attempts: &[Option<Duration>]) -> Vec<u64> {
+        let policy = ReconnectPolicy::DIRIGERA;
+        let mut prev = None;
+        attempts
+            .iter()
+            .map(|&connected_for| {
+                let wait = policy.after_attempt(prev, connected_for);
+                prev = Some(wait);
+                wait.as_secs()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_from_1s_to_a_60s_cap() {
+        assert_eq!(dirigera_waits(&[FAILED; 8]), [1, 2, 4, 8, 16, 32, 60, 60]);
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_a_stable_connection() {
+        let stable = ReconnectPolicy::DIRIGERA.stable_after; // the threshold itself counts
+        let long = Some(Duration::from_mins(5));
+        assert_eq!(
+            dirigera_waits(&[FAILED, FAILED, FAILED, Some(stable), FAILED, FAILED]),
+            [1, 2, 4, 1, 2, 4]
+        );
+        // From the cap, too.
+        let mut attempts = vec![FAILED; 8];
+        attempts.extend([long, FAILED]);
+        assert_eq!(
+            dirigera_waits(&attempts),
+            [1, 2, 4, 8, 16, 32, 60, 60, 1, 2]
+        );
+    }
+
+    #[test]
+    fn reconnect_backoff_keeps_doubling_after_a_short_lived_connection() {
+        let stable = ReconnectPolicy::DIRIGERA.stable_after;
+        let short = Some(Duration::from_secs(5));
+        let almost = Some(stable.saturating_sub(Duration::from_millis(1)));
+        assert_eq!(
+            dirigera_waits(&[FAILED, FAILED, short, almost, short, FAILED]),
+            [1, 2, 4, 8, 16, 32]
+        );
+        // A short-lived first connection starts at the base delay, like a failure.
+        assert_eq!(dirigera_waits(&[short, short]), [1, 2]);
     }
 }
 
