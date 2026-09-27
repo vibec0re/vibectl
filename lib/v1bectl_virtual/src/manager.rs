@@ -1492,11 +1492,14 @@ mod tests {
         );
     }
 
-    /// #15: input tracking must outlive falling behind the bus. Tracking is
-    /// held at the device lock on an event for `a` while more events pile
-    /// up behind it than the bus keeps (1000). A change to `b` must still
-    /// re-derive `b`'s group `h`. Nothing about `a` can echo `h`, so that
-    /// echo shows tracking got past the lag.
+    /// #15: input tracking must outlive falling behind the bus. More events
+    /// for `a` are published than the bus keeps (1000) before tracking can
+    /// work through them. The test holds the device lock meanwhile, so
+    /// tracking can't get past an event for `a` even if it's already
+    /// running. On the `current_thread` test runtime it may not have been
+    /// polled at all yet. Either way it falls behind. A change to `b` must
+    /// still re-derive `b`'s group `h`. Nothing about `a` can echo `h`, so
+    /// that echo shows tracking got past the lag.
     #[tokio::test]
     async fn input_tracking_survives_falling_behind_the_bus() {
         let (manager, store, bus) = manager_with_group(&["a"]).await;
@@ -1512,7 +1515,8 @@ mod tests {
 
         let echo_of_a = state_event(&"a".to_string(), None, &off());
         {
-            // Tracking blocks here at its first event for `a`.
+            // If tracking runs before we let go, it waits here, at its first
+            // event for `a`.
             let _held = manager.virtual_devices.write().await;
             for _ in 0..1500 {
                 bus.publish(echo_of_a.clone()).await;

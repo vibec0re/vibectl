@@ -83,6 +83,13 @@ pub trait VirtualDevice: Send + Sync {
     /// outside change. It matters because re-deriving a group from its
     /// members can be lossy (a linear group set to 50 reads back as 60).
     ///
+    /// After a re-derive, a group's state is usually one its members don't
+    /// hold (an average), so it accounts for none of them. Every later
+    /// event of a member then re-derives it again, until a write fans a
+    /// state out to them. That's harmless: the members haven't moved, so
+    /// the re-derive lands on the same state, and the manager echoes nothing
+    /// for an unchanged one (#22 re-review: a 50-event storm, no echo).
+    ///
     /// The default, `false`, re-derives on every input change.
     fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
         let _ = (input, state);
