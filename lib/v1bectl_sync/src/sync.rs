@@ -1158,7 +1158,8 @@ impl SyncEngine {
                 retry.attempts,
             ),
             None => debug!(
-                "🔁 Retry for {} dropped: a newer write is queued, or the device is gone",
+                "🔁 Retry for {} dropped: a newer write is queued, the write was confirmed \
+                 or abandoned, or the device is gone",
                 device_id
             ),
         }
@@ -1177,11 +1178,15 @@ impl SyncEngine {
     /// - Otherwise a pending confirmation's `expected_state` is the latest
     ///   user write (every write re-arms it, under the buffer lock held
     ///   here). With `optimistic_updates` off, the store doesn't have it yet.
-    /// - Otherwise it's the store's value: what the engine now holds for the
-    ///   device. Once a write's window ran out and the hub's value won, that
-    ///   is the hub's own value, so the write is abandoned rather than
-    ///   pushed after the UI already showed it reverted.
-    /// - A device that's no longer in the store has nothing to retry.
+    /// - Otherwise a user write has nothing left to retry. The hub confirmed
+    ///   it, or its window ran out and the pull took the hub's value: the
+    ///   write is abandoned rather than pushed after the UI already showed it
+    ///   reverted. This used to resend the store's value (#32 review), which
+    ///   by then is the hub's own, or a stale one that undoes a switch change
+    ///   the next pull hasn't seen yet.
+    /// - A push that never had a pending confirmation (a `queue_sync` push
+    ///   below `Critical`) resends its own value, while the device is still
+    ///   in the store.
     async fn latest_push_state(
         &self,
         buffer: &HashMap<DeviceId, SyncBufferEntry>,
@@ -1191,13 +1196,20 @@ impl SyncEngine {
         if buffer.contains_key(device_id) {
             return None;
         }
-        if let Some(confirmation) = self.pending_confirmations.read().await.get(device_id) {
-            return Some(confirmation.expected_state.clone());
-        }
-        self.store
-            .get_device(device_id)
+        let expected = self
+            .pending_confirmations
+            .read()
             .await
-            .map(|device| device.state)
+            .get(device_id)
+            .map(|confirmation| confirmation.expected_state.clone());
+        if expected.is_some() || retry.protected {
+            return expected;
+        }
+        self.store.get_device(device_id).await?;
+        match &retry.task.task_type {
+            SyncTaskType::PushToGateway { new_state } => Some(new_state.clone()),
+            _ => None,
+        }
     }
 
     /// One pull cycle: read every device in the store from the gateway and

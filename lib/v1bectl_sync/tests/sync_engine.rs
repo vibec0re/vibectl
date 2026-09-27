@@ -16,7 +16,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use v1bectl_sync::{ConflictResolution, SyncConfig};
+use v1bectl_sync::{ConflictResolution, SyncConfig, SyncPriority, SyncTask, SyncTaskType};
 
 // ---------------------------------------------------------------------
 // Worker intervals come from the config
@@ -302,6 +302,79 @@ async fn a_retry_in_flight_is_not_overtaken_by_a_newer_write() {
     rig.shutdown().await;
 }
 
+/// A retry that comes due while a newer write of the device waits in the
+/// sync buffer is dropped: the write supersedes it (#32 review). The write
+/// goes out once, and as a write: its push marks the pending entry pushed,
+/// so the hub's confirmation clears it and a switch change right after is
+/// taken.
+///
+/// The batch's first push is held while the newer write comes in, then
+/// fails; its retry comes due while the buffer worker is held on the
+/// batch's second push, with the newer write still in the buffer.
+#[tokio::test]
+async fn a_buffered_write_supersedes_a_due_retry() {
+    let rig = Rig::new(
+        &["h", "a", "b"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: Duration::from_secs(60),
+            ..fast_retries()
+        },
+    )
+    .await;
+    let (older, newer) = (light(true, 30), light(true, 70));
+
+    let first = rig
+        .write_one_batch("h", &[("a", older.clone()), ("b", older.clone())])
+        .await;
+    rig.write(&first, newer.clone()).await;
+    rig.hub.set_on_set(OnSet::Fail);
+    rig.hub.release(1);
+    rig.hub
+        .wait("the batch's second push at the gate", |log| {
+            log.sets_started.len() == 3
+        })
+        .await;
+    rig.hub.set_on_set(OnSet::Apply);
+    // The retry comes due and is taken out of the queue. While the buffer
+    // worker is held, the only way a PATCH of `first` can go out is a retry
+    // sent although the newer write is buffered.
+    let retry_sent = tokio::select! {
+        _ = rig.wait_for_retry_queue("the retry taken out", 0) => false,
+        _ = rig.hub.wait("a retry PATCH", |log| log.sets_for(&first).len() > 1) => true,
+    };
+    assert!(
+        !retry_sent,
+        "{first}: the retry went out although the newer write was buffered: {:?}",
+        rig.hub.log()
+    );
+
+    rig.hub.open_gate();
+    rig.hub
+        .wait("the newer write's push landed", |log| {
+            log.sets_for(&first).contains(&newer) && log.sets_done == log.sets_started.len()
+        })
+        .await;
+    assert_eq!(
+        rig.hub.log().sets_for(&first),
+        vec![older, newer.clone()],
+        "{first}: PATCHes"
+    );
+    rig.full_pull_cycle().await;
+    let flipped = light(false, 40);
+    rig.hub.report(&first, flipped.clone());
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored(&first).await,
+        flipped,
+        "{first}: the switch change after the hub confirmed the newer write \
+         was ignored: its push went out as a retry, not as a write"
+    );
+
+    rig.shutdown().await;
+}
+
 /// The retry count is per write, not per device (#32 review): a new write
 /// to a device with failures behind it gets the whole `max_retry_attempts`.
 /// It used to take over the older write's count, and was given up early.
@@ -382,11 +455,11 @@ async fn max_retry_attempts_counts_the_first_failure() {
     rig.shutdown().await;
 }
 
-/// Retries go straight to the gateway and don't restart the protection
-/// window: only a write does, and its push going out. With a hub that keeps
-/// failing, the write is reverted once the window from its push is up,
-/// while the retries are still going, and the retries after that send what
-/// the store now holds (the hub's value): the write was abandoned.
+/// Retries don't restart the protection window: only a write's own push
+/// does. With a hub that keeps failing, the write is reverted once the
+/// window from its push is up, while the retries are still going. Then the
+/// write is abandoned: its retries stop. They used to go on with the
+/// store's value, which is the hub's own by then (#32 review).
 #[tokio::test]
 async fn retries_do_not_extend_the_protection_window() {
     let rig = Rig::new(
@@ -406,16 +479,61 @@ async fn retries_do_not_extend_the_protection_window() {
     // If every retry restarted the window, it would only run out once the
     // retries stop, long after this wait gives up.
     wait_for_echo(&mut rx, "a", &off()).await;
-    // The retries go on, now with the store's value. (A retry that read its
-    // value just before the revert may still send `on` first.)
+    // No retry of the store's value comes, and at most one of `on`: a
+    // retry queued again just before the revert. (Bounded: 6 buffer ticks
+    // and 60 retry ticks.)
     let at_revert = rig.hub.log().sets_started.len();
-    rig.hub
-        .wait("a retry of the store's value after the revert", |log| {
+    let store_value_retried = rig
+        .hub
+        .within(Duration::from_millis(300), |log| {
             log.sets_started[at_revert..]
                 .iter()
                 .any(|(id, state)| id == "a" && *state == off())
         })
         .await;
+    let after_revert = rig.hub.log().sets_started[at_revert..].to_vec();
+    assert!(
+        !store_value_retried && after_revert.len() <= 1,
+        "the abandoned write was still retried after the revert: {after_revert:?}"
+    );
+
+    rig.shutdown().await;
+}
+
+/// A push queued with `queue_sync` below `Critical` never had a pending
+/// confirmation, so there's no newer user value to send instead: its retry
+/// resends its own value (#32 review). It used to send the store's, which
+/// such a push never wrote.
+#[tokio::test]
+async fn a_queued_push_is_retried_with_its_own_value() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Fail, true),
+        Pulls::OnDemand,
+        fast_retries(),
+    )
+    .await;
+
+    rig.engine
+        .queue_sync(SyncTask {
+            device_id: "a".to_string(),
+            task_type: SyncTaskType::PushToGateway { new_state: on() },
+            created_at: Instant::now(),
+            priority: SyncPriority::Normal,
+        })
+        .await;
+    rig.hub
+        .wait("the push at the gate", |log| log.sets_started.len() == 1)
+        .await;
+    rig.hub.release(1);
+    rig.hub
+        .wait("its retry at the gate", |log| log.sets_started.len() == 2)
+        .await;
+    assert_eq!(
+        rig.hub.log().sets_for("a"),
+        vec![on(), on()],
+        "PATCHes: the retry didn't resend the queued value"
+    );
 
     rig.shutdown().await;
 }
