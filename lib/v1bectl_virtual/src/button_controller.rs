@@ -4,6 +4,7 @@ use crate::virtual_device::{
     VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
 };
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use v1bectl_sync::{
     ButtonPressType, DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState,
@@ -227,6 +228,20 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
 /// A pair like the shipped `on`/`off` is hold-to-light: the lights are on
 /// while the button is down. So a click turns them on and off again.
 ///
+/// **One press fires once.** A remote can report one press both ways: as a
+/// `ButtonPressed` over the hub's event stream, and as an `is_pressed`
+/// change that the sync engine's pull picks up and echoes. So once its
+/// button has reported a gesture, a controller goes by those alone, and its
+/// button's switch echoes run nothing (#35). A button that never reports
+/// one (a switch that only has the flag, or a hub without an event stream)
+/// keeps working off its echoes, as in #34. It's not a time window because
+/// the echo comes from a pull: up to a pull interval (2 s) and the pull's
+/// own time after the press, or later for a long hold. No window both
+/// catches every echo and lets the next real press through. The gap: an
+/// echo that comes before the button's first `ButtonPressed` still runs.
+/// So the first press after a server start can run twice, if a pull lands
+/// while the button is down.
+///
 /// It makes no writes of its own. Once it's registered, the
 /// [`VirtualDeviceManager`](crate::VirtualDeviceManager) hands it its
 /// button's events ([`VirtualDevice::reactions`]) and makes each write its
@@ -241,6 +256,10 @@ pub struct ButtonController {
     press_off_action: Option<ButtonAction>,
     press_on_long_action: Option<ButtonAction>,
     press_off_long_action: Option<ButtonAction>,
+    /// Set once its button has reported a gesture (`ButtonPressed`). From
+    /// then on, only those run anything, and its switch echoes don't (see
+    /// the type's docs: one press fires once).
+    reports_gestures: AtomicBool,
 }
 
 impl ButtonController {
@@ -288,6 +307,7 @@ impl ButtonController {
             press_off_action: parse(&press_off)?,
             press_on_long_action: parse(press_on_long.as_deref().unwrap_or_default())?,
             press_off_long_action: parse(press_off_long.as_deref().unwrap_or_default())?,
+            reports_gestures: AtomicBool::new(false),
         })
     }
 
@@ -342,12 +362,28 @@ impl VirtualDevice for ButtonController {
             return Vec::new();
         }
         if let EventType::ButtonPressed { press_type, .. } = &event.event_type {
+            if !self.reports_gestures.swap(true, Ordering::Relaxed) {
+                tracing::info!(
+                    "🔘 Button {} reports its presses as ButtonPressed: {} ignores its switch echoes from now on",
+                    self.button_id,
+                    self.config.device_id
+                );
+            }
             tracing::debug!("🔘 Button {} reported a {:?}", self.button_id, press_type);
             return self.gesture(press_type).into_iter().cloned().collect();
         }
         let Some(is_pressed) = pressed(event) else {
             return Vec::new();
         };
+        if self.reports_gestures.load(Ordering::Relaxed) {
+            // The same press as a `ButtonPressed` it has run, or will.
+            tracing::debug!(
+                "🔘 Button {} pressed: {} (skipped: it reports its presses as ButtonPressed)",
+                self.button_id,
+                is_pressed
+            );
+            return Vec::new();
+        }
         tracing::debug!("🔘 Button {} pressed: {}", self.button_id, is_pressed);
         self.edge(is_pressed).into_iter().cloned().collect()
     }

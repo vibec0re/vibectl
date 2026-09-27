@@ -1061,11 +1061,20 @@ mod tests {
     /// `btn` pressed (or released), as the sync engine reports it when the
     /// hub says so: stored, and echoed.
     async fn press(store: &StateStore, bus: &EventBus, is_pressed: bool) {
-        let btn = "btn".to_string();
-        let old = stored(store, &btn).await;
+        press_switch(store, bus, "btn", is_pressed).await;
+    }
+
+    /// `button` pressed (or released), as the sync engine reports it when
+    /// the hub says so: stored, and echoed.
+    async fn press_switch(store: &StateStore, bus: &EventBus, button: &str, is_pressed: bool) {
+        let button = button.to_string();
+        let old = stored(store, &button).await;
         let new = switch(is_pressed);
-        store.update_device_state(&btn, new.clone()).await.unwrap();
-        bus.publish(state_event(&btn, Some(&old), &new)).await;
+        store
+            .update_device_state(&button, new.clone())
+            .await
+            .unwrap();
+        bus.publish(state_event(&button, Some(&old), &new)).await;
     }
 
     /// `button` reports `press_type`, as a hub reports a gesture it
@@ -1708,6 +1717,68 @@ mod tests {
         let events = pump(&manager, &mut rx).await;
         assert_eq!(stored(&store, "a").await, light(true, 50), "a moved");
         assert_eq!(events.len(), 1, "only the report: {events:?}");
+    }
+
+    /// #35, dedupe: a real remote can report one press both ways, as a
+    /// `ButtonPressed` over the hub's event stream and as the `is_pressed`
+    /// change the sync engine's pull echoes after it. It must fire once.
+    /// Light `a` starts on at 50; the press adds 20 and the release takes
+    /// 5 off, so a click moves it by 15 and each echo that ran would show.
+    /// Two presses, each reported both ways, end at 80: 50 → 70 → 65, then
+    /// 85 → 80. A battery tick of the remote runs nothing either.
+    ///
+    /// And the dedupe is per button: a controller on `plain`, a switch that
+    /// never reports a gesture, keeps running off its echoes (#34).
+    #[tokio::test]
+    async fn a_press_reported_both_ways_fires_once() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        for id in ["a", "b"] {
+            store.add_device(light_info(id), light(true, 50)).await;
+        }
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        for (id, button, target) in [("ctrl", "btn", "a"), ("ctrl_plain", "plain", "b")] {
+            add_switch(&store, button).await;
+            let (press_on, press_off) = (
+                serde_json::json!(["inc", target, 20]),
+                serde_json::json!(["dec", target, 5]),
+            );
+            manager
+                .add_virtual_device(Box::new(controller(
+                    id, button, press_on, press_off, &store, &bus,
+                )))
+                .await
+                .expect("register");
+        }
+        let mut rx = bus.subscribe();
+
+        let mut echoed = Vec::new();
+        for _ in 0..2 {
+            // The hub's event first, then the pull catches the press.
+            report(&bus, "btn", ButtonPressType::SinglePress).await;
+            press(&store, &bus, true).await;
+            press(&store, &bus, false).await;
+            echoed.extend(echoes(&pump(&manager, &mut rx).await, "a"));
+        }
+        let btn = "btn".to_string();
+        let tick = switch_at(false, 84);
+        store.update_device_state(&btn, tick.clone()).await.unwrap();
+        bus.publish(state_event(&btn, Some(&switch(false)), &tick))
+            .await;
+        echoed.extend(echoes(&pump(&manager, &mut rx).await, "a"));
+
+        let want: Vec<_> = [70, 65, 85, 80].map(|level| light(true, level)).into();
+        assert_eq!(echoed, want, "each press must run its click once");
+        assert_eq!(stored(&store, "a").await, light(true, 80));
+
+        press_switch(&store, &bus, "plain", true).await;
+        press_switch(&store, &bus, "plain", false).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "b"),
+            vec![light(true, 70), light(true, 65)],
+            "a button that never reported a gesture must still fire on its echoes"
+        );
     }
 
     /// #34 review, nit 3: a member that's on at level 0 (the TUI's `-` can
