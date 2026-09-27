@@ -318,7 +318,7 @@ async fn a_buffered_write_supersedes_a_due_retry() {
         TestHub::new(OnSet::Apply, true),
         Pulls::Periodic,
         SyncConfig {
-            protection_window: Duration::from_secs(60),
+            protection_window: Duration::from_mins(1),
             ..fast_retries()
         },
     )
@@ -341,8 +341,8 @@ async fn a_buffered_write_supersedes_a_due_retry() {
     // worker is held, the only way a PATCH of `first` can go out is a retry
     // sent although the newer write is buffered.
     let retry_sent = tokio::select! {
-        _ = rig.wait_for_retry_queue("the retry taken out", 0) => false,
-        _ = rig.hub.wait("a retry PATCH", |log| log.sets_for(&first).len() > 1) => true,
+        () = rig.wait_for_retry_queue("the retry taken out", 0) => false,
+        () = rig.hub.wait("a retry PATCH", |log| log.sets_for(&first).len() > 1) => true,
     };
     assert!(
         !retry_sent,
@@ -424,7 +424,7 @@ async fn a_new_write_gets_its_own_retry_budget() {
 /// (and, with a 60 s delay, would still be waiting).
 #[tokio::test]
 async fn max_retry_attempts_counts_the_first_failure() {
-    let delay = Duration::from_secs(60);
+    let delay = Duration::from_mins(1);
     let rig = Rig::new(
         &["h", "a", "b"],
         TestHub::new(OnSet::Apply, true),

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use std::time::Duration;
-use v1bectl_state::*;
+use v1bectl_state::{DeviceEvent, DeviceId, DeviceInfo, DeviceStateValue};
 
 pub type EventStream = tokio::sync::broadcast::Receiver<DeviceEvent>;
 

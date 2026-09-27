@@ -8,7 +8,7 @@
 //! members of a group write, say) reverted it.
 //!
 //! The engine runs for real, against the shared rig's `TestHub` (see
-//! `common`): a fake gateway whose PATCHes can be held at a gate and whose
+//! `common`): a fake gateway whose `PATCHes` can be held at a gate and whose
 //! traffic is logged. The tests order their steps on that log, never on
 //! sleeps, except `push_time_restart_covers_a_queue_delay`, whose subject is
 //! elapsed time.
@@ -143,7 +143,7 @@ async fn periodic_pull_confirmation_clears_the_pending_entry() {
         TestHub::new(OnSet::Apply, false),
         Pulls::Periodic,
         SyncConfig {
-            protection_window: Duration::from_secs(60),
+            protection_window: Duration::from_mins(1),
             ..SyncConfig::default()
         },
     )
@@ -211,7 +211,7 @@ async fn writes_without_the_priority_boost_are_protected_too() {
 }
 
 /// The window is bounded. With the hub still reporting the old value once
-/// it's up, GatewayWins reverts the write, whether the push went through
+/// it's up, `GatewayWins` reverts the write, whether the push went through
 /// (and the device never changed) or failed. The store isn't left
 /// "protected" with a value the hub never got.
 #[tokio::test]
@@ -419,7 +419,7 @@ async fn failed_push_stays_protected_within_the_window() {
 /// "test timing" failure rather than a false pass or fail.
 #[tokio::test]
 async fn push_time_restart_covers_a_queue_delay() {
-    let window = Duration::from_millis(1000);
+    let window = Duration::from_secs(1);
     let rig = Rig::new(
         &["a", "b"],
         TestHub::new(OnSet::Apply, true),
@@ -500,7 +500,7 @@ async fn pull_now(rig: &Rig, pulls: Pulls, id: &str) {
 /// slider snapped back). The hub still reports `off`, which is also what
 /// the toggle-back expects, but only by coincidence: the `on` PATCH is
 /// about to move the hub. The toggle-back must stay protected until its own
-/// push lands, whichever order the batch sends its PATCHes in, and the UI
+/// push lands, whichever order the batch sends its `PATCHes` in, and the UI
 /// must never show it `on` again.
 ///
 /// `Pulls::Periodic` takes the periodic pull's path (`clear_confirmed`, the
@@ -619,7 +619,7 @@ async fn a_removed_device_takes_its_pending_confirmation_with_it() {
         TestHub::new(OnSet::Ignore, false),
         Pulls::Periodic,
         SyncConfig {
-            protection_window: Duration::from_secs(60),
+            protection_window: Duration::from_mins(1),
             ..SyncConfig::default()
         },
     )

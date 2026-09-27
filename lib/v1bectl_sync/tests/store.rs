@@ -1,6 +1,6 @@
-//! 🔥 Integration tests for `StateStore` (lib/v1bectl_sync/src/store.rs).
+//! 🔥 Integration tests for `StateStore` (`lib/v1bectl_sync/src/store.rs`).
 //!
-//! Covers every public method: add/get/list/list_by_type/list_by_group,
+//! Covers every public method: `add/get/list/list_by_type/list_by_group`,
 //! update (including the `DeviceNotFound` error path and `last_updated`
 //! monotonicity), remove, the device-group CRUD, the stats helpers, and a
 //! concurrency smoke test.
@@ -17,7 +17,7 @@ fn device_info(id: &str, device_type: DeviceType, groups: &[&str], reachable: bo
         name: format!("Device {id}"),
         device_type,
         capabilities: vec![Capability::OnOff],
-        device_groups: groups.iter().map(|g| g.to_string()).collect(),
+        device_groups: groups.iter().map(ToString::to_string).collect(),
         manufacturer: Some("IKEA".to_string()),
         model: Some("TRADFRI".to_string()),
         firmware_version: Some("1.0.0".to_string()),
@@ -268,11 +268,16 @@ async fn remove_device_on_missing_device_returns_device_not_found_with_id() {
 // ---------------------------------------------------------------------
 
 fn group_info(name: &str, device_ids: &[&str]) -> DeviceGroupInfo {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "device count, always far below u32::MAX"
+    )]
+    let device_count = device_ids.len() as u32;
     DeviceGroupInfo {
         group_name: name.to_string(),
         icon_ref: format!("icon://{name}"),
-        device_count: device_ids.len() as u32,
-        device_ids: device_ids.iter().map(|d| d.to_string()).collect(),
+        device_count,
+        device_ids: device_ids.iter().map(ToString::to_string).collect(),
     }
 }
 
@@ -359,7 +364,7 @@ async fn reachable_device_count_counts_only_reachable_devices() {
 // ---------------------------------------------------------------------
 
 /// N tasks concurrently update N distinct devices. This does not stress any
-/// single key (that's covered by the RwLock's own guarantees) — it instead
+/// single key (that's covered by the `RwLock`'s own guarantees) — it instead
 /// pins the higher-level contract that concurrent updates to *different*
 /// devices don't get lost or cross-applied to the wrong device.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -382,6 +387,10 @@ async fn concurrent_updates_to_distinct_devices_all_land() {
         let store = store.clone();
         handles.push(tokio::spawn(async move {
             let id = format!("device-{i}");
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "i is 0..N (N=20), so i*2 never exceeds u8::MAX"
+            )]
             let brightness = (i * 2) as u8;
             store
                 .update_device_state(&id, light_state(true, brightness))
@@ -402,6 +411,10 @@ async fn concurrent_updates_to_distinct_devices_all_land() {
             .get_device(&id)
             .await
             .unwrap_or_else(|| panic!("device {id} should still exist"));
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "i is 0..N (N=20), so i*2 never exceeds u8::MAX"
+        )]
         let expected_brightness = (i * 2) as u8;
         assert_eq!(device.state, light_state(true, expected_brightness));
     }
