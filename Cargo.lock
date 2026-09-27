@@ -3246,6 +3246,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "mockall",
+ "native-tls",
  "reqwest",
  "serde",
  "serde_json",
