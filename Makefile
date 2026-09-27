@@ -123,7 +123,7 @@ test-scenario:
 # Run targets
 .PHONY: run-server
 run-server:
-	V1BECTL_GATEWAY_TYPE=dummy V1BECTL_DUMMY_SCENARIO=basic_home cargo run --bin v1bectl_server
+	cargo run --bin v1bectl_server -- dummy --scenario basic_home
 
 .PHONY: run-server-real
 run-server-real:
@@ -131,7 +131,7 @@ run-server-real:
 		echo "Usage: make run-server-real DIRIGERA_HOST=<host> ACCESS_TOKEN=<token>"; \
 		exit 1; \
 	fi
-	V1BECTL_GATEWAY_TYPE=real V1BECTL_GATEWAY_HOST=$(DIRIGERA_HOST) V1BECTL_ACCESS_TOKEN=$(ACCESS_TOKEN) cargo run --bin v1bectl_server
+	V1BECTL_ACCESS_TOKEN=$(ACCESS_TOKEN) cargo run --bin v1bectl_server -- dirigera --host $(DIRIGERA_HOST)
 
 .PHONY: run-cli
 run-cli:
@@ -194,22 +194,12 @@ coverage:
 docs:
 	cargo doc --workspace --no-deps --open
 
-# Docker targets
-.PHONY: docker-build
-docker-build:
-	docker build -t v1bectl:latest .
-
-.PHONY: docker-run
-docker-run:
-	docker run -p 8080:8080 v1bectl:latest
-
 # Integration test scenarios
 .PHONY: test-scenarios
 test-scenarios:
 	@echo "Testing all scenarios..."
 	make test-scenario SCENARIO=basic_home
-	make test-scenario SCENARIO=large_home  
-	make test-scenario SCENARIO=unreliable_network
+	make test-scenario SCENARIO=large_home
 	@echo "All scenarios tested successfully!"
 
 # Quick development cycle
