@@ -46,6 +46,7 @@ mod ws;
 
 use std::collections::{BTreeMap, HashSet};
 
+use hytte_plugin::proto::manifest::Setting;
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
 use hytte_plugin::tokio_stream::wrappers::UnboundedReceiverStream;
 use hytte_plugin::{nodes, CmdReceiver, CmdSender, Input, MsgStream, Plugin, View};
@@ -148,8 +149,21 @@ impl Plugin for VibeWidget {
 
     fn manifest() -> Manifest {
         // No host-state subscriptions, no shell capabilities: everything this
-        // widget does goes over its own WebSocket.
-        Manifest::new("vibectl", Mount::SidebarLead).with_version(env!("CARGO_PKG_VERSION"))
+        // widget does goes over its own WebSocket. The two settings below
+        // (#1410) just give the control-center a form for the two env vars
+        // this widget already reads (`screens::config_path`, `ws::server_url`)
+        // — declaring them changes no other code.
+        Manifest::new("vibectl", Mount::SidebarLead)
+            .with_version(env!("CARGO_PKG_VERSION"))
+            .with_setting(Setting::path("V1BECTL_SCREENS", "Screens layout file").doc(
+                "The screens.kdl layout; unset uses ~/.config/v1bectl/screens.kdl, \
+                     then one group per room.",
+            ))
+            .with_setting(
+                Setting::text("V1BECTL_SERVER", "Server address")
+                    .doc("host:port of the v1bectl server")
+                    .default_value("127.0.0.1:31337"),
+            )
     }
 
     fn init(cmds: CmdSender<Self::Cmd>) -> Self {
@@ -1922,5 +1936,33 @@ screen "wz" {
             "virtual group skipped: {all:?}"
         );
         assert!(all.iter().any(|t| t == "MAIN"), "real light shown: {all:?}");
+    }
+
+    #[test]
+    fn manifest_declares_the_two_env_settings() {
+        use hytte_plugin::proto::manifest::SettingKind;
+
+        let manifest = VibeWidget::manifest();
+        assert_eq!(
+            manifest.settings.len(),
+            2,
+            "exactly the two settings the widget reads: {:?}",
+            manifest.settings
+        );
+
+        let screens = &manifest.settings[0];
+        assert_eq!(screens.env, "V1BECTL_SCREENS");
+        assert_eq!(screens.label, "Screens layout file");
+        assert_eq!(screens.kind, SettingKind::Path { directory: false });
+        assert_eq!(
+            screens.default, None,
+            "no default text: the widget's own XDG fallback isn't one fixed path"
+        );
+
+        let server = &manifest.settings[1];
+        assert_eq!(server.env, "V1BECTL_SERVER");
+        assert_eq!(server.label, "Server address");
+        assert_eq!(server.kind, SettingKind::Text);
+        assert_eq!(server.default.as_deref(), Some("127.0.0.1:31337"));
     }
 }

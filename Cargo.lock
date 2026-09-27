@@ -677,7 +677,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "778e2ac28f6c47af28e4907f13ffd1e1ddbd400980a9abd7c8df189bf578a5ad"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1758,7 +1758,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#5a89fbd5e769addd21a54c41f05c414d742dafaa"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#244145b43820eeb1986ccde245bc6b8c7c4ab9c4"
 dependencies = [
  "hytte-plugin-proto",
  "hytte-preem",
@@ -1769,7 +1769,7 @@ dependencies = [
 [[package]]
 name = "hytte-plugin-proto"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#5a89fbd5e769addd21a54c41f05c414d742dafaa"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#244145b43820eeb1986ccde245bc6b8c7c4ab9c4"
 dependencies = [
  "rmp-serde",
  "serde",
@@ -1780,7 +1780,7 @@ dependencies = [
 [[package]]
 name = "hytte-preem"
 version = "0.1.0"
-source = "git+https://github.com/vibec0re/trollshell?branch=main#5a89fbd5e769addd21a54c41f05c414d742dafaa"
+source = "git+https://github.com/vibec0re/trollshell?branch=main#244145b43820eeb1986ccde245bc6b8c7c4ab9c4"
 dependencies = [
  "hytte-plugin-proto",
 ]
@@ -2887,7 +2887,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.60.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3154,7 +3154,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
