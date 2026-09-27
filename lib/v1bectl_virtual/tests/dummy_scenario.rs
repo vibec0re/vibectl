@@ -145,6 +145,40 @@ async fn shipped_virtual_devices_only_reference_dummy_devices() {
     );
 }
 
+/// #16: no two shipped light groups drive the same lights the same way. Once
+/// #14 pointed `bedroom_lights.toml` at the dummy's lights,
+/// `bedroom_lights_test.toml` became a copy of it under another id: the same
+/// three lights, with the same ranges.
+#[tokio::test]
+async fn shipped_light_groups_are_not_duplicates() {
+    let configs = shipped_configs().await;
+    let mut seen: HashMap<String, &str> = HashMap::new();
+    for config in &configs {
+        // What the group drives: each light and how it maps the level.
+        let mut drives: Vec<String> = match config {
+            VirtualDeviceTomlConfig::LightGroupLinear(c) => c
+                .members
+                .iter()
+                .map(|(name, light)| format!("{light} {:?}", c.brightness.get(name)))
+                .collect(),
+            VirtualDeviceTomlConfig::LightGroup(c) => c
+                .members
+                .iter()
+                .map(|light| {
+                    let curve = c.brightness_curves.get(light).map(|b| (b.min, b.max));
+                    format!("{light} {curve:?}")
+                })
+                .collect(),
+            _ => continue,
+        };
+        drives.sort();
+        let id = config_id(config);
+        if let Some(other) = seen.insert(drives.join(", "), id) {
+            panic!("{id} duplicates {other}: both drive {drives:?}");
+        }
+    }
+}
+
 /// #16: every shipped controller binds a switch the dummy registers, and no
 /// two bind the same one, or one press would run two actions. It used to be
 /// that one controller bound a real-hub remote the dummy doesn't have, and
