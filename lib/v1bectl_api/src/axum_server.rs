@@ -17,9 +17,13 @@ use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use v1bectl_sync::sync::*;
-use v1bectl_sync::*;
-use v1bectl_virtual::*;
+use v1bectl_sync::{
+    recv_lossy, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus, EventType,
+    Gateway, LightState, OutletState, RgbColor, SceneState, StateStore, SyncEngine,
+};
+use v1bectl_virtual::{
+    LightGroup, SceneController, VirtualDeviceConfig, VirtualDeviceManager, VirtualDeviceType,
+};
 
 #[derive(Clone)]
 pub struct AxumServer {
@@ -148,6 +152,7 @@ impl AxumServer {
     }
 
     // 🔥 Set sync engine for OPTIMISTIC UPDATES!
+    #[must_use]
     pub fn with_sync_engine(mut self, sync_engine: Arc<SyncEngine>) -> Self {
         // Virtual writes fan out to physical members, and those take the same
         // path as a direct write: store, echo, gateway push.
@@ -158,6 +163,7 @@ impl AxumServer {
     }
 
     /// 🔥 GET VIRTUAL DEVICE MANAGER FOR EXTERNAL REGISTRATION! 💖
+    #[must_use]
     pub fn virtual_device_manager(&self) -> Arc<VirtualDeviceManager> {
         Arc::clone(&self.virtual_device_manager)
     }
@@ -172,7 +178,7 @@ impl AxumServer {
         self.virtual_device_manager
             .start()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start virtual device manager: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to start virtual device manager: {e}"))?;
 
         // 🔥 SUBSCRIBE TO EVENTBUS AND FORWARD TO WEBSOCKET CLIENTS! 💖
         spawn_event_forwarder(&self.event_bus, Arc::clone(&self.subscribers));
@@ -214,6 +220,10 @@ impl AxumServer {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match arm per ApiRequest variant; splitting each arm into its own function is a real restructure, out of scope for a lint gate"
+    )]
     async fn handle_api_request(
         &self,
         request: ApiRequest,
@@ -223,6 +233,11 @@ impl AxumServer {
             ApiRequest::DiscoverDevices => {
                 debug!("Handling device discovery request - WITH STATES! 🔥");
                 let all_device_states = self.state_store.list_devices().await;
+                // Device count, always far below u32::MAX.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "device count, always far below u32::MAX"
+                )]
                 let total = all_device_states.len() as u32;
 
                 ApiResponse::DeviceList {
@@ -263,8 +278,14 @@ impl AxumServer {
                     filtered_devices.retain(|d| d.device_info.reachable);
                 }
 
+                // Device count, always far below u32::MAX.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "device count, always far below u32::MAX"
+                )]
+                let total_count = filtered_devices.len() as u32;
                 ApiResponse::DeviceList {
-                    total_count: filtered_devices.len() as u32,
+                    total_count,
                     devices: filtered_devices, // 🔥 Return FULL DeviceState!
                 }
             }
@@ -331,7 +352,7 @@ impl AxumServer {
                                     .set_virtual_device_state(&device_id, new_state.clone())
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(()) => {
                                         debug!(
                                             "✅ Virtual device {} updated successfully!",
                                             device_id
@@ -373,7 +394,7 @@ impl AxumServer {
                                         );
                                         ApiResponse::Error {
                                             code: "VIRTUAL_UPDATE_FAILED".to_string(),
-                                            message: format!("Virtual device update failed: {}", e),
+                                            message: format!("Virtual device update failed: {e}"),
                                         }
                                     }
                                 }
@@ -387,7 +408,7 @@ impl AxumServer {
                                         .apply_optimistic_update(&device_id, new_state.clone())
                                         .await
                                     {
-                                        Ok(_) => {
+                                        Ok(()) => {
                                             debug!("✅ Optimistic update applied for {} - USER SEES CHANGE NOW!", device_id);
                                             ApiResponse::LightUpdated {
                                                 new_state: current_light,
@@ -397,7 +418,7 @@ impl AxumServer {
                                             error!("Failed to apply optimistic update: {}", e);
                                             ApiResponse::Error {
                                                 code: "OPTIMISTIC_UPDATE_FAILED".to_string(),
-                                                message: format!("Update failed: {}", e),
+                                                message: format!("Update failed: {e}"),
                                             }
                                         }
                                     }
@@ -408,14 +429,14 @@ impl AxumServer {
                                         .set_device_state(&device_id, new_state.clone())
                                         .await
                                     {
-                                        Ok(_) => {
+                                        Ok(()) => {
                                             // If gateway update succeeds, update local state
                                             match self
                                                 .state_store
                                                 .update_device_state(&device_id, new_state.clone())
                                                 .await
                                             {
-                                                Ok(_) => {
+                                                Ok(()) => {
                                                     debug!("Updated light state for device: {} - VIBEC0RE CONTROL! 🔥", device_id);
 
                                                     // 🔥 Broadcast state change event - PURE CBOR!
@@ -439,8 +460,7 @@ impl AxumServer {
                                                     ApiResponse::Error {
                                                         code: "STORE_UPDATE_FAILED".to_string(),
                                                         message: format!(
-                                                            "Local state update failed: {}",
-                                                            e
+                                                            "Local state update failed: {e}"
                                                         ),
                                                     }
                                                 }
@@ -453,7 +473,7 @@ impl AxumServer {
                                             );
                                             ApiResponse::Error {
                                                 code: "GATEWAY_FAILED".to_string(),
-                                                message: format!("Gateway update failed: {}", e),
+                                                message: format!("Gateway update failed: {e}"),
                                             }
                                         }
                                     }
@@ -497,7 +517,7 @@ impl AxumServer {
                                 .apply_optimistic_update(&device_id, new_state.clone())
                                 .await
                             {
-                                Ok(_) => {
+                                Ok(()) => {
                                     debug!(
                                         "✅ Outlet {} set to {} - INSTANT UPDATE!",
                                         device_id,
@@ -516,7 +536,7 @@ impl AxumServer {
                                     error!("Failed to apply outlet update: {}", e);
                                     ApiResponse::Error {
                                         code: "OUTLET_UPDATE_FAILED".to_string(),
-                                        message: format!("Update failed: {}", e),
+                                        message: format!("Update failed: {e}"),
                                     }
                                 }
                             }
@@ -527,14 +547,14 @@ impl AxumServer {
                                 .set_device_state(&device_id, new_state.clone())
                                 .await
                             {
-                                Ok(_) => {
+                                Ok(()) => {
                                     // If gateway update succeeds, update local state
                                     match self
                                         .state_store
                                         .update_device_state(&device_id, new_state.clone())
                                         .await
                                     {
-                                        Ok(_) => {
+                                        Ok(()) => {
                                             debug!(
                                                 "🔌 Updated outlet state for device: {} to {}",
                                                 device_id,
@@ -566,10 +586,7 @@ impl AxumServer {
                                             error!("Failed to update local state after gateway success: {}", e);
                                             ApiResponse::Error {
                                                 code: "STORE_UPDATE_FAILED".to_string(),
-                                                message: format!(
-                                                    "Local state update failed: {}",
-                                                    e
-                                                ),
+                                                message: format!("Local state update failed: {e}"),
                                             }
                                         }
                                     }
@@ -581,7 +598,7 @@ impl AxumServer {
                                     );
                                     ApiResponse::Error {
                                         code: "GATEWAY_FAILED".to_string(),
-                                        message: format!("Gateway update failed: {}", e),
+                                        message: format!("Gateway update failed: {e}"),
                                     }
                                 }
                             }
@@ -606,8 +623,8 @@ impl AxumServer {
                                 .virtual_device_manager
                                 .add_virtual_device(Box::new(light_group))
                                 .await
-                                .map_err(|e| format!("Failed to add virtual device: {}", e)),
-                            Err(e) => Err(format!("Failed to create light group: {}", e)),
+                                .map_err(|e| format!("Failed to add virtual device: {e}")),
+                            Err(e) => Err(format!("Failed to create light group: {e}")),
                         }
                     }
                     VirtualDeviceType::SceneController => {
@@ -616,15 +633,15 @@ impl AxumServer {
                                 .virtual_device_manager
                                 .add_virtual_device(Box::new(scene_controller))
                                 .await
-                                .map_err(|e| format!("Failed to add virtual device: {}", e)),
-                            Err(e) => Err(format!("Failed to create scene controller: {}", e)),
+                                .map_err(|e| format!("Failed to add virtual device: {e}")),
+                            Err(e) => Err(format!("Failed to create scene controller: {e}")),
                         }
                     }
                     _ => Err("Virtual device type not yet implemented".to_string()),
                 };
 
                 match device_result {
-                    Ok(_) => {
+                    Ok(()) => {
                         debug!("Created virtual device: {}", config.device_id);
                         ApiResponse::VirtualDeviceCreated {
                             device_id: config.device_id,
@@ -642,13 +659,13 @@ impl AxumServer {
                     .remove_virtual_device(&device_id)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         debug!("Removed virtual device: {}", device_id);
                         ApiResponse::VirtualDeviceRemoved { device_id }
                     }
                     Err(e) => ApiResponse::Error {
                         code: "REMOVE_FAILED".to_string(),
-                        message: format!("Failed to remove virtual device: {}", e),
+                        message: format!("Failed to remove virtual device: {e}"),
                     },
                 }
             }
@@ -667,7 +684,7 @@ impl AxumServer {
                     .set_virtual_device_state(&device_id, scene_state)
                     .await
                 {
-                    Ok(_) => {
+                    Ok(()) => {
                         debug!("Activated scene '{}' on device '{}'", scene_name, device_id);
                         ApiResponse::SceneActivated {
                             device_id,
@@ -676,7 +693,7 @@ impl AxumServer {
                     }
                     Err(e) => ApiResponse::Error {
                         code: "SCENE_FAILED".to_string(),
-                        message: format!("Failed to activate scene: {}", e),
+                        message: format!("Failed to activate scene: {e}"),
                     },
                 }
             }
@@ -734,6 +751,10 @@ async fn websocket_handler(ws: WebSocketUpgrade, State(server): State<AxumServer
     ws.on_upgrade(|socket| handle_websocket(socket, server))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat loop wiring the socket's send/recv halves to the subscriber channel and request dispatch; splitting it apart would scatter shared connection state across functions"
+)]
 async fn handle_websocket(socket: WebSocket, server: AxumServer) {
     let subscriber_id = Uuid::new_v4().to_string();
     debug!(
@@ -913,6 +934,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
+    use v1bectl_sync::SyncStatus;
+    use v1bectl_virtual::{DummyGateway, LightGroupLinear};
 
     const GROUP: &str = "virtual_bedroom_lights";
     /// (member, its brightness when the group is on at 50%): the linear
@@ -1271,7 +1294,7 @@ mod tests {
 
     /// #14 review, finding 4b: a hub reports a member's colour its own way
     /// (a bulb without colour temperature has none, the RGB bulb its hue).
-    /// When that view lands in the store (GatewayWins, after the protection
+    /// When that view lands in the store (`GatewayWins`, after the protection
     /// window), the member is still where the group put it. So the group
     /// must not be re-derived, which would be lossy: Bedroom Lights at 50
     /// would read back as 60.

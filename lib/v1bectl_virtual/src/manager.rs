@@ -1,10 +1,15 @@
 use crate::button_controller::ButtonAction;
-use crate::virtual_device::*;
+use crate::virtual_device::{
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    recv_lossy, DeviceEvent, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, DeviceType,
+    EventBus, EventType, StateError, StateStore, SyncEngine,
+};
 
 /// Virtual Device Manager - coordinates all virtual devices 🔥
 ///
@@ -44,7 +49,7 @@ pub struct VirtualDeviceManager {
 /// tracking decode.
 ///
 /// `old_value` is the state the store held before, as in the engine's
-/// GatewayWins and confirmation echoes. (The engine's optimistic echo sends
+/// `GatewayWins` and confirmation echoes. (The engine's optimistic echo sends
 /// `Null` there.) Clients read only `new_value`; the server's event log
 /// prints both.
 fn state_event(
@@ -87,7 +92,7 @@ impl VirtualDeviceManager {
     }
 
     /// Send member writes through `sync_engine`, like direct writes, so they
-    /// reach the gateway. Without this the 2s pull worker (GatewayWins)
+    /// reach the gateway. Without this the 2s pull worker (`GatewayWins`)
     /// reverts them. Only the first attach counts.
     pub fn attach_sync_engine(&self, sync_engine: Arc<SyncEngine>) {
         if self.sync_engine.set(sync_engine).is_err() {
@@ -410,6 +415,12 @@ impl VirtualDeviceManager {
             return Ok(());
         };
 
+        // Event timestamps are near-present wall-clock millis; this only
+        // truncates past year ~292 million.
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "wall-clock millis since epoch, nowhere near u64::MAX until year ~292 million"
+        )]
         let timestamp_millis = event
             .timestamp
             .duration_since(std::time::UNIX_EPOCH)
@@ -571,24 +582,23 @@ impl VirtualDeviceManager {
     async fn run_action(&self, action: &ButtonAction) -> Result<(), VirtualDeviceError> {
         let target = &action.target;
         let mut devices = self.virtual_devices.write().await;
-        let current = match devices.get(target) {
-            Some(device) => device.current_state(),
-            None => {
-                let stored = self
-                    .state_store
-                    .get_device(target)
-                    .await
-                    .ok_or_else(|| VirtualDeviceError::DeviceNotFound(target.clone()))?;
-                if stored
-                    .device_info
-                    .device_groups
-                    .iter()
-                    .any(|g| g == "virtual")
-                {
-                    return Err(VirtualDeviceError::DeviceNotFound(target.clone()));
-                }
-                stored.state
+        let current = if let Some(device) = devices.get(target) {
+            device.current_state()
+        } else {
+            let stored = self
+                .state_store
+                .get_device(target)
+                .await
+                .ok_or_else(|| VirtualDeviceError::DeviceNotFound(target.clone()))?;
+            if stored
+                .device_info
+                .device_groups
+                .iter()
+                .any(|g| g == "virtual")
+            {
+                return Err(VirtualDeviceError::DeviceNotFound(target.clone()));
             }
+            stored.state
         };
         let DeviceStateValue::Light(light) = &current else {
             tracing::warn!(
@@ -809,6 +819,10 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
     use tokio::sync::watch;
+    use v1bectl_sync::{
+        Capability, Gateway, GatewayError, GatewayHealth, LightState, SwitchState, SyncConfig,
+        SyncStatus,
+    };
 
     fn light_info(device_id: &str) -> DeviceInfo {
         DeviceInfo {
@@ -2003,7 +2017,7 @@ mod tests {
 
     /// The live-gateway half of #1: member writes must reach the hub, and
     /// the pulls after them must leave them alone. If they only hit the
-    /// store, the pull worker (GatewayWins) reverts them.
+    /// store, the pull worker (`GatewayWins`) reverts them.
     #[tokio::test]
     async fn virtual_member_writes_reach_the_gateway() {
         const LIGHTS: [&str; 3] = ["light_bedroom", "light_living_room", "light_kitchen"];

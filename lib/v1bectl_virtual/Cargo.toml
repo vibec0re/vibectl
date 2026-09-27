@@ -23,3 +23,6 @@ toml = "0.8"  # 🔥 FOR PARSING VIRTUAL DEVICE CONFIGS! 💖
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

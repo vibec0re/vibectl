@@ -2,7 +2,10 @@ use crate::button_controller::ButtonAction;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    Capability, DeviceEvent, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, DeviceType,
+    StateError,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum VirtualDeviceError {
@@ -131,11 +134,15 @@ pub trait VirtualDevice: Send + Sync {
             device_id: config.device_id.clone(),
             name: config.name.clone(),
             device_type: match self.device_type() {
-                VirtualDeviceType::LightGroup => DeviceType::VirtualLightGroup,
-                VirtualDeviceType::LightGroupLinear => DeviceType::VirtualLightGroup, // 🔥 Same device type, different impl!
-                VirtualDeviceType::ButtonController => DeviceType::VirtualConditional, // 🔥 Controller is like conditional!
+                // 🔥 Same device type, different impl!
+                VirtualDeviceType::LightGroup | VirtualDeviceType::LightGroupLinear => {
+                    DeviceType::VirtualLightGroup
+                }
+                // 🔥 Controller is like conditional!
+                VirtualDeviceType::ButtonController | VirtualDeviceType::ConditionalDevice => {
+                    DeviceType::VirtualConditional
+                }
                 VirtualDeviceType::SceneController => DeviceType::VirtualScene,
-                VirtualDeviceType::ConditionalDevice => DeviceType::VirtualConditional,
                 VirtualDeviceType::TimerDevice => DeviceType::VirtualTimer,
             },
             capabilities: self.get_capabilities(),
@@ -145,7 +152,7 @@ pub trait VirtualDevice: Send + Sync {
             firmware_version: Some("1.0.0".to_string()),
             battery_powered: false,
             reachable: config.enabled,
-            last_seen: chrono::Utc::now().timestamp_millis() as u64,
+            last_seen: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             custom_attributes: HashMap::new(),
         }
     }
@@ -159,10 +166,11 @@ pub trait VirtualDevice: Send + Sync {
                 Capability::ColorTemperature,
                 Capability::RgbColor,
             ],
-            VirtualDeviceType::ButtonController => vec![], // 🔥 Controllers have no capabilities, they just react!
-            VirtualDeviceType::SceneController => vec![],
-            VirtualDeviceType::ConditionalDevice => vec![],
-            VirtualDeviceType::TimerDevice => vec![],
+            // 🔥 Controllers have no capabilities, they just react!
+            VirtualDeviceType::ButtonController
+            | VirtualDeviceType::SceneController
+            | VirtualDeviceType::ConditionalDevice
+            | VirtualDeviceType::TimerDevice => vec![],
         }
     }
 }

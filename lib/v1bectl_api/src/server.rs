@@ -7,6 +7,7 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
+    #[must_use]
     pub fn new(port: u16) -> Self {
         Self { port }
     }

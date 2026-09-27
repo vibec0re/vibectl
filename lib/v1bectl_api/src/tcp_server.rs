@@ -3,7 +3,10 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    DeviceInfo, DeviceStateValue, DiscoverDevicesResponse, EventBus, LightState, Message,
+    MessageType, StateStore,
+};
 
 pub struct TcpServer {
     port: u16,
@@ -60,12 +63,11 @@ async fn handle_connection(
         debug!("Received message: {:?}", message.message_type);
 
         // Process based on payload type
-        let response = match &message.message_type {
-            MessageType::Request => process_request(message, &state_store, &event_bus).await,
-            _ => {
-                warn!("Unexpected message type: {:?}", message.message_type);
-                create_error_response(message.correlation_id, "Invalid message type")
-            }
+        let response = if let MessageType::Request = &message.message_type {
+            process_request(message, &state_store, &event_bus).await
+        } else {
+            warn!("Unexpected message type: {:?}", message.message_type);
+            create_error_response(message.correlation_id, "Invalid message type")
         };
 
         // Send response
@@ -120,10 +122,16 @@ async fn handle_discover_devices(correlation_id: String, state_store: &Arc<State
 
     let device_infos: Vec<DeviceInfo> = devices.into_iter().map(|d| d.device_info).collect();
 
+    // Discovered-device count, always far below u32::MAX.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "discovered-device count, always far below u32::MAX"
+    )]
+    let total_count = device_infos.len() as u32;
     let response = DiscoverDevicesResponse {
         devices: device_infos.clone(),
-        total_count: device_infos.len() as u32,
-        discovery_timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        total_count,
+        discovery_timestamp: chrono::Utc::now().timestamp_millis().cast_unsigned(),
         gateway_scan_duration_ms: 0,
     };
 
@@ -134,7 +142,7 @@ async fn handle_discover_devices(correlation_id: String, state_store: &Arc<State
         correlation_id,
         message_type: MessageType::Response,
         payload,
-        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        timestamp: chrono::Utc::now().timestamp_millis().cast_unsigned(),
     }
 }
 
@@ -151,7 +159,7 @@ async fn handle_get_device_state(
                 correlation_id,
                 message_type: MessageType::Response,
                 payload,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             }
         }
         None => create_error_response(correlation_id, "Device not found"),
@@ -170,9 +178,8 @@ async fn handle_set_light_state(message: Message, state_store: &Arc<StateStore>)
         return create_error_response(message.correlation_id, "Invalid device ID length");
     }
 
-    let device_id = match String::from_utf8(message.payload[2..2 + device_id_len].to_vec()) {
-        Ok(id) => id,
-        Err(_) => return create_error_response(message.correlation_id, "Invalid device ID"),
+    let Ok(device_id) = String::from_utf8(message.payload[2..2 + device_id_len].to_vec()) else {
+        return create_error_response(message.correlation_id, "Invalid device ID");
     };
 
     let state_bytes = &message.payload[2 + device_id_len..];
@@ -191,10 +198,10 @@ async fn handle_set_light_state(message: Message, state_store: &Arc<StateStore>)
                 correlation_id: message.correlation_id,
                 message_type: MessageType::Response,
                 payload: response,
-                timestamp: chrono::Utc::now().timestamp_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             }
         }
-        Err(e) => create_error_response(message.correlation_id, &format!("Update failed: {}", e)),
+        Err(e) => create_error_response(message.correlation_id, &format!("Update failed: {e}")),
     }
 }
 
@@ -204,6 +211,6 @@ fn create_error_response(correlation_id: String, error: &str) -> Message {
         correlation_id,
         message_type: MessageType::Error,
         payload: error_bytes,
-        timestamp: chrono::Utc::now().timestamp_millis() as u64,
+        timestamp: chrono::Utc::now().timestamp_millis().cast_unsigned(),
     }
 }

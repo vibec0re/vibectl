@@ -162,6 +162,14 @@ fn default_transition_duration() -> u32 {
 use std::fs;
 use std::path::Path;
 
+// kept async: its own body no longer awaits now that the per-file helper
+// below is sync, but this is a public API with a caller outside this PR's
+// lane (v1bectl_server, which does `.await` it) — sync/api join the ratchet
+// separately (#5), so its call site isn't touched here.
+#[expect(
+    clippy::unused_async,
+    reason = "public API; v1bectl_server awaits this, and that crate is outside this PR's lane"
+)]
 pub async fn load_virtual_devices_from_dir(
     dir: &Path,
 ) -> anyhow::Result<Vec<VirtualDeviceTomlConfig>> {
@@ -181,7 +189,7 @@ pub async fn load_virtual_devices_from_dir(
         let path = entry.path();
 
         if path.extension().and_then(|s| s.to_str()) == Some("toml") {
-            match load_virtual_device_from_file(&path).await {
+            match load_virtual_device_from_file(&path) {
                 Ok(config) => {
                     tracing::info!("✅ Loaded virtual device from {:?}", path);
                     configs.push(config);
@@ -197,7 +205,7 @@ pub async fn load_virtual_devices_from_dir(
     Ok(configs)
 }
 
-async fn load_virtual_device_from_file(path: &Path) -> anyhow::Result<VirtualDeviceTomlConfig> {
+fn load_virtual_device_from_file(path: &Path) -> anyhow::Result<VirtualDeviceTomlConfig> {
     let content = fs::read_to_string(path)?;
     let config: VirtualDeviceTomlConfig = toml::from_str(&content)?;
     Ok(config)

@@ -1,9 +1,13 @@
 // 🔥 BUTTON CONTROLLER - REACTS TO BUTTON EVENTS! 💖
 
-use crate::virtual_device::*;
+use crate::virtual_device::{
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+};
 use async_trait::async_trait;
 use std::sync::Arc;
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState, StateStore,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonCommand {
@@ -53,7 +57,7 @@ impl ButtonAction {
             .as_str()
             .ok_or_else(|| VirtualDeviceError::Config("Device ID must be string".to_string()))?;
         let command = ButtonCommand::from_str(cmd_str)
-            .ok_or_else(|| VirtualDeviceError::Config(format!("Unknown command: {}", cmd_str)))?;
+            .ok_or_else(|| VirtualDeviceError::Config(format!("Unknown command: {cmd_str}")))?;
         let amount = action
             .get(2)
             .and_then(serde_json::Value::as_u64)
@@ -67,6 +71,7 @@ impl ButtonAction {
     }
 
     /// The state this action moves a light at `light` to.
+    #[must_use]
     pub fn apply(&self, mut light: LightState) -> LightState {
         match self.command {
             ButtonCommand::Inc => {
@@ -207,6 +212,13 @@ impl ButtonController {
     // kept: constructor takes the full set of button actions and dependencies;
     // grouping them into a struct would change the public API.
     #[allow(clippy::too_many_arguments)]
+    // kept by value: callers outside this PR's lane (v1bectl_server) pass an
+    // owned Vec (some via `cfg.press_on.clone()`); v1bectl_server joins the
+    // ratchet separately, so its call sites aren't touched here.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "v1bectl_server passes owned Vecs here and is outside this PR's lane"
+    )]
     pub fn new(
         config: VirtualDeviceConfig,
         button_id: String,
@@ -300,6 +312,7 @@ impl VirtualDevice for ButtonController {
 mod tests {
     use super::*;
     use serde_json::{json, Value};
+    use v1bectl_sync::SwitchState;
 
     fn switch(is_pressed: bool, battery_level: u8) -> Value {
         serde_json::to_value(DeviceStateValue::Switch(SwitchState {
@@ -326,6 +339,10 @@ mod tests {
     /// release, in every shape `pressed` reads. Without an old value, only
     /// `is_pressed: true` counts (see [`transition`]).
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "flat table of (case, event, want) triples covering every event shape `pressed` reads; splitting it up would just scatter the table"
+    )]
     fn only_an_is_pressed_transition_is_a_press_or_a_release() {
         let switch_state = |is_pressed| {
             DeviceStateValue::Switch(SwitchState {
