@@ -12,7 +12,7 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::*;
-use v1bectl_sync::SyncConfig;
+use v1bectl_sync::{ConflictResolution, SyncConfig};
 
 // ---------------------------------------------------------------------
 // Worker intervals come from the config
@@ -83,6 +83,56 @@ async fn retry_worker_runs_on_retry_interval() {
         "first retry {retried:?} after the engine started, before the first \
          retry_interval ({retry_interval:?}) tick: the retry worker ignores it"
     );
+
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------
+// The pull cycle
+// ---------------------------------------------------------------------
+
+/// One device's error doesn't cost the other devices their pull.
+///
+/// With `ServerWins`, a pull that finds the hub disagreeing pushes the
+/// store's value back, and this hub fails every PATCH, so handling every
+/// device errors. A cycle that stopped at the first error would read the
+/// same first device (the store's iteration order doesn't change) and never
+/// get to the others.
+#[tokio::test]
+async fn a_device_error_does_not_end_the_pull_cycle() {
+    const IDS: [&str; 3] = ["a", "b", "c"];
+    let rig = Rig::new(
+        &IDS,
+        TestHub::new(OnSet::Fail, false),
+        Pulls::Periodic,
+        SyncConfig {
+            conflict_resolution: ConflictResolution::ServerWins,
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    // Someone switched every light on at the wall.
+    for id in IDS {
+        rig.hub.report(id, on());
+    }
+    let before = rig.hub.log();
+    rig.full_pull_cycle().await;
+    rig.full_pull_cycle().await;
+
+    let log = rig.hub.log();
+    for id in IDS {
+        assert!(
+            log.reads_of(id) > before.reads_of(id),
+            "{id} was never pulled again: another device's error ended the cycle \
+             (reads {:?})",
+            log.reads
+        );
+        assert!(
+            log.sets_for(id).len() > before.sets_for(id).len(),
+            "{id}: its conflict was never handled (no ServerWins push)"
+        );
+    }
 
     rig.shutdown().await;
 }

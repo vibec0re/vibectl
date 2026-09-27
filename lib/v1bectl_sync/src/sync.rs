@@ -1013,6 +1013,9 @@ impl SyncEngine {
         Ok(())
     }
 
+    /// One pull cycle: read every device in the store from the gateway and
+    /// reconcile it. A device that fails (its read, or handling what it
+    /// read) is logged and skipped; the rest of the cycle still runs.
     async fn pull_gateway_states(&self) -> anyhow::Result<()> {
         debug!("Pulling states from gateway");
 
@@ -1027,9 +1030,18 @@ impl SyncEngine {
                             "🔍 SYNC_DEBUG: Pull detected change for {} - handling",
                             device.device_id
                         );
-                        self.handle_gateway_state_change(&device.device_id, gateway_state)
-                            .await?;
-                        updated_count += 1;
+                        // ❌ One device's error must not cost the others
+                        // their pull: log it and go on to the next device.
+                        match self
+                            .handle_gateway_state_change(&device.device_id, gateway_state)
+                            .await
+                        {
+                            Ok(()) => updated_count += 1,
+                            Err(e) => warn!(
+                                "❌ Pull: handling the gateway state of {} failed: {}",
+                                device.device_id, e
+                            ),
+                        }
                     }
                 }
                 Err(e) => {
