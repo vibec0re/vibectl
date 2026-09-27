@@ -167,6 +167,48 @@ async fn periodic_pull_confirmation_clears_the_pending_entry() {
     rig.shutdown().await;
 }
 
+/// Every user write is protected, whatever its priority (#32). With
+/// `client_priority_boost: false` a write is queued `High`, not `Critical`,
+/// and used to get no pending confirmation at all: a pull before its push
+/// landed reverted it. The rest of the lifecycle is the same as with the
+/// boost: the hub confirms, and the next external change is taken.
+#[tokio::test]
+async fn writes_without_the_priority_boost_are_protected_too() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::OnDemand,
+        SyncConfig {
+            client_priority_boost: false,
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    rig.write("a", on()).await;
+    rig.hub
+        .wait("PATCH at the gate", |log| !log.sets_started.is_empty())
+        .await;
+    rig.pull("a").await;
+    assert_eq!(
+        rig.stored("a").await,
+        on(),
+        "a pull before the push landed reverted a write queued without the \
+         priority boost"
+    );
+
+    rig.hub.release(1);
+    rig.hub.wait("push", |log| log.sets_done >= 1).await;
+    rig.pull("a").await;
+    assert_eq!(rig.stored("a").await, on(), "after the hub confirmed");
+    let flipped = light(false, 40);
+    rig.hub.report("a", flipped.clone());
+    rig.pull("a").await;
+    assert_eq!(rig.stored("a").await, flipped, "external change after it");
+
+    rig.shutdown().await;
+}
+
 /// The window is bounded. With the hub still reporting the old value once
 /// it's up, GatewayWins reverts the write, whether the push went through
 /// (and the device never changed) or failed. The store isn't left

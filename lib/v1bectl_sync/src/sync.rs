@@ -47,11 +47,15 @@ pub struct SyncBufferEntry {
     pub state: DeviceStateValue,
     pub updated_at: Instant,
     pub priority: SyncPriority,
+    /// A user write: its protection window restarts when the push goes out.
+    pub protected: bool,
 }
 
 // 🔥 PENDING CONFIRMATION TRACKER - UI CHANGES ARE SACRED! 💖
-/// A user-initiated (`SyncPriority::Critical`) write that the hub hasn't
-/// confirmed yet. While it's inside its window, a pull that disagrees with
+/// A user write that the hub hasn't confirmed yet: one made through
+/// [`SyncEngine::apply_optimistic_update`] (whatever its priority), or a
+/// `SyncPriority::Critical` push queued with [`SyncEngine::queue_sync`].
+/// While it's inside its window, a pull that disagrees with
 /// `expected_state` is ignored instead of reverting the store.
 #[derive(Debug, Clone)]
 pub struct PendingConfirmation {
@@ -157,7 +161,15 @@ pub struct SyncConfig {
     pub conflict_resolution: ConflictResolution,
     // 🔥 NEW VIBEOPTIMIZATION SETTINGS!
     pub optimistic_updates: bool,
-    pub client_priority_boost: bool, // Prioritize client-initiated changes
+    /// Queue user writes ([`SyncEngine::apply_optimistic_update`]) as
+    /// `SyncPriority::Critical` instead of `High`.
+    ///
+    /// This doesn't change their protection: every user write gets a
+    /// protection window either way (#32). Nothing orders buffered pushes by
+    /// priority either (each drain sends every device's latest value), so
+    /// for now the flag only changes the priority recorded on the push and
+    /// on its retry.
+    pub client_priority_boost: bool,
     /// 🛡️ How long a user write is shielded from pulls that still report the
     /// old value. It starts at the write and restarts when the push goes out,
     /// so it covers both the wait in the sync buffer and the hub's round trip.
@@ -255,42 +267,30 @@ impl SyncEngine {
     }
 
     // Queue a sync task
+    /// Queue a sync task. A `PushToGateway` goes into the sync buffer, where
+    /// the latest value per device wins; anything else joins the task queue
+    /// by priority.
+    ///
+    /// A `Critical` push counts as a user write and gets a protection window
+    /// ([`SyncConfig::protection_window`]). User writes normally come in
+    /// through [`Self::apply_optimistic_update`], which protects them whatever
+    /// their priority.
     pub async fn queue_sync(&self, task: SyncTask) {
         debug!("Queuing sync task: {:?}", task);
-
-        // Update sync status
-        {
-            let mut status = self.sync_status.write().await;
-            status.insert(
-                task.device_id.clone(),
-                SyncStatus::PendingSync {
-                    queued_at: chrono::Utc::now().timestamp_millis() as u64,
-                },
-            );
-        }
+        self.mark_pending_sync(&task.device_id).await;
 
         // 🔥 USE SYNC BUFFER FOR PushToGateway - OVERWRITES CONSTANTLY! <3
         if let SyncTaskType::PushToGateway { new_state } = &task.task_type {
+            let protected = task.priority == SyncPriority::Critical;
             let mut buffer = self.sync_buffer.write().await;
-            // 🛡️ A user write is protected from the moment it's queued, not
-            // from when its push reaches the gateway (#23). Arming under the
-            // buffer lock means a drained value is never newer than what the
-            // pending confirmation expects.
-            if task.priority == SyncPriority::Critical {
-                self.arm_protection(&task.device_id, new_state).await;
-            }
-            buffer.insert(
-                task.device_id.clone(),
-                SyncBufferEntry {
-                    state: new_state.clone(),
-                    updated_at: Instant::now(),
-                    priority: task.priority.clone(),
-                },
-            );
-            debug!(
-                "💖 BUFFER UPDATED for {} - the next drain sends the latest value!",
-                task.device_id
-            );
+            self.buffer_push(
+                &mut buffer,
+                &task.device_id,
+                new_state,
+                task.priority.clone(),
+                protected,
+            )
+            .await;
         } else {
             // Non-push tasks go to regular queue
             let mut queue = self.sync_queue.write().await;
@@ -304,16 +304,68 @@ impl SyncEngine {
         }
     }
 
+    async fn mark_pending_sync(&self, device_id: &DeviceId) {
+        let mut status = self.sync_status.write().await;
+        status.insert(
+            device_id.clone(),
+            SyncStatus::PendingSync {
+                queued_at: chrono::Utc::now().timestamp_millis() as u64,
+            },
+        );
+    }
+
+    /// 💖 Put `state` in the sync buffer for `device_id`, replacing whatever
+    /// was waiting there. `buffer` is the held buffer lock.
+    ///
+    /// 🛡️ A `protected` write is shielded from the moment it's queued, not
+    /// from when its push reaches the gateway (#23). Arming under the buffer
+    /// lock means a drained value is never newer than what the pending
+    /// confirmation expects.
+    async fn buffer_push(
+        &self,
+        buffer: &mut HashMap<DeviceId, SyncBufferEntry>,
+        device_id: &DeviceId,
+        state: &DeviceStateValue,
+        priority: SyncPriority,
+        protected: bool,
+    ) {
+        if protected {
+            self.arm_protection(device_id, state).await;
+        }
+        buffer.insert(
+            device_id.clone(),
+            SyncBufferEntry {
+                state: state.clone(),
+                updated_at: Instant::now(),
+                priority,
+                protected,
+            },
+        );
+        debug!(
+            "💖 BUFFER UPDATED for {} - the next drain sends the latest value!",
+            device_id
+        );
+    }
+
     /// The configuration this engine runs with.
     pub fn config(&self) -> &SyncConfig {
         &self.config
     }
 
     // 🔥 OPTIMISTIC UPDATE - INSTANT UI FEEDBACK!
-    /// Queue `new_state` for the gateway. With `optimistic_updates` on, it
-    /// also goes into the store right away and is echoed on the event bus.
-    /// With it off, only the push is queued: the store and the echo follow
-    /// once a pull confirms the push.
+    /// A user write: queue `new_state` for the gateway. With
+    /// `optimistic_updates` on, it also goes into the store right away and is
+    /// echoed on the event bus. With it off, only the push is queued: the
+    /// store and the echo follow once a pull confirms the push.
+    ///
+    /// 🛡️ Every write through here gets a protection window
+    /// ([`SyncConfig::protection_window`]), whatever priority
+    /// `client_priority_boost` gives it (#32). This is the entry point for
+    /// user writes (the API server's handlers and the virtual manager's
+    /// member fan-out), and the path where the store runs ahead of the hub
+    /// until the push lands, which is what the window covers. Protection
+    /// used to follow the priority instead, so with the boost off (`High`)
+    /// a pull before the push landed reverted the write.
     pub async fn apply_optimistic_update(
         &self,
         device_id: &DeviceId,
@@ -326,12 +378,15 @@ impl SyncEngine {
 
         if !self.config.optimistic_updates {
             // Fall back to normal sync if optimistic updates disabled
-            self.queue_sync(SyncTask {
-                device_id: device_id.clone(),
-                task_type: SyncTaskType::PushToGateway { new_state },
-                created_at: Instant::now(),
-                priority: SyncPriority::Critical,
-            })
+            self.mark_pending_sync(device_id).await;
+            let mut buffer = self.sync_buffer.write().await;
+            self.buffer_push(
+                &mut buffer,
+                device_id,
+                &new_state,
+                SyncPriority::Critical,
+                true,
+            )
             .await;
             return Ok(());
         }
@@ -345,9 +400,7 @@ impl SyncEngine {
         // 0. 🛡️ ARM THE PROTECTION WINDOW FIRST (#23)! The store is about to
         // run ahead of the hub, and a pull that lands before the push goes
         // out must not take that for an external change and revert it.
-        if priority == SyncPriority::Critical {
-            self.arm_protection(device_id, &new_state).await;
-        }
+        self.arm_protection(device_id, &new_state).await;
 
         // 1. IMMEDIATELY update local state - NO WAITING!
         if let Err(e) = self
@@ -356,9 +409,7 @@ impl SyncEngine {
             .await
         {
             // Nothing was written, so there's nothing to protect.
-            if priority == SyncPriority::Critical {
-                self.pending_confirmations.write().await.remove(device_id);
-            }
+            self.pending_confirmations.write().await.remove(device_id);
             return Err(e.into());
         }
 
@@ -388,15 +439,13 @@ impl SyncEngine {
             );
         }
 
-        // 4. Queue gateway sync in background (with boost if enabled). For a
-        // Critical write this re-arms the window with the same value.
-        self.queue_sync(SyncTask {
-            device_id: device_id.clone(),
-            task_type: SyncTaskType::PushToGateway { new_state },
-            created_at: Instant::now(),
-            priority,
-        })
-        .await;
+        // 4. Queue gateway sync in background (with boost if enabled). This
+        // re-arms the window with the same value.
+        self.mark_pending_sync(device_id).await;
+        let mut buffer = self.sync_buffer.write().await;
+        self.buffer_push(&mut buffer, device_id, &new_state, priority, true)
+            .await;
+        drop(buffer);
 
         debug!("✅ Optimistic update applied - user sees change INSTANTLY!");
         Ok(())
@@ -532,7 +581,7 @@ impl SyncEngine {
             // It was armed when the write came in (#23). However long this
             // entry waited behind other devices' pushes, the hub still gets
             // the full window to confirm it.
-            if entry.priority == SyncPriority::Critical {
+            if entry.protected {
                 self.refresh_protection(&device_id, &entry.state).await;
             }
 
