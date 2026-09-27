@@ -1,2 +1,1 @@
-pub mod websocket_reconnect;
-pub mod websocket_simple; // 🔥 NEW RECONNECTING WEBSOCKET! CHOOOM FIX! 💖
+pub mod websocket_reconnect; // 🔥 THE RECONNECTING WEBSOCKET! CHOOOM FIX! 💖
