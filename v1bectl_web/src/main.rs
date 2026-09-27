@@ -1,7 +1,5 @@
 // 🔥 VIBEC0RE WEBUI - CYBER EDITION! 💖
 
-use yew::prelude::*;
-
 mod components;
 mod cyber_app;
 mod screen_renderer;

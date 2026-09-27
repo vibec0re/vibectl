@@ -143,10 +143,8 @@ pub enum ApiResponse {
     },
 }
 
-// Re-export types from v1bectl_state
-pub use v1bectl_state::{
-    Capability, DeviceInfo, DeviceState, DeviceStateValue, DeviceType, EventType,
-};
+// Re-export the v1bectl_state types the UI uses
+pub use v1bectl_state::{DeviceInfo, DeviceState, DeviceStateValue};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionStatus {

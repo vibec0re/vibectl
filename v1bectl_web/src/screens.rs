@@ -55,7 +55,7 @@ pub fn parse_screens(content: &str) -> Result<Vec<Screen>, String> {
     let mut screens = Vec::new();
     let mut chars = content.chars().peekable();
 
-    while let Some(c) = chars.peek() {
+    while chars.peek().is_some() {
         skip_whitespace_and_comments(&mut chars);
 
         if chars.peek().is_none() {

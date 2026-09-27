@@ -75,17 +75,13 @@ pub fn cyber_app() -> Html {
         let devices = devices.clone();
 
         use_effect_with(last_response, move |response| {
-            if let Some(resp) = response {
-                match resp {
-                    ApiResponse::DeviceList {
-                        devices: device_list,
-                        total_count,
-                    } => {
-                        log::info!("🔥 Got {} devices!", total_count);
-                        devices.set(device_list.clone());
-                    }
-                    _ => {}
-                }
+            if let Some(ApiResponse::DeviceList {
+                devices: device_list,
+                total_count,
+            }) = response
+            {
+                log::info!("🔥 Got {} devices!", total_count);
+                devices.set(device_list.clone());
             }
             || ()
         });
@@ -94,7 +90,6 @@ pub fn cyber_app() -> Html {
     // 🔥 HANDLE DEVICE EVENTS FOR REAL-TIME UPDATES! 💖
     {
         let last_event = ws.last_event.clone();
-        let devices = devices.clone();
         let send_request = ws.send_request.clone();
 
         use_effect_with(last_event, move |event| {
