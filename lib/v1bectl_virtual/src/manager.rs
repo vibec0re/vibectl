@@ -1,3 +1,4 @@
+use crate::button_controller::ButtonAction;
 use crate::virtual_device::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,11 +10,13 @@ use v1bectl_sync::*;
 ///
 /// A write to a virtual device ([`Self::set_virtual_device_state`]) fans out
 /// to its members. Input tracking ([`Self::start`]) re-derives a virtual
-/// device when one of its inputs changes from outside. Each of these runs
-/// start to finish under the `virtual_devices` lock: the device's new state,
-/// its members' commits, its store state and every echo. So they never
-/// interleave. A second write can't land between a first write's fan-out
-/// and its commits, and echoes go out in the order the store changed.
+/// device when one of its inputs changes from outside, and runs a button
+/// controller's action when its button is pressed ([`Self::handle_event`]).
+/// Each of these runs start to finish under the `virtual_devices` lock: the
+/// device's new state, its members' commits, its store state and every
+/// echo. So they never interleave. A second write can't land between a
+/// first write's fan-out and its commits, and echoes go out in the order the
+/// store changed.
 pub struct VirtualDeviceManager {
     /// All virtual devices indexed by device ID
     virtual_devices: Arc<RwLock<HashMap<DeviceId, Box<dyn VirtualDevice>>>>,
@@ -310,11 +313,22 @@ impl VirtualDeviceManager {
 
     /// Input tracking for one event from the bus. A device's `state` change
     /// (`AttributeChanged{attribute: "state"}`, the shape of every state
-    /// echo) goes to [`Self::handle_device_state_change`]; anything else is
-    /// ignored. [`Self::start`] runs this for every event on the bus. Call
-    /// it directly to drive tracking yourself instead (the tests do, to
-    /// control exactly when it catches up).
+    /// echo) goes to [`Self::handle_device_state_change`]. Then every
+    /// virtual device the event is an input of gets to react to it (see
+    /// [`VirtualDevice::reactions`]): a button controller runs its action
+    /// for a press. Anything else is ignored.
+    ///
+    /// [`Self::start`] runs this for every event on the bus. Call it
+    /// directly to drive tracking yourself instead (the tests do, to control
+    /// exactly when it catches up).
     pub async fn handle_event(&self, event: &DeviceEvent) -> Result<(), VirtualDeviceError> {
+        let tracked = self.track(event).await;
+        self.react_to(event).await;
+        tracked
+    }
+
+    /// The state-tracking half of [`Self::handle_event`].
+    async fn track(&self, event: &DeviceEvent) -> Result<(), VirtualDeviceError> {
         let EventType::AttributeChanged {
             attribute,
             new_value,
@@ -428,6 +442,95 @@ impl VirtualDeviceManager {
         Ok(())
     }
 
+    /// Make the writes the virtual devices that `event` is an input of ask
+    /// for (see [`VirtualDevice::reactions`]): a button controller's action
+    /// for a press. Each one is a write of its own (see
+    /// [`Self::run_action`]). A failed one is logged and doesn't stop the
+    /// others; the press has happened either way.
+    ///
+    /// Only the lookups happen under the locks. They're let go before any
+    /// action runs, since each one takes the `virtual_devices` lock itself.
+    async fn react_to(&self, event: &DeviceEvent) {
+        let virtual_device_ids = {
+            let input_map = self.input_mappings.read().await;
+            input_map.get(&event.device_id).cloned().unwrap_or_default()
+        };
+        if virtual_device_ids.is_empty() {
+            return;
+        }
+
+        let actions: Vec<(DeviceId, ButtonAction)> = {
+            let devices = self.virtual_devices.read().await;
+            virtual_device_ids
+                .iter()
+                .filter_map(|id| devices.get(id).map(|device| (id, device.reactions(event))))
+                .flat_map(|(id, actions)| actions.into_iter().map(move |a| (id.clone(), a)))
+                .collect()
+        };
+
+        for (virtual_id, action) in actions {
+            match self.run_action(&action).await {
+                Ok(()) => tracing::info!(
+                    "✅ {} executed {:?} on {}",
+                    virtual_id,
+                    action.command,
+                    action.target
+                ),
+                Err(e) => tracing::error!(
+                    "❌ {} failed to execute {:?} on {}: {}",
+                    virtual_id,
+                    action.command,
+                    action.target,
+                    e
+                ),
+            }
+        }
+    }
+
+    /// Make the write `action` asks for, starting from its target's state
+    /// at the time. The target must be a light. A virtual one (a light
+    /// group) is written the way [`Self::set_virtual_device_state`] writes
+    /// it: the group fans out to its members, and they're committed through
+    /// the sync engine and echoed. A physical one is written like a direct
+    /// write.
+    ///
+    /// This takes the `virtual_devices` lock and holds it to the end, so the
+    /// state the action starts from is still the target's when the write
+    /// lands (see the type's docs). So don't call it with that lock held.
+    async fn run_action(&self, action: &ButtonAction) -> Result<(), VirtualDeviceError> {
+        let target = &action.target;
+        let mut devices = self.virtual_devices.write().await;
+        let current = match devices.get(target) {
+            Some(device) => device.current_state(),
+            None => {
+                self.state_store
+                    .get_device(target)
+                    .await
+                    .ok_or_else(|| VirtualDeviceError::DeviceNotFound(target.clone()))?
+                    .state
+            }
+        };
+        let DeviceStateValue::Light(light) = &current else {
+            tracing::warn!(
+                "⚠️ A button action can only control lights, {} is {:?}",
+                target,
+                current
+            );
+            return Ok(());
+        };
+        let new_state = DeviceStateValue::Light(action.apply(light.clone()));
+
+        if devices.contains_key(target) {
+            return self.write_virtual(&mut devices, target, new_state).await;
+        }
+        self.state_store
+            .update_device_state(target, new_state.clone())
+            .await?;
+        self.commit_member_write(target, Some(&current), &new_state, false)
+            .await;
+        Ok(())
+    }
+
     /// Set virtual device state (called from API)
     ///
     /// Publishes a state echo for the virtual device and for every member
@@ -448,6 +551,17 @@ impl VirtualDeviceManager {
     ) -> Result<(), VirtualDeviceError> {
         // Held to the end (see the type's docs).
         let mut devices = self.virtual_devices.write().await;
+        self.write_virtual(&mut devices, device_id, new_state).await
+    }
+
+    /// [`Self::set_virtual_device_state`], for a caller that already holds
+    /// the `virtual_devices` lock: `devices` is what it guards.
+    async fn write_virtual(
+        &self,
+        devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        device_id: &DeviceId,
+        new_state: DeviceStateValue,
+    ) -> Result<(), VirtualDeviceError> {
         let Some(virtual_device) = devices.get(device_id) else {
             return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
         };
@@ -599,7 +713,10 @@ mod tests {
     //! feeds it the bus, so each test decides exactly when tracking catches
     //! up, and nothing waits on a clock.
     use super::*;
-    use crate::{DummyGateway, LightGroup, LightGroupLinear, SceneController, DEFAULT_GROUP_LEVEL};
+    use crate::{
+        ButtonController, DummyGateway, LightGroup, LightGroupLinear, SceneController,
+        DEFAULT_GROUP_LEVEL,
+    };
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
     use tokio::sync::watch;
@@ -747,6 +864,66 @@ mod tests {
             .set_virtual_device_state(&device_id.to_string(), DeviceStateValue::Light(state))
             .await
             .expect("plain on");
+    }
+
+    fn switch(is_pressed: bool) -> DeviceStateValue {
+        DeviceStateValue::Switch(SwitchState {
+            is_pressed,
+            last_pressed: None,
+            battery_level: Some(85),
+        })
+    }
+
+    /// A released switch `btn` in the store, and a button controller `ctrl`
+    /// bound to it that runs `press_on` on a press and `press_off` on a
+    /// release.
+    async fn add_controller(
+        manager: &VirtualDeviceManager,
+        store: &Arc<StateStore>,
+        bus: &Arc<EventBus>,
+        press_on: serde_json::Value,
+        press_off: serde_json::Value,
+    ) {
+        let info = DeviceInfo {
+            device_type: DeviceType::Switch,
+            capabilities: vec![Capability::OnOff],
+            ..light_info("btn")
+        };
+        store.add_device(info, switch(false)).await;
+        let config = VirtualDeviceConfig {
+            device_id: "ctrl".to_string(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: "ctrl".to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        let action = |value: serde_json::Value| value.as_array().cloned().expect("action");
+        let controller = ButtonController::new(
+            config,
+            "btn".to_string(),
+            action(press_on),
+            action(press_off),
+            None,
+            None,
+            store.clone(),
+            bus.clone(),
+        )
+        .expect("controller");
+        manager
+            .add_virtual_device(Box::new(controller))
+            .await
+            .expect("register");
+    }
+
+    /// `btn` pressed (or released), as the sync engine reports it when the
+    /// hub says so: stored, and echoed.
+    async fn press(store: &StateStore, bus: &EventBus, is_pressed: bool) {
+        let btn = "btn".to_string();
+        let old = stored(store, &btn).await;
+        let new = switch(is_pressed);
+        store.update_device_state(&btn, new.clone()).await.unwrap();
+        bus.publish(state_event(&btn, Some(&old), &new)).await;
     }
 
     /// Input tracking, caught up: hands the manager every event published so
@@ -1110,6 +1287,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #16: a button press on a controller that targets a group must go
+    /// through the group, the way an API write does: every member changes,
+    /// is queued for the gateway and echoed once, and so is the group. The
+    /// controller used to write the group's state straight into the store,
+    /// so no member moved and nothing was echoed.
+    #[tokio::test]
+    async fn button_press_goes_through_the_group_to_its_members() {
+        let (manager, store, bus) = started_group(Kind::Curves, [off(), off(), off()]).await;
+        let engine = Arc::new(SyncEngine::new(
+            store.clone(),
+            bus.clone(),
+            Arc::new(DummyGateway::new("basic_home")),
+            None,
+        ));
+        manager.attach_sync_engine(engine.clone());
+        let (press_on, press_off) = (
+            serde_json::json!(["on", "g"]),
+            serde_json::json!(["off", "g"]),
+        );
+        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        let mut rx = bus.subscribe();
+
+        press(&store, &bus, true).await;
+        let events = pump(&manager, &mut rx).await;
+        // Started with nothing on, so `on` lights them at the default level.
+        let on = light(true, DEFAULT_GROUP_LEVEL);
+        for id in ["a", "b", "c"] {
+            assert_eq!(stored(&store, id).await, on, "the press never reached {id}");
+            assert_eq!(echoes(&events, id), vec![on.clone()], "{id} echo");
+            let status = engine.get_sync_status(&id.to_string()).await;
+            assert!(
+                matches!(status, Some(SyncStatus::PendingSync { .. })),
+                "{id} never queued for the gateway: {status:?}"
+            );
+        }
+        assert_eq!(stored(&store, "g").await, on, "group after the press");
+        assert_eq!(echoes(&events, "g"), vec![on.clone()], "group echo");
+
+        press(&store, &bus, false).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            stored(&store, "g").await,
+            group_start(),
+            "group after the release"
+        );
+        for id in ["a", "b", "c"] {
+            assert_eq!(
+                stored(&store, id).await,
+                off(),
+                "the release never reached {id}"
+            );
+            assert_eq!(echoes(&events, id), vec![off()], "{id} echo");
+        }
+    }
+
+    /// A button action on a physical light is a direct write: the light
+    /// changes, is queued for the gateway, and is echoed once.
+    #[tokio::test]
+    async fn button_press_on_a_light_is_a_direct_write() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        store.add_device(light_info("a"), off()).await;
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let engine = Arc::new(SyncEngine::new(
+            store.clone(),
+            bus.clone(),
+            Arc::new(DummyGateway::new("basic_home")),
+            None,
+        ));
+        manager.attach_sync_engine(engine.clone());
+        let (press_on, press_off) = (
+            serde_json::json!(["set", "a", 30]),
+            serde_json::json!(["dec", "a", 10]),
+        );
+        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        let mut rx = bus.subscribe();
+
+        press(&store, &bus, true).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(stored(&store, "a").await, light(true, 30));
+        assert_eq!(echoes(&events, "a"), vec![light(true, 30)], "a echo");
+        let status = engine.get_sync_status(&"a".to_string()).await;
+        assert!(
+            matches!(status, Some(SyncStatus::PendingSync { .. })),
+            "a never queued for the gateway: {status:?}"
+        );
+
+        press(&store, &bus, false).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(stored(&store, "a").await, light(true, 20));
+        assert_eq!(echoes(&events, "a"), vec![light(true, 20)], "a echo");
+    }
+
+    /// The same press with tracking running on its own, as in the server:
+    /// the action takes the device lock that tracking has just let go of,
+    /// and must not deadlock the tracking task. It keeps going afterwards
+    /// too: the release gets through as well.
+    #[tokio::test]
+    async fn button_press_under_live_tracking_does_not_deadlock() {
+        let (manager, store, bus) = started_group(Kind::Curves, [off(), off(), off()]).await;
+        let (press_on, press_off) = (
+            serde_json::json!(["on", "g"]),
+            serde_json::json!(["off", "g"]),
+        );
+        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        manager.start().await.expect("start");
+        let mut rx = bus.subscribe();
+
+        for (is_pressed, want) in [
+            (true, light(true, DEFAULT_GROUP_LEVEL)),
+            (false, group_start()),
+        ] {
+            press(&store, &bus, is_pressed).await;
+            // The timeout only bounds a failure; the group's echo ends the wait.
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while let Some(event) = recv_lossy(&mut rx, "test").await {
+                    if echoes(&[event], "g") == vec![want.clone()] {
+                        return;
+                    }
+                }
+                panic!("event bus closed");
+            })
+            .await
+            .unwrap_or_else(|_| panic!("tracking stalled: no group echo for pressed={is_pressed}"));
+        }
+        assert_eq!(
+            stored(&store, "a").await,
+            off(),
+            "the release never reached a"
+        );
     }
 
     /// #15: input tracking must outlive falling behind the bus. Tracking is

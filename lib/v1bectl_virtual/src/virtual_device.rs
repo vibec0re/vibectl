@@ -1,3 +1,4 @@
+use crate::button_controller::ButtonAction;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -86,6 +87,21 @@ pub trait VirtualDevice: Send + Sync {
     fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
         let _ = (input, state);
         false
+    }
+
+    /// The writes this device asks for in reaction to `event`, an event of
+    /// one of its [`Self::input_devices`]: a button controller's action for
+    /// a press. Unlike [`Self::on_input_changed`], this sees the event
+    /// itself, not the input as the store holds it: a press is an event, and
+    /// by the time the manager gets to it the store may hold the release.
+    ///
+    /// The manager makes each write after it has tracked the event, the way
+    /// it makes an API write: through `set_virtual_device_state` for a
+    /// virtual target (fan-out, echoes, gateway), and like a direct write
+    /// for a physical one. The default asks for nothing.
+    fn reactions(&self, event: &DeviceEvent) -> Vec<ButtonAction> {
+        let _ = event;
+        Vec::new()
     }
 
     /// Get current virtual device state

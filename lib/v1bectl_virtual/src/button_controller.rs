@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use v1bectl_sync::*;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonCommand {
     Inc, // Increment brightness
     Dec, // Decrement brightness
@@ -27,27 +27,146 @@ impl ButtonCommand {
     }
 }
 
-/// Button Controller - listens to button events and controls devices
+/// One configured button action, `[command, target, amount]`: what a press
+/// does to `target`, a light or a light group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ButtonAction {
+    pub command: ButtonCommand,
+    pub target: DeviceId,
+    /// The `inc`/`dec` step (default 10), or the `set` level (default 50).
+    pub amount: Option<u8>,
+}
+
+impl ButtonAction {
+    /// Parse `[command, target]` or `[command, target, amount]`.
+    pub fn parse(action: &[serde_json::Value]) -> Result<Self, VirtualDeviceError> {
+        if action.len() < 2 {
+            return Err(VirtualDeviceError::Config(
+                "Invalid action format".to_string(),
+            ));
+        }
+
+        let cmd_str = action[0]
+            .as_str()
+            .ok_or_else(|| VirtualDeviceError::Config("Command must be string".to_string()))?;
+        let target = action[1]
+            .as_str()
+            .ok_or_else(|| VirtualDeviceError::Config("Device ID must be string".to_string()))?;
+        let command = ButtonCommand::from_str(cmd_str)
+            .ok_or_else(|| VirtualDeviceError::Config(format!("Unknown command: {}", cmd_str)))?;
+        let amount = action
+            .get(2)
+            .and_then(serde_json::Value::as_u64)
+            .map(|amount| u8::try_from(amount.min(100)).unwrap_or(100));
+
+        Ok(Self {
+            command,
+            target: target.to_string(),
+            amount,
+        })
+    }
+
+    /// The state this action moves a light at `light` to.
+    pub fn apply(&self, mut light: LightState) -> LightState {
+        match self.command {
+            ButtonCommand::Inc => {
+                let current = light.brightness.unwrap_or(0);
+                let step = self.amount.unwrap_or(10);
+                light.brightness = Some(current.saturating_add(step).min(100));
+                light.is_on = true;
+            }
+            ButtonCommand::Dec => {
+                let current = light.brightness.unwrap_or(100);
+                let new_brightness = current.saturating_sub(self.amount.unwrap_or(10));
+                light.brightness = Some(new_brightness);
+                if new_brightness == 0 {
+                    light.is_on = false;
+                }
+            }
+            ButtonCommand::Set => {
+                let brightness = self.amount.unwrap_or(50);
+                light.brightness = Some(brightness);
+                light.is_on = brightness > 0;
+            }
+            ButtonCommand::On => {
+                light.is_on = true;
+                if light.brightness.unwrap_or(0) == 0 {
+                    light.brightness = Some(100);
+                }
+            }
+            ButtonCommand::Off => {
+                light.is_on = false;
+            }
+        }
+        light
+    }
+}
+
+/// Whether `event` is a press (`Some(true)`) or a release (`Some(false)`),
+/// in any shape that carries one. The main one is a state echo of a switch
+/// (`AttributeChanged{attribute: "state"}`, as the sync engine publishes it
+/// when the hub reports the switch has changed). The others are the shapes
+/// the controller has always read: a bare state object with `is_pressed`,
+/// an `isOn`/`buttonState` flag, and a `StateChanged` switch state.
+fn pressed(event: &DeviceEvent) -> Option<bool> {
+    match &event.event_type {
+        EventType::AttributeChanged {
+            attribute,
+            new_value,
+            ..
+        } if attribute == "state" => {
+            match serde_json::from_value::<DeviceStateValue>(new_value.clone()) {
+                Ok(DeviceStateValue::Switch(switch)) => Some(switch.is_pressed),
+                _ => new_value
+                    .get("is_pressed")
+                    .and_then(serde_json::Value::as_bool),
+            }
+        }
+        EventType::AttributeChanged {
+            attribute,
+            new_value,
+            ..
+        } if attribute == "isOn" || attribute == "buttonState" => new_value.as_bool(),
+        EventType::StateChanged {
+            new_state: Some(DeviceStateValue::Switch(switch)),
+            ..
+        } => Some(switch.is_pressed),
+        _ => None,
+    }
+}
+
+/// Button Controller: runs an action when its button is pressed, and
+/// another when it's released.
+///
+/// It makes no writes of its own. Once it's registered, the
+/// [`VirtualDeviceManager`](crate::VirtualDeviceManager) hands it its
+/// button's events ([`VirtualDevice::reactions`]) and makes each write its
+/// actions ask for, the way it makes an API write (#16). So a press that
+/// targets a light group reaches the group's members and the hub, and is
+/// echoed. It used to write the group's state straight into the store,
+/// which reached neither.
 pub struct ButtonController {
     config: VirtualDeviceConfig,
     button_id: String, // Button device to listen to
-    press_on_action: Vec<serde_json::Value>,
-    press_off_action: Vec<serde_json::Value>,
+    press_on_action: Option<ButtonAction>,
+    press_off_action: Option<ButtonAction>,
     // kept: long-press actions are accepted and stored now; the long-press
     // detection path is not wired up yet, so these aren't read.
     #[allow(dead_code)]
     press_on_long_action: Option<Vec<serde_json::Value>>,
     #[allow(dead_code)]
     press_off_long_action: Option<Vec<serde_json::Value>>,
-    state_store: Arc<StateStore>,
-    // kept: retained handle to the event bus; the listener task is spawned with
-    // its own clone at construction, so this field isn't read afterwards.
-    #[allow(dead_code)]
-    event_bus: Arc<EventBus>,
-    event_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ButtonController {
+    /// A controller for `button_id` that runs `press_on` on a press and
+    /// `press_off` on a release. Each is `[command, target, amount]` (see
+    /// [`ButtonAction::parse`]); an empty one does nothing, and a malformed
+    /// one fails here.
+    ///
+    /// `state_store` and `event_bus` aren't used any more (the manager
+    /// delivers the events and makes the writes). They stay so callers
+    /// don't have to change.
     // kept: constructor takes the full set of button actions and dependencies;
     // grouping them into a struct would change the public API.
     #[allow(clippy::too_many_arguments)]
@@ -58,223 +177,25 @@ impl ButtonController {
         press_off: Vec<serde_json::Value>,
         press_on_long: Option<Vec<serde_json::Value>>,
         press_off_long: Option<Vec<serde_json::Value>>,
-        state_store: Arc<StateStore>,
-        event_bus: Arc<EventBus>,
+        _state_store: Arc<StateStore>,
+        _event_bus: Arc<EventBus>,
     ) -> Result<Self, VirtualDeviceError> {
-        let mut controller = Self {
-            config,
-            button_id,
-            press_on_action: press_on,
-            press_off_action: press_off,
-            press_on_long_action: press_on_long,
-            press_off_long_action: press_off_long,
-            state_store,
-            event_bus: event_bus.clone(),
-            event_handle: None,
+        let parse = |action: &[serde_json::Value]| {
+            if action.is_empty() {
+                Ok(None)
+            } else {
+                ButtonAction::parse(action).map(Some)
+            }
         };
 
-        // Start event listener
-        controller.start_event_listener(event_bus);
-
-        Ok(controller)
-    }
-
-    fn start_event_listener(&mut self, event_bus: Arc<EventBus>) {
-        let button_id = self.button_id.clone();
-        let state_store = self.state_store.clone();
-        let press_on = self.press_on_action.clone();
-        let press_off = self.press_off_action.clone();
-
-        // 🔥 SPAWN EVENT LISTENER TASK! 💖
-        let handle = tokio::spawn(async move {
-            let mut event_rx = event_bus.subscribe();
-            tracing::info!(
-                "🎮 ButtonController listening for button {} events!",
-                button_id
-            );
-
-            // A lagged (skipped) button event is simply lost rather than resynced:
-            // there's no periodic re-read here, just the next live button press.
-            while let Some(event) = recv_lossy(&mut event_rx, "ButtonController").await {
-                // Check if event is for our button
-                if event.device_id == button_id {
-                    match &event.event_type {
-                        EventType::AttributeChanged {
-                            attribute,
-                            old_value: _,
-                            new_value,
-                        } => {
-                            if attribute == "state" {
-                                // The sync engine publishes state changes with attribute "state" containing the full state
-                                if let Some(state_obj) = new_value.as_object() {
-                                    if let Some(is_pressed) =
-                                        state_obj.get("is_pressed").and_then(|v| v.as_bool())
-                                    {
-                                        tracing::debug!(
-                                            "🔘 Button {} pressed: {} (from AttributeChanged)",
-                                            button_id,
-                                            is_pressed
-                                        );
-
-                                        let action =
-                                            if is_pressed { &press_on } else { &press_off };
-
-                                        if let Err(e) =
-                                            Self::execute_action(action, &state_store).await
-                                        {
-                                            tracing::error!(
-                                                "❌ Failed to execute button action: {}",
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            } else if attribute == "isOn" || attribute == "buttonState" {
-                                tracing::debug!(
-                                    "🔘 Button {} event: {} -> {:?}",
-                                    button_id,
-                                    attribute,
-                                    new_value
-                                );
-
-                                // Determine action based on state change
-                                let action = if let Some(bool_val) = new_value.as_bool() {
-                                    if bool_val {
-                                        &press_on
-                                    } else {
-                                        &press_off
-                                    }
-                                } else {
-                                    continue;
-                                };
-
-                                // Execute action
-                                if let Err(e) = Self::execute_action(action, &state_store).await {
-                                    tracing::error!("❌ Failed to execute button action: {}", e);
-                                }
-                            }
-                        }
-                        EventType::StateChanged {
-                            new_state: Some(DeviceStateValue::Switch(switch_state)),
-                            ..
-                        } => {
-                            tracing::debug!(
-                                "🔘 Button {} pressed: {}",
-                                button_id,
-                                switch_state.is_pressed
-                            );
-
-                            let action = if switch_state.is_pressed {
-                                &press_on
-                            } else {
-                                &press_off
-                            };
-
-                            if let Err(e) = Self::execute_action(action, &state_store).await {
-                                tracing::error!("❌ Failed to execute button action: {}", e);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-
-            tracing::warn!("⚠️ ButtonController event listener ended for {}", button_id);
-        });
-
-        self.event_handle = Some(handle);
-    }
-
-    async fn execute_action(
-        action: &[serde_json::Value],
-        state_store: &Arc<StateStore>,
-    ) -> Result<(), VirtualDeviceError> {
-        if action.len() < 2 {
-            return Err(VirtualDeviceError::Config(
-                "Invalid action format".to_string(),
-            ));
-        }
-
-        let cmd_str = action[0]
-            .as_str()
-            .ok_or_else(|| VirtualDeviceError::Config("Command must be string".to_string()))?;
-        let device_id = action[1]
-            .as_str()
-            .ok_or_else(|| VirtualDeviceError::Config("Device ID must be string".to_string()))?;
-
-        let cmd = ButtonCommand::from_str(cmd_str)
-            .ok_or_else(|| VirtualDeviceError::Config(format!("Unknown command: {}", cmd_str)))?;
-
-        // Get current device state
-        let device_state = state_store
-            .get_device(&device_id.to_string())
-            .await
-            .ok_or_else(|| VirtualDeviceError::DeviceNotFound(device_id.to_string()))?;
-
-        match device_state.state {
-            DeviceStateValue::Light(mut light_state) => {
-                match cmd {
-                    ButtonCommand::Inc => {
-                        // Increment brightness by value (default 10)
-                        let increment = action.get(2).and_then(|v| v.as_u64()).unwrap_or(10) as u8;
-                        let current = light_state.brightness.unwrap_or(0);
-                        light_state.brightness = Some((current + increment).min(100));
-                        light_state.is_on = true;
-                    }
-                    ButtonCommand::Dec => {
-                        // Decrement brightness by value (default 10)
-                        let decrement = action.get(2).and_then(|v| v.as_u64()).unwrap_or(10) as u8;
-                        let current = light_state.brightness.unwrap_or(100);
-                        let new_brightness = current.saturating_sub(decrement);
-                        light_state.brightness = Some(new_brightness);
-                        if new_brightness == 0 {
-                            light_state.is_on = false;
-                        }
-                    }
-                    ButtonCommand::Set => {
-                        // Set specific brightness
-                        let brightness = action.get(2).and_then(|v| v.as_u64()).unwrap_or(50) as u8;
-                        light_state.brightness = Some(brightness);
-                        light_state.is_on = brightness > 0;
-                    }
-                    ButtonCommand::On => {
-                        light_state.is_on = true;
-                        if light_state.brightness.unwrap_or(0) == 0 {
-                            light_state.brightness = Some(100);
-                        }
-                    }
-                    ButtonCommand::Off => {
-                        light_state.is_on = false;
-                    }
-                }
-
-                // Update device state
-                state_store
-                    .update_device_state(
-                        &device_id.to_string(),
-                        DeviceStateValue::Light(light_state),
-                    )
-                    .await?;
-                tracing::info!("✅ ButtonController executed {:?} on {}", cmd, device_id);
-            }
-            _ => {
-                tracing::warn!(
-                    "⚠️ ButtonController can only control lights, got {:?}",
-                    device_state.state
-                );
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl Drop for ButtonController {
-    fn drop(&mut self) {
-        // Cancel event listener when dropped
-        if let Some(handle) = self.event_handle.take() {
-            handle.abort();
-        }
+        Ok(Self {
+            config,
+            button_id,
+            press_on_action: parse(&press_on)?,
+            press_off_action: parse(&press_off)?,
+            press_on_long_action: press_on_long,
+            press_off_long_action: press_off_long,
+        })
     }
 }
 
@@ -297,13 +218,21 @@ impl VirtualDevice for ButtonController {
         Ok(())
     }
 
-    async fn on_input_changed(
-        &mut self,
-        _device_id: &DeviceId,
-        _new_state: &DeviceState,
-    ) -> Result<(), VirtualDeviceError> {
-        // Handled by event listener
-        Ok(())
+    fn reactions(&self, event: &DeviceEvent) -> Vec<ButtonAction> {
+        if event.device_id != self.button_id {
+            return Vec::new();
+        }
+        let Some(is_pressed) = pressed(event) else {
+            return Vec::new();
+        };
+        tracing::debug!("🔘 Button {} pressed: {}", self.button_id, is_pressed);
+
+        let action = if is_pressed {
+            &self.press_on_action
+        } else {
+            &self.press_off_action
+        };
+        action.iter().cloned().collect()
     }
 
     fn current_state(&self) -> DeviceStateValue {
@@ -316,23 +245,16 @@ impl VirtualDevice for ButtonController {
     }
 
     fn output_devices(&self) -> Vec<DeviceId> {
-        // Extract device IDs from actions
+        // The targets of its actions
         let mut devices = Vec::new();
-
-        if self.press_on_action.len() > 1 {
-            if let Some(device_id) = self.press_on_action[1].as_str() {
-                devices.push(device_id.to_string());
+        for action in [&self.press_on_action, &self.press_off_action]
+            .into_iter()
+            .flatten()
+        {
+            if !devices.contains(&action.target) {
+                devices.push(action.target.clone());
             }
         }
-
-        if self.press_off_action.len() > 1 {
-            if let Some(device_id) = self.press_off_action[1].as_str() {
-                if !devices.contains(&device_id.to_string()) {
-                    devices.push(device_id.to_string());
-                }
-            }
-        }
-
         devices
     }
 }
