@@ -51,6 +51,46 @@ struct Config {
     socket: String,
 }
 
+/// What an attempt dials when no config has loaded yet this session.
+const DEFAULT_SOCKET_URL: &str = "ws://localhost:31337";
+
+/// The socket URL for each attempt. An attempt whose config fetch fails (a
+/// flaky phone network, a web server restarting next to the API server)
+/// reuses the last URL a config fetch returned this session. It only falls
+/// back to `DEFAULT_SOCKET_URL` if no config has ever loaded (#9). Pure, so
+/// it's unit-tested natively.
+#[derive(Debug, Default)]
+struct SocketUrl {
+    last_good: Option<String>,
+}
+
+impl SocketUrl {
+    /// The URL for an attempt whose config fetch returned `loaded` (`None`:
+    /// it failed or timed out).
+    fn resolve(&mut self, loaded: Option<String>) -> String {
+        if let Some(url) = loaded {
+            self.last_good = Some(url.clone());
+            return url;
+        }
+        match &self.last_good {
+            Some(url) => {
+                log::warn!(
+                    "⚠️ Failed to load config, reusing the last good URL {}",
+                    url
+                );
+                url.clone()
+            }
+            None => {
+                log::warn!(
+                    "⚠️ Failed to load config (none loaded yet), using default {}",
+                    DEFAULT_SOCKET_URL
+                );
+                DEFAULT_SOCKET_URL.to_string()
+            }
+        }
+    }
+}
+
 // Load config from static file
 async fn load_config() -> Option<String> {
     match Request::get("/static/config.json").send().await {
@@ -460,6 +500,8 @@ struct WsState {
     /// Dropping this tells the current attempt's task to close its socket and
     /// exit without reconnecting.
     closer: Option<oneshot::Sender<()>>,
+    /// Where the attempts connect to; outlives every attempt.
+    socket_url: SocketUrl,
 }
 
 impl WsState {
@@ -468,6 +510,7 @@ impl WsState {
             lifecycle: Lifecycle::new(),
             sender: None,
             closer: None,
+            socket_url: SocketUrl::default(),
         }
     }
 
@@ -673,17 +716,18 @@ async fn race_attempt<T>(fut: impl Future<Output = T>, closer: &mut Closer) -> R
 /// until it dies or is superseded. The task owns the socket and its timers,
 /// so they all go away together.
 async fn run_connection(ctx: Ctx, generation: u64, mut closer: Closer) {
-    let ws_url = match race_attempt(load_config(), &mut closer).await {
+    let loaded = match race_attempt(load_config(), &mut closer).await {
         Race::Superseded => return,
-        Race::Done(Some(url)) => url,
-        Race::Done(None) | Race::TimedOut => {
-            log::warn!("⚠️ Failed to load config, using default ws://localhost:31337");
-            "ws://localhost:31337".to_string()
-        }
+        Race::Done(loaded) => loaded,
+        Race::TimedOut => None,
     };
-    if !ctx.is_current(generation) {
-        return;
-    }
+    let ws_url = {
+        let mut state = ctx.state.borrow_mut();
+        if !state.lifecycle.is_current(generation) {
+            return;
+        }
+        state.socket_url.resolve(loaded)
+    };
 
     log::info!("🚀 Connecting to: {}", ws_url);
     let mut ws = match WebSocket::open(&ws_url) {
@@ -1511,6 +1555,25 @@ mod tests {
         drop(closer_tx);
         let all = race(ready(7), ready(()), &mut closer).now_or_never();
         assert!(matches!(all, Some(Race::Superseded)));
+    }
+
+    #[test]
+    fn a_failed_config_fetch_reuses_the_last_good_url() {
+        // #9: a reconnect whose config fetch failed used to dial
+        // ws://localhost:31337, which is wrong for any page not served from
+        // the server's own host (a phone on the LAN).
+        let mut url = SocketUrl::default();
+        // Nothing has loaded yet: the default is all there is.
+        assert_eq!(url.resolve(None), DEFAULT_SOCKET_URL);
+        let hub = "ws://192.168.1.20:31337";
+        assert_eq!(url.resolve(Some(hub.to_string())), hub);
+        // Failed or timed-out fetches keep dialing the last good URL.
+        assert_eq!(url.resolve(None), hub);
+        assert_eq!(url.resolve(None), hub);
+        // A newer config replaces it.
+        let moved = "wss://nest.example:8443/ws";
+        assert_eq!(url.resolve(Some(moved.to_string())), moved);
+        assert_eq!(url.resolve(None), moved);
     }
 
     #[test]
