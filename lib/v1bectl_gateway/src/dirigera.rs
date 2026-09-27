@@ -880,6 +880,11 @@ type DirigeraWsStream =
 /// `Sec-WebSocket-Key` plus the `Host` / `Upgrade` / `Connection` /
 /// `Sec-WebSocket-Version` headers that tungstenite's handshake insists on.
 ///
+/// It offers **no** `Sec-WebSocket-Protocol`. The public Dirigera clients
+/// (`Leggin/dirigera`, `lpgera/dirigera`) connect with just the bearer token,
+/// and tungstenite fails the handshake outright (`SubProtocol error: Server
+/// sent no subprotocol`) when it offered one the server doesn't echo back.
+///
 /// Validated once up front, so a malformed host or token makes
 /// `event_stream` fail instead of retrying in the background forever.
 fn dirigera_ws_request(
@@ -890,8 +895,7 @@ fn dirigera_ws_request(
         .parse()
         .map_err(|e| GatewayError::InternalError(format!("Failed to build WS request: {e}")))?;
     let request = ClientRequestBuilder::new(uri)
-        .with_header("Authorization", format!("Bearer {access_token}"))
-        .with_sub_protocol("v1.user");
+        .with_header("Authorization", format!("Bearer {access_token}"));
     request
         .clone()
         .into_client_request()
@@ -1254,34 +1258,26 @@ mod event_stream_tests {
         Ok(())
     }
 
-    /// Accept only what the hub accepts: our bearer token and the `v1.user`
-    /// subprotocol, which a compliant server must echo back.
+    /// Accept only what the hub accepts: our bearer token. Like the hub as
+    /// the public clients see it, the `101` reply carries no
+    /// `Sec-WebSocket-Protocol`, whatever the client offered.
     #[expect(
         clippy::result_large_err,
         reason = "signature fixed by tungstenite's server handshake `Callback`"
     )]
     fn check_dirigera_handshake(
         request: &Request,
-        mut response: Response,
+        response: Response,
     ) -> Result<Response, ErrorResponse> {
-        let header = |name: &str| {
-            request
-                .headers()
-                .get(name)
-                .and_then(|v: &HeaderValue| v.to_str().ok())
-        };
-        let expected_auth = format!("Bearer {TEST_TOKEN}");
-        if header("Authorization") != Some(expected_auth.as_str())
-            || header("Sec-WebSocket-Protocol") != Some("v1.user")
-        {
-            let mut reject = ErrorResponse::new(Some("bad token or subprotocol".into()));
+        let auth = request
+            .headers()
+            .get("Authorization")
+            .and_then(|v: &HeaderValue| v.to_str().ok());
+        if auth != Some(format!("Bearer {TEST_TOKEN}").as_str()) {
+            let mut reject = ErrorResponse::new(Some("bad token".into()));
             *reject.status_mut() = StatusCode::UNAUTHORIZED;
             return Err(reject);
         }
-        response.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_static("v1.user"),
-        );
         Ok(response)
     }
 
@@ -1360,6 +1356,50 @@ mod event_stream_tests {
                 new_value: state_data("light_1", 42),
             }
         );
+    }
+
+    // The hub replies `101` without `Sec-WebSocket-Protocol`. Had the client
+    // offered one (it used to offer `v1.user`), tungstenite would fail every
+    // handshake with "SubProtocol error: Server sent no subprotocol".
+    #[tokio::test]
+    async fn event_stream_connects_to_a_hub_that_sends_no_subprotocol() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![state_changed_frame(
+                "light_1", 42,
+            )])],
+        );
+
+        let request = dirigera_ws_request(&hub.url(), TEST_TOKEN).expect("WS request");
+        let connector = dirigera_ws_connector().expect("TLS connector");
+        let result = connect_dirigera_ws(&request, &connector, FAST.connect_timeout).await;
+        if let Err(e) = result {
+            panic!(
+                "handshake with a hub that sends no subprotocol failed: {e}; hub saw: {:?}",
+                hub.errors()
+            );
+        }
+
+        let offered = request.into_client_request().expect("WS request");
+        assert_eq!(
+            offered.headers().get("Sec-WebSocket-Protocol"),
+            None,
+            "don't offer a subprotocol the hub may not echo"
+        );
+    }
+
+    // The fake hub really checks the token, so the tests above prove we send it.
+    #[tokio::test]
+    async fn fake_hub_rejects_a_wrong_token() {
+        let hub = spawn_fake_hub(bind_localhost(), vec![Session::SendThenHold(vec![])]);
+
+        let request = dirigera_ws_request(&hub.url(), "wrong-token").expect("WS request");
+        let connector = dirigera_ws_connector().expect("TLS connector");
+        let result = connect_dirigera_ws(&request, &connector, FAST.connect_timeout).await;
+        let Err(e) = result else {
+            panic!("the fake hub accepted a wrong token");
+        };
+        assert!(e.to_string().contains("401"), "{e}");
     }
 
     // (b) The hub closes the stream; the listener reconnects for the next frame.
