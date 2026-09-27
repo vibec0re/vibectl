@@ -845,17 +845,19 @@ impl ReconnectPolicy {
         connect_timeout: Duration::from_secs(10),
     };
 
-    /// The delay to use after waiting `delay` once more without success.
-    fn next_delay(self, delay: Duration) -> Duration {
-        delay.saturating_mul(2).min(self.max_delay)
-    }
-
-    /// The delay to carry on with after a connection that was up for `uptime`.
-    fn delay_after_session(self, delay: Duration, uptime: Duration) -> Duration {
-        if uptime >= self.stable_after {
-            self.base_delay
-        } else {
-            delay
+    /// How long to wait before the next connect attempt. 🔁
+    ///
+    /// `prev` is the wait before the attempt that just ended (`None` if it was
+    /// the first); `connected_for` is how long that attempt's connection
+    /// stayed up (`None` if it never connected). A connection that lasted at
+    /// least `stable_after` resets the wait to `base_delay`. Anything else, a
+    /// failed connect or a short-lived connection, doubles `prev`, capped at
+    /// `max_delay`.
+    fn after_attempt(self, prev: Option<Duration>, connected_for: Option<Duration>) -> Duration {
+        let stable = connected_for.is_some_and(|uptime| uptime >= self.stable_after);
+        match prev {
+            Some(prev) if !stable => prev.saturating_mul(2).min(self.max_delay),
+            _ => self.base_delay,
         }
     }
 }
@@ -952,7 +954,7 @@ async fn run_dirigera_ws(
     policy: ReconnectPolicy,
     event_sender: broadcast::Sender<DeviceEvent>,
 ) {
-    let mut delay = policy.base_delay;
+    let mut prev_delay = None;
 
     loop {
         if event_sender.receiver_count() == 0 {
@@ -961,7 +963,9 @@ async fn run_dirigera_ws(
         }
 
         info!("🚀 Connecting to Dirigera WebSocket at: {ws_url}");
-        match connect_dirigera_ws(&request, &connector, policy.connect_timeout).await {
+        let connected_for = match connect_dirigera_ws(&request, &connector, policy.connect_timeout)
+            .await
+        {
             Ok(ws_stream) => {
                 info!("✅ WebSocket connected to Dirigera hub!");
                 let connected_at = Instant::now();
@@ -974,15 +978,18 @@ async fn run_dirigera_ws(
                         return;
                     }
                 }
-
-                delay = policy.delay_after_session(delay, connected_at.elapsed());
+                Some(connected_at.elapsed())
             }
-            Err(e) => error!("❌ Failed to connect WebSocket: {e}"),
-        }
+            Err(e) => {
+                error!("❌ Failed to connect WebSocket: {e}");
+                None
+            }
+        };
 
+        let delay = policy.after_attempt(prev_delay, connected_for);
         info!("⏰ Retrying Dirigera WebSocket in {delay:?}");
         tokio::time::sleep(delay).await;
-        delay = policy.next_delay(delay);
+        prev_delay = Some(delay);
     }
 }
 
@@ -1464,30 +1471,57 @@ mod event_stream_tests {
         assert_eq!(hub.served.load(Ordering::SeqCst), 1, "must not reconnect");
     }
 
-    #[test]
-    fn reconnect_backoff_doubles_from_1s_to_a_60s_cap() {
+    /// A connect attempt that never got through (`connected_for: None`).
+    const FAILED: Option<Duration> = None;
+
+    /// The waits, in whole seconds, that `ReconnectPolicy::DIRIGERA` puts
+    /// after each attempt in `attempts`, fed back in as the loop does.
+    fn dirigera_waits(attempts: &[Option<Duration>]) -> Vec<u64> {
         let policy = ReconnectPolicy::DIRIGERA;
-        let mut delay = policy.base_delay;
-        let mut seen = Vec::new();
-        for _ in 0..8 {
-            seen.push(delay.as_secs());
-            delay = policy.next_delay(delay);
-        }
-        assert_eq!(seen, [1, 2, 4, 8, 16, 32, 60, 60]);
+        let mut prev = None;
+        attempts
+            .iter()
+            .map(|&connected_for| {
+                let wait = policy.after_attempt(prev, connected_for);
+                prev = Some(wait);
+                wait.as_secs()
+            })
+            .collect()
     }
 
     #[test]
-    fn reconnect_backoff_resets_only_after_a_stable_connection() {
-        let policy = ReconnectPolicy::DIRIGERA;
-        let backed_off = Duration::from_secs(32);
+    fn reconnect_backoff_doubles_from_1s_to_a_60s_cap() {
+        assert_eq!(dirigera_waits(&[FAILED; 8]), [1, 2, 4, 8, 16, 32, 60, 60]);
+    }
+
+    #[test]
+    fn reconnect_backoff_resets_after_a_stable_connection() {
+        let stable = ReconnectPolicy::DIRIGERA.stable_after; // the threshold itself counts
+        let long = Some(Duration::from_mins(5));
         assert_eq!(
-            policy.delay_after_session(backed_off, Duration::from_secs(5)),
-            backed_off
+            dirigera_waits(&[FAILED, FAILED, FAILED, Some(stable), FAILED, FAILED]),
+            [1, 2, 4, 1, 2, 4]
         );
+        // From the cap, too.
+        let mut attempts = vec![FAILED; 8];
+        attempts.extend([long, FAILED]);
         assert_eq!(
-            policy.delay_after_session(backed_off, Duration::from_secs(30)),
-            policy.base_delay
+            dirigera_waits(&attempts),
+            [1, 2, 4, 8, 16, 32, 60, 60, 1, 2]
         );
+    }
+
+    #[test]
+    fn reconnect_backoff_keeps_doubling_after_a_short_lived_connection() {
+        let stable = ReconnectPolicy::DIRIGERA.stable_after;
+        let short = Some(Duration::from_secs(5));
+        let almost = Some(stable.saturating_sub(Duration::from_millis(1)));
+        assert_eq!(
+            dirigera_waits(&[FAILED, FAILED, short, almost, short, FAILED]),
+            [1, 2, 4, 8, 16, 32]
+        );
+        // A short-lived first connection starts at the base delay, like a failure.
+        assert_eq!(dirigera_waits(&[short, short]), [1, 2]);
     }
 }
 
