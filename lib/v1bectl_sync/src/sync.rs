@@ -51,12 +51,19 @@ pub struct SyncBufferEntry {
 }
 
 // 🔥 PENDING CONFIRMATION TRACKER - UI CHANGES ARE SACRED! 💖
+/// A user-initiated (`SyncPriority::Critical`) write that the hub hasn't
+/// confirmed yet. While it's inside its window, a pull that disagrees with
+/// `expected_state` is ignored instead of reverting the store.
 #[derive(Debug, Clone)]
 pub struct PendingConfirmation {
     pub device_id: DeviceId,
+    /// The latest value written. Every write re-arms the entry with its own.
     pub expected_state: DeviceStateValue,
+    /// When the window last (re)started: at the write, and again when its
+    /// push goes out to the gateway.
     pub sent_at: Instant,
-    pub protection_window: Duration, // 5s default - UI changes are PROTECTED!
+    /// `SyncConfig::protection_window` - UI changes are PROTECTED!
+    pub protection_window: Duration,
 }
 
 #[derive(Clone)]
@@ -144,6 +151,10 @@ pub struct SyncConfig {
     pub optimistic_updates: bool,
     pub gateway_rate_limit: u32,     // Max requests per second to gateway
     pub client_priority_boost: bool, // Prioritize client-initiated changes
+    /// 🛡️ How long a user write is shielded from pulls that still report the
+    /// old value. It starts at the write and restarts when the push goes out,
+    /// so it covers both the wait in the sync buffer and the hub's round trip.
+    pub protection_window: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +179,7 @@ impl Default for SyncConfig {
             optimistic_updates: true,    // INSTANT UI FEEDBACK!
             gateway_rate_limit: 10,      // 🔥 10 req/s - FAST but still safe!
             client_priority_boost: true, // TUI FEELS INSTANT!
+            protection_window: Duration::from_secs(5), // 🛡️ UI changes are PROTECTED!
         }
     }
 }
@@ -256,6 +268,13 @@ impl SyncEngine {
         // 🔥 USE SYNC BUFFER FOR PushToGateway - OVERWRITES CONSTANTLY! <3
         if let SyncTaskType::PushToGateway { new_state } = &task.task_type {
             let mut buffer = self.sync_buffer.write().await;
+            // 🛡️ A user write is protected from the moment it's queued, not
+            // from when its push reaches the gateway (#23). Arming under the
+            // buffer lock means a drained value is never newer than what the
+            // pending confirmation expects.
+            if task.priority == SyncPriority::Critical {
+                self.arm_protection(&task.device_id, new_state).await;
+            }
             buffer.insert(
                 task.device_id.clone(),
                 SyncBufferEntry {
@@ -313,10 +332,31 @@ impl SyncEngine {
             return Ok(());
         }
 
+        let priority = if self.config.client_priority_boost {
+            SyncPriority::Critical // 🔥 CLIENT CHANGES GET PRIORITY!
+        } else {
+            SyncPriority::High
+        };
+
+        // 0. 🛡️ ARM THE PROTECTION WINDOW FIRST (#23)! The store is about to
+        // run ahead of the hub, and a pull that lands before the push goes
+        // out must not take that for an external change and revert it.
+        if priority == SyncPriority::Critical {
+            self.arm_protection(device_id, &new_state).await;
+        }
+
         // 1. IMMEDIATELY update local state - NO WAITING!
-        self.store
+        if let Err(e) = self
+            .store
             .update_device_state(device_id, new_state.clone())
-            .await?;
+            .await
+        {
+            // Nothing was written, so there's nothing to protect.
+            if priority == SyncPriority::Critical {
+                self.pending_confirmations.write().await.remove(device_id);
+            }
+            return Err(e.into());
+        }
 
         // 2. Broadcast event IMMEDIATELY - UI updates NOW!
         self.event_bus
@@ -344,13 +384,8 @@ impl SyncEngine {
             );
         }
 
-        // 4. Queue gateway sync in background (with boost if enabled)
-        let priority = if self.config.client_priority_boost {
-            SyncPriority::Critical // 🔥 CLIENT CHANGES GET PRIORITY!
-        } else {
-            SyncPriority::High
-        };
-
+        // 4. Queue gateway sync in background (with boost if enabled). For a
+        // Critical write this re-arms the window with the same value.
         self.queue_sync(SyncTask {
             device_id: device_id.clone(),
             task_type: SyncTaskType::PushToGateway { new_state },
@@ -485,27 +520,24 @@ impl SyncEngine {
                 priority: entry.priority.clone(), // Clone to fix move error
             };
 
-            // 🔥 ADD PENDING CONFIRMATION - UI CHANGES ARE PROTECTED! 💖
+            // 🔥 RESTART THE PROTECTION WINDOW - THE PUSH GOES OUT NOW! 💖
+            // It was armed when the write came in (#23). However long this
+            // entry waited behind other devices' pushes, the hub still gets
+            // the full window to confirm it.
             if entry.priority == SyncPriority::Critical {
-                // User-initiated changes
-                let mut pending = self.pending_confirmations.write().await;
-                pending.insert(
-                    device_id.clone(),
-                    PendingConfirmation {
-                        device_id: device_id.clone(),
-                        expected_state: entry.state.clone(),
-                        sent_at: Instant::now(),
-                        protection_window: Duration::from_secs(5), // 5s protection!
-                    },
-                );
-                debug!(
-                    "🛡️ SYNC_DEBUG: Added pending confirmation for {} - 5s protection window!",
-                    device_id
-                );
+                self.refresh_protection(&device_id, &entry.state).await;
             }
 
             // Execute with rate limiting
             if let Err(e) = self.execute_sync_task(&task).await {
+                // 🛡️ The pending confirmation stays and runs out on its own,
+                // `protection_window` after this attempt. With the defaults
+                // the first retry comes well inside it, so a transient
+                // failure doesn't flicker the UI. A hub that stays down
+                // doesn't keep the store protected: once the window is up,
+                // the next pull reverts it to what the hub reports. Removing
+                // the entry here could also unprotect a newer write that
+                // already re-armed it.
                 warn!("Buffered sync failed for {}: {}", device_id, e);
                 self.queue_retry(&task, e.to_string()).await;
             } else {
@@ -514,6 +546,65 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    /// 🛡️ Start the protection window for a user write to `device_id`.
+    ///
+    /// This runs when the write is accepted, before the store shows it
+    /// (#23). If the window started only when the push went out, a pull in
+    /// between would find no pending confirmation, see the store ahead of
+    /// the hub, and revert the write. A newer write re-arms the entry with
+    /// its own value, so the entry always expects the latest one.
+    async fn arm_protection(&self, device_id: &DeviceId, expected_state: &DeviceStateValue) {
+        let mut pending = self.pending_confirmations.write().await;
+        pending.insert(
+            device_id.clone(),
+            PendingConfirmation {
+                device_id: device_id.clone(),
+                expected_state: expected_state.clone(),
+                sent_at: Instant::now(),
+                protection_window: self.config.protection_window,
+            },
+        );
+        debug!(
+            "🛡️ SYNC_DEBUG: Armed pending confirmation for {} - {:?} protection window!",
+            device_id, self.config.protection_window
+        );
+    }
+
+    /// 🛡️ Restart the protection window as a buffered push goes out, so it
+    /// still covers the hub's confirmation.
+    ///
+    /// `expected_state` stays as it is. Every write sets it, so it already
+    /// holds `pushed` (the buffer keeps only the latest value) or a newer
+    /// write that came in after this push was drained. Writing `pushed` back
+    /// would move the expectation back to a stale value, and the hub
+    /// confirming that stale value would then revert the newer write. If
+    /// there is no entry (a pull already confirmed it, or it expired), the
+    /// push re-arms one for `pushed`.
+    async fn refresh_protection(&self, device_id: &DeviceId, pushed: &DeviceStateValue) {
+        let mut pending = self.pending_confirmations.write().await;
+        if let Some(confirmation) = pending.get_mut(device_id) {
+            confirmation.sent_at = Instant::now();
+            debug!(
+                "🛡️ SYNC_DEBUG: Push going out for {} - protection window restarted!",
+                device_id
+            );
+        } else {
+            pending.insert(
+                device_id.clone(),
+                PendingConfirmation {
+                    device_id: device_id.clone(),
+                    expected_state: pushed.clone(),
+                    sent_at: Instant::now(),
+                    protection_window: self.config.protection_window,
+                },
+            );
+            debug!(
+                "🛡️ SYNC_DEBUG: Push going out for {} - protection window re-armed!",
+                device_id
+            );
+        }
     }
 
     async fn process_push_queue(&self) -> anyhow::Result<()> {
