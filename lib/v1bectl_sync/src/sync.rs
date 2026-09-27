@@ -67,6 +67,12 @@ pub struct PendingConfirmation {
     pub sent_at: Instant,
     /// `SyncConfig::protection_window` - UI changes are PROTECTED!
     pub protection_window: Duration,
+    /// `expected_state`'s own push has gone out to the gateway. Only then can
+    /// the hub reporting that value be its confirmation. Before, the hub
+    /// showing it is a coincidence: a write that toggles back to the hub's
+    /// current value while the previous write's PATCH is still in flight,
+    /// which is about to move the hub away. A newer write resets it (#32).
+    pub pushed: bool,
 }
 
 #[derive(Clone)]
@@ -626,6 +632,7 @@ impl SyncEngine {
                 expected_state: expected_state.clone(),
                 sent_at: Instant::now(),
                 protection_window: self.config.protection_window,
+                pushed: false,
             },
         );
         debug!(
@@ -635,19 +642,24 @@ impl SyncEngine {
     }
 
     /// 🛡️ Restart the protection window as a buffered push goes out, so it
-    /// still covers the hub's confirmation.
+    /// still covers the hub's confirmation, and mark the entry
+    /// [`PendingConfirmation::pushed`] if this push carries its value.
     ///
     /// `expected_state` stays as it is. Every write sets it, so it already
     /// holds `pushed` (the buffer keeps only the latest value) or a newer
     /// write that came in after this push was drained. Writing `pushed` back
     /// would move the expectation back to a stale value, and the hub
-    /// confirming that stale value would then revert the newer write. If
-    /// there is no entry (a pull already confirmed it, or it expired), the
-    /// push re-arms one for `pushed`.
+    /// confirming that stale value would then revert the newer write. For
+    /// the same reason a stale push doesn't mark the entry pushed: the newer
+    /// value hasn't gone out yet. If there is no entry (a pull already
+    /// confirmed it, or it expired), the push re-arms one for `pushed`.
     async fn refresh_protection(&self, device_id: &DeviceId, pushed: &DeviceStateValue) {
         let mut pending = self.pending_confirmations.write().await;
         if let Some(confirmation) = pending.get_mut(device_id) {
             confirmation.sent_at = Instant::now();
+            if self.states_equal(&confirmation.expected_state, pushed) {
+                confirmation.pushed = true;
+            }
             debug!(
                 "🛡️ SYNC_DEBUG: Push going out for {} - protection window restarted!",
                 device_id
@@ -660,6 +672,7 @@ impl SyncEngine {
                     expected_state: pushed.clone(),
                     sent_at: Instant::now(),
                     protection_window: self.config.protection_window,
+                    pushed: true,
                 },
             );
             debug!(
@@ -797,8 +810,10 @@ impl SyncEngine {
                 let expected_state = confirmation.expected_state.clone(); // Clone for later use
 
                 if elapsed < confirmation.protection_window {
-                    // Still in protection window - check if this is our confirmation
-                    if self.states_equal(&gateway_state, &expected_state) {
+                    // Still in protection window - check if this is our
+                    // confirmation: our value, and its push has gone out.
+                    // Before that, the hub showing it is a coincidence (#32).
+                    if confirmation.pushed && self.states_equal(&gateway_state, &expected_state) {
                         debug!(
                             "✅ SYNC_DEBUG: UI change confirmed for {} after {:?}",
                             device_id, elapsed
@@ -836,7 +851,8 @@ impl SyncEngine {
 
                         return Ok(());
                     } else {
-                        // Not our change - IGNORE during protection window!
+                        // Not our change (or our value before its push went
+                        // out) - IGNORE during protection window!
                         let remaining = confirmation.protection_window - elapsed;
                         debug!("🛡️ SYNC_DEBUG: Ignoring pull for {} - protection active ({:?} remaining)", 
                                device_id, remaining);
@@ -1223,8 +1239,8 @@ impl SyncEngine {
     }
 
     /// ✅ A pull found the store and the hub agreeing on `gateway_state`. If
-    /// that's the value a pending user write expects, this is the hub's
-    /// confirmation: drop the entry.
+    /// that's the value a pending user write expects, and that value's push
+    /// has gone out, this is the hub's confirmation: drop the entry.
     ///
     /// With optimistic updates the store shows a write before the hub does,
     /// so once the push lands the periodic pull finds the two equal and never
@@ -1234,10 +1250,18 @@ impl SyncEngine {
     /// our change". There's nothing to echo: the store already had the value,
     /// and the write echoed it. An entry expecting something else is left
     /// alone; it still waits for its own value (a newer write, say).
+    ///
+    /// So is an entry whose push hasn't gone out yet
+    /// ([`PendingConfirmation::pushed`]). A user who toggles a light on, and
+    /// back off while the `on` PATCH is in flight, leaves the store, the hub
+    /// and the entry all on `off`. The hub hasn't confirmed anything, though:
+    /// the `on` PATCH is about to land. Taking that for a confirmation
+    /// dropped the entry, and the pull after the PATCH landed reverted the
+    /// toggle-back.
     async fn clear_confirmed(&self, device_id: &DeviceId, gateway_state: &DeviceStateValue) {
         let mut pending = self.pending_confirmations.write().await;
         let confirmed = pending.get(device_id).is_some_and(|confirmation| {
-            self.states_equal(&confirmation.expected_state, gateway_state)
+            confirmation.pushed && self.states_equal(&confirmation.expected_state, gateway_state)
         });
         if confirmed {
             pending.remove(device_id);

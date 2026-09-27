@@ -231,7 +231,7 @@ impl Gateway for TestHub {
 // ---------------------------------------------------------------------
 
 /// How the test gets its pulls.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Pulls {
     /// The pull worker runs back to back. Wait on [`Rig::full_pull_cycle`].
     Periodic,
@@ -295,6 +295,40 @@ impl Rig {
             .apply_optimistic_update(&id.to_string(), state)
             .await
             .expect("write");
+    }
+
+    /// Makes `writes` so that one drain of the sync buffer takes them all,
+    /// and resolves once that batch's first PATCH is held at the gate.
+    /// Returns its device; the batch's other PATCHes wait behind it, in the
+    /// drain's (random) order.
+    ///
+    /// Two writes in a row can otherwise land in different drains, if a
+    /// buffer tick falls between them. So this first writes `holder` and
+    /// holds its PATCH at the gate while `writes` are made, then lets it
+    /// through (with whatever `OnSet` the hub has then). The hub must be
+    /// gated, with nothing held or queued.
+    pub async fn write_one_batch(
+        &self,
+        holder: &str,
+        writes: &[(&str, DeviceStateValue)],
+    ) -> DeviceId {
+        let start = self.hub.log().sets_started.len();
+        self.write(holder, on()).await;
+        self.hub
+            .wait("the holder's PATCH at the gate", |log| {
+                log.sets_started.len() == start + 1
+            })
+            .await;
+        for (id, state) in writes {
+            self.write(id, state.clone()).await;
+        }
+        self.hub.release(1);
+        self.hub
+            .wait("the batch's first PATCH at the gate", |log| {
+                log.sets_started.len() == start + 2
+            })
+            .await;
+        self.hub.log().sets_started[start + 1].0.clone()
     }
 
     pub async fn stored(&self, id: &str) -> DeviceStateValue {

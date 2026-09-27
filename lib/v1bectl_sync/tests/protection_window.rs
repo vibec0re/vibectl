@@ -473,6 +473,138 @@ async fn push_time_restart_covers_a_queue_delay() {
     rig.shutdown().await;
 }
 
+/// Which device of a two-write batch the toggle-back tests toggle back.
+#[derive(Clone, Copy, Debug)]
+enum ToggledBack {
+    /// The device whose `on` PATCH the batch sends first: the toggle-back is
+    /// made while that PATCH is in flight.
+    HeldFirst,
+    /// The device whose `on` PATCH waits behind the other one: the
+    /// toggle-back is made while its stale `on` is out of the buffer but not
+    /// sent yet.
+    Behind,
+}
+
+/// A pull of `id` the way `pulls` makes them: a whole periodic cycle, or
+/// a queued `PullFromGateway` of `id`.
+async fn pull_now(rig: &Rig, pulls: Pulls, id: &str) {
+    match pulls {
+        Pulls::Periodic => rig.full_pull_cycle().await,
+        Pulls::OnDemand => rig.pull(id).await,
+    }
+}
+
+/// From the #32 review: a pull may only take a value for a write's
+/// confirmation once that value's push went out. The user toggles a light
+/// on and back off while the `on` PATCH is in flight (a double click, a
+/// slider snapped back). The hub still reports `off`, which is also what
+/// the toggle-back expects, but only by coincidence: the `on` PATCH is
+/// about to move the hub. The toggle-back must stay protected until its own
+/// push lands, whichever order the batch sends its PATCHes in, and the UI
+/// must never show it `on` again.
+///
+/// `Pulls::Periodic` takes the periodic pull's path (`clear_confirmed`, the
+/// store and the hub agree); `Pulls::OnDemand` a queued pull's
+/// (`handle_gateway_state_change`).
+async fn toggle_back_during_an_in_flight_patch(pulls: Pulls, toggled_back: ToggledBack) {
+    let rig = Rig::new(
+        &["h", "a", "b"],
+        TestHub::new(OnSet::Apply, true),
+        pulls,
+        SyncConfig::default(),
+    )
+    .await;
+    let first = rig.write_one_batch("h", &[("a", on()), ("b", on())]).await;
+    let behind = if first == "a" { "b" } else { "a" };
+    let toggled = match toggled_back {
+        ToggledBack::HeldFirst => first.as_str(),
+        ToggledBack::Behind => behind,
+    };
+    let case = format!("{pulls:?}, {toggled_back:?}: {toggled}");
+    let mut rx = rig.bus.subscribe();
+
+    // Toggle back before the hub answered: it still reports `off`.
+    rig.write(toggled, off()).await;
+    pull_now(&rig, pulls, toggled).await;
+    assert_eq!(
+        rig.stored(toggled).await,
+        off(),
+        "{case}: before the `on` PATCH landed"
+    );
+
+    // The batch's `on` PATCHes land, but not the toggle-back's own push.
+    rig.hub.release(1);
+    rig.hub
+        .wait("the batch's second PATCH at the gate", |log| {
+            log.sets_started.len() == 3
+        })
+        .await;
+    if let ToggledBack::Behind = toggled_back {
+        assert_eq!(
+            rig.hub.log().sets_started[2],
+            (toggled.to_string(), on()),
+            "{case}: the stale `on` goes out"
+        );
+        rig.hub.release(1);
+        rig.hub
+            .wait("the stale `on` landed", |log| log.sets_done >= 3)
+            .await;
+    }
+    // Held first: `toggled`'s `on` landed; the buffer worker is held on
+    // `behind`, and the toggle-back still waits in the buffer. Behind: its
+    // stale `on` landed; the toggle-back's push may be out, but not landed.
+    assert_eq!(rig.hub.reported(toggled), Some(on()), "{case}: the hub");
+    pull_now(&rig, pulls, toggled).await;
+    assert_eq!(
+        rig.stored(toggled).await,
+        off(),
+        "{case}: the toggle-back was reverted: the pull that found the hub \
+         still on the old value took it for the confirmation"
+    );
+
+    // The toggle-back's push lands, and that is its confirmation.
+    rig.hub.open_gate();
+    rig.hub
+        .wait("the toggle-back's push landed", |log| {
+            log.sets_for(toggled).last() == Some(&off()) && log.sets_done == log.sets_started.len()
+        })
+        .await;
+    pull_now(&rig, pulls, toggled).await;
+    assert_eq!(rig.hub.reported(toggled), Some(off()), "{case}: the hub");
+    assert_eq!(rig.stored(toggled).await, off(), "{case}: the store");
+    let shown: Vec<Value> = drain_events(&mut rx)
+        .into_iter()
+        .filter(|(id, _, _)| id == toggled)
+        .map(|(_, _, new)| new)
+        .collect();
+    assert!(
+        shown.iter().all(|new| *new == json(&off())),
+        "{case}: the UI showed the toggled-back light on again: {shown:?}"
+    );
+
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+async fn toggle_back_during_its_own_in_flight_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::Periodic, ToggledBack::HeldFirst).await;
+}
+
+#[tokio::test]
+async fn toggle_back_behind_another_devices_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::Periodic, ToggledBack::Behind).await;
+}
+
+#[tokio::test]
+async fn queued_pull_toggle_back_during_its_own_in_flight_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::OnDemand, ToggledBack::HeldFirst).await;
+}
+
+#[tokio::test]
+async fn queued_pull_toggle_back_behind_another_devices_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::OnDemand, ToggledBack::Behind).await;
+}
+
 /// A device removed from the store takes its pending confirmation with it
 /// (#32). Nothing else clears it: only a pull of the device does, and pulls
 /// only read devices in the store. If the device comes back under the same
