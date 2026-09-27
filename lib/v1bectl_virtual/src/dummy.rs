@@ -85,7 +85,9 @@ impl DummyGateway {
 
             let tx = event_tx_clone.clone();
             tokio::spawn(async move {
-                while let Ok(event) = event_rx.recv().await {
+                // A lagged (skipped) synthetic event is simply lost, same as a real
+                // button/dummy event would be for downstream subscribers.
+                while let Some(event) = recv_lossy(&mut event_rx, "dummy event pump").await {
                     let _ = tx.send(event);
                 }
             });

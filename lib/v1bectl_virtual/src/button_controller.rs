@@ -93,7 +93,9 @@ impl ButtonController {
                 button_id
             );
 
-            while let Ok(event) = event_rx.recv().await {
+            // A lagged (skipped) button event is simply lost rather than resynced:
+            // there's no periodic re-read here, just the next live button press.
+            while let Some(event) = recv_lossy(&mut event_rx, "ButtonController").await {
                 // Check if event is for our button
                 if event.device_id == button_id {
                     match &event.event_type {
