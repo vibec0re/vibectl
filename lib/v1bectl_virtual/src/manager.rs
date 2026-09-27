@@ -554,7 +554,12 @@ impl VirtualDeviceManager {
         }
 
         tokio::spawn(async move {
-            while let Ok(event) = event_receiver.recv().await {
+            // Falling behind the bus skips the events missed, it doesn't end
+            // tracking (#15). Inputs are judged as the store holds them, so
+            // the next event for a member catches its group up. A member
+            // that doesn't change again stays unreconciled until it does.
+            while let Some(event) = recv_lossy(&mut event_receiver, "virtual device tracking").await
+            {
                 if let Err(e) = manager.handle_event(&event).await {
                     tracing::error!("Failed to handle state change for virtual devices: {}", e);
                 }
@@ -628,6 +633,16 @@ mod tests {
         lights: &[&str],
     ) -> (VirtualDeviceManager, Arc<EventBus>) {
         let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        manager
+            .add_virtual_device(Box::new(group("g", lights, &store)))
+            .await
+            .expect("register");
+        (manager, bus)
+    }
+
+    /// A 1:1 `LightGroup` named `device_id` over `lights`.
+    fn group(device_id: &str, lights: &[&str], store: &Arc<StateStore>) -> LightGroup {
         let curves: serde_json::Map<String, serde_json::Value> = lights
             .iter()
             .map(|id| {
@@ -638,20 +653,14 @@ mod tests {
             })
             .collect();
         let config = VirtualDeviceConfig {
-            device_id: "g".to_string(),
+            device_id: device_id.to_string(),
             device_type: VirtualDeviceType::LightGroup,
-            name: "Group".to_string(),
+            name: device_id.to_string(),
             description: None,
             enabled: true,
             config: serde_json::json!({ "lights": lights, "brightness_curves": curves }),
         };
-        let group = LightGroup::new(config, store.clone()).expect("group");
-        let manager = VirtualDeviceManager::new(store, bus.clone());
-        manager
-            .add_virtual_device(Box::new(group))
-            .await
-            .expect("register");
-        (manager, bus)
+        LightGroup::new(config, store.clone()).expect("group")
     }
 
     async fn manager_with_group(
@@ -891,6 +900,54 @@ mod tests {
                 ("scene".to_string(), "missing_scene_light".to_string()),
             ]
         );
+    }
+
+    /// #15: input tracking must outlive falling behind the bus. Tracking is
+    /// held at the device lock on an event for `a` while more events pile
+    /// up behind it than the bus keeps (1000). A change to `b` must still
+    /// re-derive `b`'s group `h`. Nothing about `a` can echo `h`, so that
+    /// echo shows tracking got past the lag.
+    #[tokio::test]
+    async fn input_tracking_survives_falling_behind_the_bus() {
+        let (manager, store, bus) = manager_with_group(&["a"]).await;
+        manager
+            .add_virtual_device(Box::new(group("h", &["b"], &store)))
+            .await
+            .expect("register");
+        for id in ["a", "b"] {
+            store.add_device(light_info(id), off()).await;
+        }
+        manager.start().await.expect("start");
+        let mut rx = bus.subscribe();
+
+        let echo_of_a = state_event(&"a".to_string(), None, &off());
+        {
+            // Tracking blocks here at its first event for `a`.
+            let _held = manager.virtual_devices.write().await;
+            for _ in 0..1500 {
+                bus.publish(echo_of_a.clone()).await;
+            }
+        }
+
+        let on = light(true, 70);
+        store
+            .update_device_state(&"b".to_string(), on.clone())
+            .await
+            .unwrap();
+        bus.publish(state_event(&"b".to_string(), None, &on)).await;
+
+        // The timeout only bounds a failure; the echo ends the wait.
+        let h_echo = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = recv_lossy(&mut rx, "test").await {
+                if event.device_id == "h" {
+                    return event;
+                }
+            }
+            panic!("event bus closed");
+        })
+        .await
+        .expect("tracking died behind the bus: `h` was never re-derived");
+        assert_eq!(echoes(&[h_echo], "h"), vec![on]);
     }
 
     /// The dummy hub, with the sync engine's reads held at a gate and its

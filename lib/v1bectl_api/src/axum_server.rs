@@ -175,37 +175,7 @@ impl AxumServer {
             .map_err(|e| anyhow::anyhow!("Failed to start virtual device manager: {}", e))?;
 
         // 🔥 SUBSCRIBE TO EVENTBUS AND FORWARD TO WEBSOCKET CLIENTS! 💖
-        {
-            let event_bus = Arc::clone(&self.event_bus);
-            let subscribers = Arc::clone(&self.subscribers);
-
-            tokio::spawn(async move {
-                let mut event_rx = event_bus.subscribe();
-                debug!("📢 API Server subscribed to EventBus - will forward events to WebSocket clients!");
-
-                while let Ok(event) = event_rx.recv().await {
-                    debug!("🔥 Forwarding event to WebSocket clients: {:?}", event);
-                    let subscribers_read = subscribers.read().await;
-                    let mut failed = Vec::new();
-
-                    for (id, tx) in subscribers_read.iter() {
-                        if tx.send(event.clone()).is_err() {
-                            failed.push(id.clone());
-                        }
-                    }
-                    drop(subscribers_read);
-
-                    // Clean up failed subscribers
-                    if !failed.is_empty() {
-                        let mut subscribers_write = subscribers.write().await;
-                        for id in failed {
-                            subscribers_write.remove(&id);
-                        }
-                    }
-                }
-                warn!("EventBus subscription ended!");
-            });
-        }
+        spawn_event_forwarder(&self.event_bus, Arc::clone(&self.subscribers));
 
         let app = Router::new()
             // WebSocket ONLY - pure async real-time vibes!! 🔥
@@ -721,6 +691,43 @@ impl AxumServer {
             }
         }
     }
+}
+
+/// Forward every event on `event_bus` to each WebSocket subscriber, and drop
+/// the subscribers whose client has gone. Subscribes before it returns, so
+/// nothing published after this call is missed.
+fn spawn_event_forwarder(
+    event_bus: &EventBus,
+    subscribers: Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<DeviceEvent>>>>,
+) {
+    let mut event_rx = event_bus.subscribe();
+    debug!("📢 API Server subscribed to EventBus - will forward events to WebSocket clients!");
+
+    tokio::spawn(async move {
+        // Lagging behind the bus skips events instead of ending the
+        // forwarding for every client (#15).
+        while let Some(event) = recv_lossy(&mut event_rx, "WebSocket forwarder").await {
+            debug!("🔥 Forwarding event to WebSocket clients: {:?}", event);
+            let subscribers_read = subscribers.read().await;
+            let mut failed = Vec::new();
+
+            for (id, tx) in subscribers_read.iter() {
+                if tx.send(event.clone()).is_err() {
+                    failed.push(id.clone());
+                }
+            }
+            drop(subscribers_read);
+
+            // Clean up failed subscribers
+            if !failed.is_empty() {
+                let mut subscribers_write = subscribers.write().await;
+                for id in failed {
+                    subscribers_write.remove(&id);
+                }
+            }
+        }
+        warn!("EventBus subscription ended!");
+    });
 }
 
 async fn websocket_handler(ws: WebSocketUpgrade, State(server): State<AxumServer>) -> Response {
@@ -1309,6 +1316,45 @@ mod tests {
             "group was re-derived from a colour-only difference"
         );
         assert!(echoes(&events, GROUP).is_empty(), "group re-echoed");
+    }
+
+    /// #15: the WebSocket forwarder must outlive falling behind the bus. It
+    /// is held at the subscriber lock on its first event while more events
+    /// pile up behind it than the bus keeps (1000). An event published after
+    /// that must still reach the client.
+    #[tokio::test]
+    async fn event_forwarder_survives_falling_behind_the_bus() {
+        let bus = EventBus::new(10);
+        let subscribers = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut client) = tokio::sync::mpsc::unbounded_channel();
+        subscribers.write().await.insert("client".to_string(), tx);
+        spawn_event_forwarder(&bus, Arc::clone(&subscribers));
+
+        let event = |device_id: &str| DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: device_id.to_string(),
+            event_type: EventType::DeviceRemoved,
+        };
+        {
+            // The forwarder blocks here at its first event.
+            let _held = subscribers.write().await;
+            for _ in 0..1500 {
+                bus.publish(event("flood")).await;
+            }
+        }
+        bus.publish(event("after")).await;
+
+        // The timeout only bounds a failure; the event ends the wait.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(forwarded) = client.recv().await {
+                if forwarded.device_id == "after" {
+                    return;
+                }
+            }
+            panic!("the client's channel closed");
+        })
+        .await
+        .expect("forwarding died behind the bus: `after` never reached the client");
     }
 
     /// The same tracking, run the way the server runs it
