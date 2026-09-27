@@ -12,15 +12,19 @@
 //! event bus logs, which is its echo: after its store write, before its
 //! push was queued. The second write then runs on the other worker thread,
 //! either to completion (the old code: nothing stopped it) or until it logs
-//! that it's waiting for the write lock the first one holds (the fix). Only
-//! then is the first write let go. The engine starts after both writes, so
-//! its first drain pushes exactly what the buffer ended on.
+//! that it's waiting for the write lock the first one holds (the fix). That
+//! line comes before the lock is tried, so the test then checks the second
+//! write really is locked out: no echo of it for `LOCKED_OUT`, with the
+//! first one still held. Only then is the first write let go. The engine
+//! starts after both writes, so its first drain pushes exactly what the
+//! buffer ended on.
 //!
 //! The subscriber is process-global, so this file holds this one test.
 
 mod common;
 
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use common::*;
 use tokio::sync::watch;
@@ -28,6 +32,11 @@ use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id, Record};
 use tracing::{Event, Metadata, Subscriber};
 use v1bectl_sync::{EventBus, StateStore, SyncEngine};
+
+/// How long the second write must stay without an echo while the first one
+/// is held inside its critical section. A write that isn't locked out echoes
+/// within microseconds of logging its wait.
+const LOCKED_OUT: Duration = Duration::from_millis(200);
 
 /// Where the choreography is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -141,6 +150,9 @@ async fn simultaneous_writes_leave_store_and_push_on_the_same_value() {
         .expect("the first write never echoed")
         .expect("hook");
 
+    // The first write's echo went out just before the hook held it.
+    let first_echo = rx.try_recv().map(|event| event.device_id);
+
     let mut second_write = write(second.clone());
     let second_done = tokio::time::timeout(WAIT, async {
         tokio::select! {
@@ -148,10 +160,31 @@ async fn simultaneous_writes_leave_store_and_push_on_the_same_value() {
             _ = phase.wait_for(|p| *p == Phase::SecondAtLock) => None,
         }
     })
-    .await
-    .expect("the second write neither finished nor reached the write lock");
+    .await;
+    // Logging that it waits for the lock doesn't prove the second write
+    // waits: the line comes before the lock is tried. While the first write
+    // is held inside its critical section, the second must not get any
+    // further, so no echo of it may come. (Bounded: it can only let a
+    // broken build pass on a very slow machine, never fail a correct one.)
+    let echoed_meanwhile = match &second_done {
+        Ok(Some(_)) => Some("it ran to completion".to_string()),
+        Ok(None) => tokio::time::timeout(LOCKED_OUT, rx.recv())
+            .await
+            .ok()
+            .map(|event| format!("it echoed {event:?}")),
+        Err(_) => None,
+    };
 
+    // Let go before asserting anything: a panic with the first write's
+    // thread still held would hang the runtime's shutdown.
     hook.release();
+    assert_eq!(first_echo, Ok(id.clone()), "the first write's echo");
+    let second_done =
+        second_done.expect("the second write neither finished nor reached the write lock");
+    assert_eq!(
+        echoed_meanwhile, None,
+        "the second write got past the write lock while the first held it"
+    );
     first_write
         .await
         .expect("first write task")
