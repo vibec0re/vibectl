@@ -33,7 +33,10 @@ serde_json = "1.0"
 ciborium = "0.2" # CBOR encoding
 
 # Networking
-reqwest = { version = "0.11", features = ["json"] }
+# Default features on purpose: in 0.12, `default-tls` is still native-tls
+# (OpenSSL on Linux), the same backend 0.11 used against the Dirigera's
+# self-signed cert. 0.13 flips the default to rustls, so re-check TLS there.
+reqwest = { version = "0.12", features = ["json"] }
 uuid = { version = "1.0", features = ["v4"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = "0.4"
