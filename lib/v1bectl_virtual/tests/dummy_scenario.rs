@@ -263,12 +263,10 @@ async fn shipped_home() -> ShippedHome {
         let controller = ButtonController::new(
             config,
             c.button.clone(),
-            c.press_on.clone(),
-            c.press_off.clone(),
-            c.press_on_long.clone(),
-            c.press_off_long.clone(),
-            store.clone(),
-            bus.clone(),
+            &c.press_on,
+            &c.press_off,
+            c.press_on_long.as_deref(),
+            c.press_off_long.as_deref(),
         )
         .unwrap_or_else(|e| panic!("{}: {e}", c.device_id));
         manager

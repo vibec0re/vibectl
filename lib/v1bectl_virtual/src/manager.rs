@@ -998,12 +998,10 @@ mod tests {
         button: &str,
         press_on: serde_json::Value,
         press_off: serde_json::Value,
-        store: &Arc<StateStore>,
-        bus: &Arc<EventBus>,
     ) -> ButtonController {
         let none = serde_json::json!([]);
         let actions = [press_on, press_off, none.clone(), none];
-        controller_with(device_id, button, actions, store, bus)
+        controller_with(device_id, button, actions)
     }
 
     /// A button controller `device_id` bound to `button`, with `actions`:
@@ -1013,8 +1011,6 @@ mod tests {
         device_id: &str,
         button: &str,
         actions: [serde_json::Value; 4],
-        store: &Arc<StateStore>,
-        bus: &Arc<EventBus>,
     ) -> ButtonController {
         let config = VirtualDeviceConfig {
             device_id: device_id.to_string(),
@@ -1029,12 +1025,10 @@ mod tests {
         ButtonController::new(
             config,
             button.to_string(),
-            press_on,
-            press_off,
-            Some(press_on_long),
-            Some(press_off_long),
-            store.clone(),
-            bus.clone(),
+            &press_on,
+            &press_off,
+            Some(&press_on_long),
+            Some(&press_off_long),
         )
         .expect("controller")
     }
@@ -1044,16 +1038,13 @@ mod tests {
     /// release.
     async fn add_controller(
         manager: &VirtualDeviceManager,
-        store: &Arc<StateStore>,
-        bus: &Arc<EventBus>,
+        store: &StateStore,
         press_on: serde_json::Value,
         press_off: serde_json::Value,
     ) {
         add_switch(store, "btn").await;
         manager
-            .add_virtual_device(Box::new(controller(
-                "ctrl", "btn", press_on, press_off, store, bus,
-            )))
+            .add_virtual_device(Box::new(controller("ctrl", "btn", press_on, press_off)))
             .await
             .expect("register");
     }
@@ -1474,7 +1465,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let mut rx = bus.subscribe();
 
         press(&store, &bus, true).await;
@@ -1529,7 +1520,7 @@ mod tests {
             serde_json::json!(["set", "a", 30]),
             serde_json::json!(["dec", "a", 10]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let mut rx = bus.subscribe();
 
         press(&store, &bus, true).await;
@@ -1559,7 +1550,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         manager.start().await.expect("start");
         let mut rx = bus.subscribe();
 
@@ -1600,7 +1591,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let mut rx = bus.subscribe();
         let on = light(true, 60);
         manager
@@ -1678,9 +1669,7 @@ mod tests {
                 serde_json::json!(["off", "a"]),
             ];
             manager
-                .add_virtual_device(Box::new(controller_with(
-                    "ctrl", "btn", actions, &store, &bus,
-                )))
+                .add_virtual_device(Box::new(controller_with("ctrl", "btn", actions)))
                 .await
                 .expect("register");
             let mut rx = bus.subscribe();
@@ -1709,7 +1698,7 @@ mod tests {
             serde_json::json!(["inc", "a", 20]),
             serde_json::json!(["dec", "a", 5]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         add_switch(&store, "other").await;
         let mut rx = bus.subscribe();
 
@@ -1744,9 +1733,7 @@ mod tests {
                 serde_json::json!(["dec", target, 5]),
             );
             manager
-                .add_virtual_device(Box::new(controller(
-                    id, button, press_on, press_off, &store, &bus,
-                )))
+                .add_virtual_device(Box::new(controller(id, button, press_on, press_off)))
                 .await
                 .expect("register");
         }
@@ -1883,9 +1870,7 @@ mod tests {
                 serde_json::json!(["off", "a"]),
             );
             manager
-                .add_virtual_device(Box::new(controller(
-                    id, button, press_on, press_off, &store, &bus,
-                )))
+                .add_virtual_device(Box::new(controller(id, button, press_on, press_off)))
                 .await
                 .expect("register");
         }
@@ -2053,7 +2038,7 @@ mod tests {
             serde_json::json!(["on", "g"]),
             serde_json::json!(["off", "g"]),
         );
-        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        add_controller(&manager, &store, press_on, press_off).await;
         let g = "g".to_string();
         manager.virtual_devices.write().await.remove(&g);
         let before = stored(&store, "g").await;

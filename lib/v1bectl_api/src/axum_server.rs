@@ -1430,16 +1430,20 @@ mod tests {
             enabled: true,
             config: serde_json::json!({}),
         };
-        let action = |value: serde_json::Value| value.as_array().cloned().expect("action");
+        let [press_on, press_off, press_on_long, press_off_long] = [
+            serde_json::json!(["on", GROUP]),
+            serde_json::json!(["off", GROUP]),
+            serde_json::json!(["inc", GROUP, 10]),
+            serde_json::json!(["dec", GROUP, 10]),
+        ]
+        .map(|value| value.as_array().cloned().expect("action"));
         let controller = ButtonController::new(
             config,
             SWITCH.to_string(),
-            action(serde_json::json!(["on", GROUP])),
-            action(serde_json::json!(["off", GROUP])),
-            Some(action(serde_json::json!(["inc", GROUP, 10]))),
-            Some(action(serde_json::json!(["dec", GROUP, 10]))),
-            Arc::clone(&home.store),
-            Arc::clone(&home.bus),
+            &press_on,
+            &press_off,
+            Some(&press_on_long),
+            Some(&press_off_long),
         )
         .expect("controller");
         home.manager

@@ -5,10 +5,8 @@ use crate::virtual_device::{
 };
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use v1bectl_sync::{
-    ButtonPressType, DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState,
-    StateStore,
+    ButtonPressType, DeviceEvent, DeviceId, DeviceStateValue, EventType, LightState,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,28 +267,15 @@ impl ButtonController {
     /// amount]` (see [`ButtonAction::parse`]); a missing or empty one does
     /// nothing, and a malformed one fails here, the long ones too.
     ///
-    /// `state_store` and `event_bus` aren't used any more (the manager
-    /// delivers the events and makes the writes). They stay so callers
-    /// don't have to change.
-    // kept: constructor takes the full set of button actions and dependencies;
-    // grouping them into a struct would change the public API.
-    #[allow(clippy::too_many_arguments)]
-    // kept by value: callers outside this PR's lane (v1bectl_server) pass an
-    // owned Vec (some via `cfg.press_on.clone()`); v1bectl_server joins the
-    // ratchet separately, so its call sites aren't touched here.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "v1bectl_server passes owned Vecs here and is outside this PR's lane"
-    )]
+    /// It takes no store or event bus: the manager delivers its button's
+    /// events and makes the writes (#16).
     pub fn new(
         config: VirtualDeviceConfig,
         button_id: String,
-        press_on: Vec<serde_json::Value>,
-        press_off: Vec<serde_json::Value>,
-        press_on_long: Option<Vec<serde_json::Value>>,
-        press_off_long: Option<Vec<serde_json::Value>>,
-        _state_store: Arc<StateStore>,
-        _event_bus: Arc<EventBus>,
+        press_on: &[serde_json::Value],
+        press_off: &[serde_json::Value],
+        press_on_long: Option<&[serde_json::Value]>,
+        press_off_long: Option<&[serde_json::Value]>,
     ) -> Result<Self, VirtualDeviceError> {
         let parse = |action: &[serde_json::Value]| {
             if action.is_empty() {
@@ -303,10 +288,10 @@ impl ButtonController {
         Ok(Self {
             config,
             button_id,
-            press_on_action: parse(&press_on)?,
-            press_off_action: parse(&press_off)?,
-            press_on_long_action: parse(press_on_long.as_deref().unwrap_or_default())?,
-            press_off_long_action: parse(press_off_long.as_deref().unwrap_or_default())?,
+            press_on_action: parse(press_on)?,
+            press_off_action: parse(press_off)?,
+            press_on_long_action: parse(press_on_long.unwrap_or_default())?,
+            press_off_long_action: parse(press_off_long.unwrap_or_default())?,
             reports_gestures: AtomicBool::new(false),
         })
     }
