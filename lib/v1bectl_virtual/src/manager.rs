@@ -784,32 +784,34 @@ mod tests {
 
     /// A write that fails part-way (a missing member, as in #2) commits and
     /// echoes the members it did change. The group keeps its old state,
-    /// which doesn't account for them, so tracking re-derives it from them
-    /// and echoes that: the group shows what happened, not its old state
-    /// (#14 review, finding 5).
+    /// which doesn't account for them, so tracking re-derives it from the
+    /// members as they are and echoes that. It must not claim the state it
+    /// was asked for: a member after the failure never got it (#14 review,
+    /// finding 5).
     #[tokio::test]
     async fn partial_group_write_re_derives_the_group() {
-        // `LightGroup` writes its lights in order: `a`, then `missing` fails.
-        let (manager, store, bus) = manager_with_group(&["a", "missing"]).await;
-        store.add_device(light_info("a"), off()).await;
+        // `LightGroup` writes its lights in order: `a`, then `missing`
+        // fails, so `b` is never written.
+        let (manager, store, bus) = manager_with_group(&["a", "missing", "b"]).await;
+        for id in ["a", "b"] {
+            store.add_device(light_info(id), light(true, 80)).await;
+        }
         let mut rx = bus.subscribe();
 
-        let on = light(true, 60);
+        let asked = light(true, 20);
         let result = manager
-            .set_virtual_device_state(&"g".to_string(), on.clone())
+            .set_virtual_device_state(&"g".to_string(), asked.clone())
             .await;
         assert!(result.is_err(), "a missing member must fail the write");
         let events = pump(&manager, &mut rx).await;
 
-        assert_eq!(stored(&store, "a").await, on);
-        assert_eq!(
-            echoes(&events, "a"),
-            vec![on.clone()],
-            "changed member echo"
-        );
-        // `a` is the only member there, and on at 60: so is the group.
+        assert_eq!(stored(&store, "a").await, asked);
+        assert_eq!(echoes(&events, "a"), vec![asked], "changed member echo");
+        assert_eq!(stored(&store, "b").await, light(true, 80), "b was written");
+        assert!(echoes(&events, "b").is_empty(), "unchanged member echoed");
+        // Re-derived from `a` at 20 and `b` at 80.
         let group = stored(&store, "g").await;
-        assert_eq!(group, on, "group must follow the member that changed");
+        assert_eq!(group, light(true, 50), "group must follow its members");
         assert_eq!(echoes(&events, "g"), vec![group.clone()], "group echo");
         assert_eq!(
             manager
