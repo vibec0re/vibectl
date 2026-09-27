@@ -103,18 +103,27 @@ pub(crate) fn resolve_write(current: &LightState, asked: LightState) -> LightSta
     }
 }
 
-/// Re-derive the group state `group` from `lit`, the levels of its members
-/// that are on: on if any is, at their average level. With none on it only
-/// goes off and keeps its level (#16). Re-deriving it to 0 would make the
-/// next plain `on` light nothing.
-pub(crate) fn re_derive(group: &mut LightState, lit: &[u8]) {
+/// Re-derive the group state `group` from `on_levels`, the levels of its
+/// members that are on: on if any of them is lit, at the average level of
+/// those that are. With none lit it only goes off and keeps its level
+/// (#16). Re-deriving it to 0 would make the next plain `on` light nothing.
+///
+/// A member that's on at level 0 isn't lit (#34 review, nit 3). The TUI's
+/// `-` can leave a light there. Counting it made a group whose members were
+/// all at 0 `{on, <old level>}`, with nothing lit. Averaging it in would
+/// dim the group below its lit members.
+pub(crate) fn re_derive(group: &mut LightState, on_levels: &[u8]) {
+    let lit: Vec<u32> = on_levels
+        .iter()
+        .filter(|&&level| level > 0)
+        .map(|&level| u32::from(level))
+        .collect();
     group.is_on = !lit.is_empty();
-    let total: u32 = lit.iter().map(|&level| u32::from(level)).sum();
     let average = u32::try_from(lit.len())
         .ok()
-        .and_then(|count| total.checked_div(count))
+        .and_then(|count| lit.iter().sum::<u32>().checked_div(count))
         .and_then(|average| u8::try_from(average).ok());
-    if let Some(average) = average.filter(|&average| average > 0) {
+    if let Some(average) = average {
         group.brightness = Some(average);
     }
 }
@@ -209,20 +218,20 @@ impl LightGroup {
     }
 
     /// Calculate group state from member light states (see [`re_derive`]):
-    /// with no member on, the group keeps its level.
+    /// with no member lit, the group keeps its level.
     async fn calculate_group_state(&mut self) -> Result<(), VirtualDeviceError> {
-        let mut lit = Vec::new();
+        let mut on_levels = Vec::new();
         for light_id in &self.lights {
             if let Some(device_state) = self.state_store.get_device(light_id).await {
                 if let DeviceStateValue::Light(light_state) = device_state.state {
                     if light_state.is_on {
-                        lit.push(light_state.brightness.unwrap_or(100));
+                        on_levels.push(light_state.brightness.unwrap_or(100));
                     }
                 }
             }
         }
 
-        re_derive(&mut self.current_state, &lit);
+        re_derive(&mut self.current_state, &on_levels);
         Ok(())
     }
 }
@@ -312,6 +321,30 @@ mod tests {
         assert_eq!(curve.interpolate(50), 63); // Halfway between 25-75: 62.5 rounds to 63
         assert_eq!(curve.interpolate(75), 75);
         assert_eq!(curve.interpolate(100), 100);
+    }
+
+    /// #34 review, nit 3: a member that's on at level 0 isn't lit. A group
+    /// whose members are all there is off, at the level it had. Before, it
+    /// came out `{on, 60}` with nothing lit. Next to a lit member, a member at
+    /// 0 doesn't pull the group's level down.
+    #[test]
+    fn re_derive_counts_members_on_at_level_0_as_unlit() {
+        let group = |is_on, level| LightState {
+            is_on,
+            brightness: Some(level),
+            color_temp: Some(2700),
+            rgb_color: None,
+        };
+        for (on_levels, want) in [
+            (&[0, 0][..], group(false, 60)),
+            (&[][..], group(false, 60)),
+            (&[0, 50][..], group(true, 50)),
+            (&[40, 80][..], group(true, 60)),
+        ] {
+            let mut derived = group(false, 60);
+            re_derive(&mut derived, on_levels);
+            assert_eq!(derived, want, "members on at {on_levels:?}");
+        }
     }
 
     #[test]

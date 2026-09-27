@@ -103,21 +103,21 @@ impl LightGroupLinear {
     }
 
     /// Calculate group state from member states (inverse mapping, see
-    /// [`re_derive`]): with no member on, the group keeps its level.
+    /// [`re_derive`]): with no member lit, the group keeps its level.
     async fn calculate_group_state(&mut self) -> Result<(), VirtualDeviceError> {
-        let mut lit = Vec::new();
+        let mut on_levels = Vec::new();
         for device_id in self.members.values() {
             if let Some(device_state) = self.state_store.get_device(device_id).await {
                 if let DeviceStateValue::Light(light_state) = device_state.state {
                     if light_state.is_on {
                         // TODO: Inverse map member brightness to group brightness
-                        lit.push(light_state.brightness.unwrap_or(100));
+                        on_levels.push(light_state.brightness.unwrap_or(100));
                     }
                 }
             }
         }
 
-        re_derive(&mut self.current_state, &lit);
+        re_derive(&mut self.current_state, &on_levels);
         Ok(())
     }
 }

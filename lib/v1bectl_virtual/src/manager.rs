@@ -1542,6 +1542,55 @@ mod tests {
         );
     }
 
+    /// #34 review, nit 3: a member that's on at level 0 (the TUI's `-` can
+    /// put a light there) isn't lit. A group whose members all read that is
+    /// off, at its level, and a plain `on` lights them at that level. It
+    /// came out `{on, 60}` with nothing lit.
+    #[tokio::test]
+    async fn members_on_at_level_0_leave_the_group_off_at_its_level() {
+        for kind in KINDS {
+            let (manager, store, bus) = started_group(kind, [off(), off(), off()]).await;
+            let mut rx = bus.subscribe();
+            manager
+                .set_virtual_device_state(&"g".to_string(), light(true, 60))
+                .await
+                .expect("write");
+            pump(&manager, &mut rx).await;
+
+            // Stored and echoed, as the sync engine's GatewayWins does.
+            let at_0 = light(true, 0);
+            for id in ["a", "b", "c"] {
+                let old = stored(&store, id).await;
+                store
+                    .update_device_state(&id.to_string(), at_0.clone())
+                    .await
+                    .unwrap();
+                bus.publish(state_event(&id.to_string(), Some(&old), &at_0))
+                    .await;
+            }
+            let events = pump(&manager, &mut rx).await;
+            assert_eq!(
+                stored(&store, "g").await,
+                light(false, 60),
+                "{kind:?}: members on at 0 must leave the group off at its level"
+            );
+            assert_eq!(
+                echoes(&events, "g"),
+                vec![light(false, 60)],
+                "{kind:?}: one re-derived group echo"
+            );
+
+            plain_on(&manager, &store, "g").await;
+            for id in ["a", "b", "c"] {
+                assert_eq!(
+                    stored(&store, id).await,
+                    light(true, 60),
+                    "{kind:?}: plain on must light {id} at the kept level"
+                );
+            }
+        }
+    }
+
     /// #16: adding a virtual device announces it with `DeviceAdded`, and
     /// removing it with `DeviceRemoved`, so clients see both without a
     /// refetch. A second remove announces nothing.
