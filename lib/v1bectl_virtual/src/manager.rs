@@ -1306,9 +1306,27 @@ mod tests {
             .add_virtual_device(Box::new(scene))
             .await
             .expect("register");
+        // #35 review, finding 4: every action of a controller is an output,
+        // the long and double ones too.
+        add_switch(&store, "btn").await;
+        let actions = [
+            serde_json::json!(["toggle", "a"]),
+            serde_json::json!([]),
+            serde_json::json!(["inc", "missing_long_light", 10]),
+            serde_json::json!(["dec", "missing_long_release_light", 10]),
+            serde_json::json!(["set", "missing_double_light", 100]),
+        ];
+        manager
+            .add_virtual_device(Box::new(controller_with("ctrl", "btn", actions)))
+            .await
+            .expect("register");
+
         assert_eq!(
             manager.dangling_references().await,
             vec![
+                ("ctrl".to_string(), "missing_double_light".to_string()),
+                ("ctrl".to_string(), "missing_long_light".to_string()),
+                ("ctrl".to_string(), "missing_long_release_light".to_string()),
                 ("g".to_string(), "missing_light".to_string()),
                 ("scene".to_string(), "missing_scene_light".to_string()),
             ]
