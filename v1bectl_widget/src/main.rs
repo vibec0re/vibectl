@@ -45,6 +45,7 @@ mod screens;
 mod ws;
 
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 
 use hytte_plugin::proto::manifest::Setting;
 use hytte_plugin::proto::{Dir, Effect, EventKind, Manifest, Mount, Node};
@@ -194,7 +195,7 @@ impl Plugin for VibeWidget {
             }
             // `Input::Event` is `#[non_exhaustive]` (it gained `output`, the
             // clicked monitor); ids are screen-agnostic here, so ignore it.
-            Input::Event { node, kind, .. } => self.on_ui_event(&node, kind),
+            Input::Event { node, kind, .. } => self.on_ui_event(&node, &kind),
             // No host state, no RunCommands, and nothing to do when our sidebar
             // slot shows/hides — the WS keeps state live either way. The rest
             // are pushes this manifest never subscribes to.
@@ -248,7 +249,7 @@ impl Plugin for VibeWidget {
 impl VibeWidget {
     /// Route a shell UI event (click / slider move / panel toggle, by node id)
     /// to a command.
-    fn on_ui_event(&mut self, node: &str, kind: EventKind) {
+    fn on_ui_event(&mut self, node: &str, kind: &EventKind) {
         if let Some(id) = node.strip_prefix("vw-l-") {
             if matches!(kind, EventKind::Click) {
                 if let Some(DeviceStateValue::Light(light)) = self.device(id).map(|d| &d.state) {
@@ -673,13 +674,13 @@ impl Climate {
     fn peek(&self) -> Option<String> {
         let mut s = String::new();
         if let Some(t) = self.temp {
-            s.push_str(&format!("🌡 {t:.1}°"));
+            let _ = write!(s, "🌡 {t:.1}°");
         }
         if let Some(h) = self.humidity {
             if !s.is_empty() {
                 s.push_str("  ");
             }
-            s.push_str(&format!("💧 {h:.0}%"));
+            let _ = write!(s, "💧 {h:.0}%");
         }
         (!s.is_empty()).then_some(s)
     }
@@ -692,6 +693,10 @@ impl Climate {
 /// `allow_toggle` and `show_slider` are **independent**, matching GTK: a light
 /// can be toggle-only (`switch`, no `slider`), brightness-only (`slider`, no
 /// `switch`), both, or a static readout (neither).
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "four independent per-element display toggles, not a state machine; this PR is the lint gate, not a RowOpts redesign"
+)]
 struct RowOpts<'a> {
     /// The row label: the config `name`, or the device's own name.
     name: &'a str,
@@ -912,7 +917,7 @@ mod tests {
             battery_powered: false,
             reachable: true,
             last_seen: 0,
-            custom_attributes: Default::default(),
+            custom_attributes: std::collections::HashMap::default(),
         }
     }
 
@@ -1014,7 +1019,9 @@ mod tests {
                 }
                 _ => {}
             }
-            children_of(node).iter().for_each(|c| walk(c, out));
+            for c in &children_of(node) {
+                walk(c, out);
+            }
         }
         let mut out = Vec::new();
         walk(node, &mut out);
@@ -1060,7 +1067,9 @@ mod tests {
             if let Node::Icon { name, .. } = node {
                 out.push(name.clone());
             }
-            children_of(node).iter().for_each(|c| walk(c, out));
+            for c in &children_of(node) {
+                walk(c, out);
+            }
         }
         let mut out = Vec::new();
         walk(node, &mut out);
@@ -1098,7 +1107,9 @@ mod tests {
             if let Node::Label { text, .. } = node {
                 out.push(text.clone());
             }
-            children_of(node).iter().for_each(|c| walk(c, out));
+            for c in &children_of(node) {
+                walk(c, out);
+            }
         }
         let mut out = Vec::new();
         walk(node, &mut out);

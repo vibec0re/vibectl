@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use v1bectl_sync::*;
+use v1bectl_sync::{DeviceInfo, DeviceStateValue, LightState, RgbColor};
 
 pub struct HttpClient {
     base_url: String,
@@ -25,7 +25,7 @@ impl HttpClient {
         let base_url = if server_addr.starts_with("http") {
             server_addr
         } else {
-            format!("http://{}", server_addr)
+            format!("http://{server_addr}")
         };
 
         Self {

@@ -12,6 +12,8 @@ use v1bectl_sync::DeviceStateValue;
 
 // 🔥 MAIN DASHBOARD RENDER - STACKED CYBER CARDS! 💖
 pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
+    const CARD_HEIGHT: u16 = 4; // Height of each card (2 lines + borders)
+
     // 🔥 Get favorite devices IN ORDER! 💖
     let mut favorites: Vec<_> = Vec::new();
     for fav_id in &app.favorites {
@@ -37,7 +39,7 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     // 🔥 STACKED LAYOUT - COMPACT 2-LINE CARDS! SCROLLABLE! 💖
-    let card_height = 4; // Height of each card (2 lines + borders)
+    let card_height = usize::from(CARD_HEIGHT);
     let visible_cards = (area.height as usize).saturating_sub(2) / card_height;
 
     // No container border - just use the full area!
@@ -70,15 +72,12 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate();
 
     for (index, device) in cards_to_render {
+        let index_u16 = u16::try_from(index).unwrap_or(u16::MAX);
         let card_area = Rect {
             x: inner.x,
-            y: inner.y + (index as u16 * card_height as u16),
+            y: inner.y + (index_u16 * CARD_HEIGHT),
             width: inner.width,
-            height: (card_height as u16).min(
-                inner
-                    .height
-                    .saturating_sub(index as u16 * card_height as u16),
-            ),
+            height: CARD_HEIGHT.min(inner.height.saturating_sub(index_u16 * CARD_HEIGHT)),
         };
 
         let is_selected = (scroll_offset + index) == selected_fav_index;
@@ -101,7 +100,7 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 // 🔥 RENDER INDIVIDUAL DEVICE CARD - SPLIT LAYOUT! 💖
-fn render_device_card(f: &mut Frame, device: &&crate::AppDevice, area: Rect, is_selected: bool) {
+fn render_device_card(f: &mut Frame, device: &crate::AppDevice, area: Rect, is_selected: bool) {
     // 🔥 DYNAMIC BORDER COLOR BASED ON STATE! 💖
     let border_color = if is_selected {
         Color::Yellow
@@ -164,10 +163,7 @@ fn render_device_card(f: &mut Frame, device: &&crate::AppDevice, area: Rect, is_
     let info_lines = vec![
         Line::from(vec![
             Span::raw(" "), // Left padding
-            Span::styled(
-                format!("{} ", device_icon),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("{device_icon} "), Style::default().fg(Color::White)),
             Span::styled(
                 truncate_string(&device.info.name, 20),
                 Style::default()
@@ -253,7 +249,7 @@ fn render_light_status(
             ),
             Span::raw(bar),
             Span::styled(
-                format!(" {}%", brightness),
+                format!(" {brightness}%"),
                 Style::default()
                     .fg(brightness_color(brightness))
                     .add_modifier(Modifier::BOLD),
@@ -292,7 +288,7 @@ fn render_sensor_status(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:.1}°C", temp),
+                format!("{temp:.1}°C"),
                 Style::default()
                     .fg(temp_color(temp))
                     .add_modifier(Modifier::BOLD),
@@ -314,7 +310,7 @@ fn render_sensor_status(
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{}%", humidity),
+                format!("{humidity}%"),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -437,9 +433,14 @@ fn render_switch_status(
 
 // 🔥 CREATE MINI BRIGHTNESS BAR - 10 CHARS! 💖
 fn create_mini_brightness_bar(brightness: u8) -> String {
-    let percentage = brightness as f32 / 100.0;
+    let percentage = f32::from(brightness) / 100.0;
     let bar_width = 10;
-    let filled_chars = (percentage * bar_width as f32).round() as usize;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "percentage is brightness/100 (brightness: u8, so 0.0..=2.55) times the 10-char bar width; always small and non-negative"
+    )]
+    let filled_chars = (percentage * 10.0).round() as usize;
 
     let mut bar = String::new();
     for i in 0..bar_width {

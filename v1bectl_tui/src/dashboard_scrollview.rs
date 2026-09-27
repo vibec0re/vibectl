@@ -45,16 +45,18 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
 
     // 🔥 CALCULATE CONTENT SIZE AND SCROLL! 💖
     let card_height = 4u16;
-    let total_height = (favorites.len() as u16 * card_height).max(area.height);
+    let favorites_len_u16 = u16::try_from(favorites.len()).unwrap_or(u16::MAX);
+    let total_height = (favorites_len_u16 * card_height).max(area.height);
 
     // Create scroll view
     let mut scroll_view = ScrollView::new(Size::new(area.width, total_height));
 
     // 🔥 RENDER ALL CARDS INTO SCROLL VIEW! 💖
     for (index, device) in favorites.iter().enumerate() {
+        let index_u16 = u16::try_from(index).unwrap_or(u16::MAX);
         let card_area = Rect {
             x: 0,
-            y: (index as u16 * card_height),
+            y: (index_u16 * card_height),
             width: area.width,
             height: card_height,
         };
@@ -65,7 +67,7 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
 
     // 🔥 AUTO-SCROLL TO KEEP SELECTED IN VIEW! 💖
     if let Some(ref mut scroll_state) = app.dashboard_scroll_state {
-        let selected_y = selected_fav_index as u16 * card_height;
+        let selected_y = u16::try_from(selected_fav_index).unwrap_or(u16::MAX) * card_height;
         let viewport_height = area.height;
 
         // Ensure selected item is visible
@@ -86,7 +88,7 @@ pub fn render_dashboard(f: &mut Frame, app: &mut App, area: Rect) {
 // 🔥 RENDER DEVICE CARD! 💖
 fn render_device_card(
     scroll_view: &mut ScrollView,
-    device: &&crate::AppDevice,
+    device: &crate::AppDevice,
     area: Rect,
     is_selected: bool,
 ) {
@@ -151,7 +153,7 @@ fn render_device_card(
 // 🔥 RENDER DEVICE INFO! 💖
 fn render_device_info(
     scroll_view: &mut ScrollView,
-    device: &&crate::AppDevice,
+    device: &crate::AppDevice,
     area: Rect,
     is_selected: bool,
 ) {
@@ -172,10 +174,7 @@ fn render_device_info(
     let info_lines = vec![
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(
-                format!("{} ", device_icon),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("{device_icon} "), Style::default().fg(Color::White)),
             Span::styled(
                 truncate_string(&device.info.name, 20),
                 Style::default()
@@ -206,9 +205,13 @@ fn render_device_info(
 }
 
 // 🔥 RENDER DEVICE STATUS! 💖
+#[expect(
+    clippy::too_many_lines,
+    reason = "one big per-device-kind status match; splitting each arm out is a real restructure, not this gate PR's job"
+)]
 fn render_device_status(
     scroll_view: &mut ScrollView,
-    device: &&crate::AppDevice,
+    device: &crate::AppDevice,
     area: Rect,
     is_selected: bool,
 ) {
@@ -246,7 +249,7 @@ fn render_device_status(
                     ),
                     Span::raw(create_mini_brightness_bar(b)),
                     Span::styled(
-                        format!(" {}%", b),
+                        format!(" {b}%"),
                         Style::default()
                             .fg(brightness_color(b))
                             .add_modifier(Modifier::BOLD),
@@ -271,7 +274,7 @@ fn render_device_status(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{:.1}°C", t),
+                        format!("{t:.1}°C"),
                         Style::default()
                             .fg(temp_color(t))
                             .add_modifier(Modifier::BOLD),
@@ -293,7 +296,7 @@ fn render_device_status(
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        format!("{}%", h),
+                        format!("{h}%"),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -429,9 +432,14 @@ fn render_no_favorites(f: &mut Frame, area: Rect) {
 
 // 🔥 HELPER FUNCTIONS! 💖
 fn create_mini_brightness_bar(brightness: u8) -> String {
-    let percentage = brightness as f32 / 100.0;
+    let percentage = f32::from(brightness) / 100.0;
     let bar_width = 10;
-    let filled_chars = (percentage * bar_width as f32).round() as usize;
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "percentage is brightness/100 (brightness: u8, so 0.0..=2.55) times the 10-char bar width; always small and non-negative"
+    )]
+    let filled_chars = (percentage * 10.0).round() as usize;
 
     (0..bar_width)
         .map(|i| if i < filled_chars { '█' } else { '░' })

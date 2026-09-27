@@ -11,7 +11,7 @@ mod websocket_client;
 use clap::{Parser, Subcommand};
 use tabled::{Table, Tabled};
 use tracing::Level;
-use v1bectl_sync::*;
+use v1bectl_sync::{DeviceStateValue, EventType};
 use websocket_client::WebSocketClient;
 
 #[derive(Parser)]
@@ -79,6 +79,10 @@ struct DeviceRow {
 }
 
 #[tokio::main]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the subcommand dispatch is one linear match; splitting each arm into its own function is a real restructure, not this gate PR's job"
+)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
@@ -89,7 +93,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::List => {
             let (devices, total_count) = client.discover_devices().await?;
 
-            println!("Found {} devices:\n", total_count);
+            println!("Found {total_count} devices:\n");
 
             let rows: Vec<DeviceRow> = devices
                 .into_iter()
@@ -108,22 +112,22 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
 
             let table = Table::new(rows);
-            println!("{}", table);
+            println!("{table}");
         }
         Commands::Get { device_id } => {
             let state = client.get_device_state(&device_id).await?;
 
-            println!("Device: {}\n", device_id);
+            println!("Device: {device_id}\n");
 
             match state {
                 DeviceStateValue::Light(light) => {
                     println!("Type: Light");
                     println!("State: {}", if light.is_on { "ON" } else { "OFF" });
                     if let Some(brightness) = light.brightness {
-                        println!("Brightness: {}%", brightness);
+                        println!("Brightness: {brightness}%");
                     }
                     if let Some(temp) = light.color_temp {
-                        println!("Color Temperature: {}K", temp);
+                        println!("Color Temperature: {temp}K");
                     }
                     if let Some(rgb) = light.rgb_color {
                         println!("RGB Color: ({}, {}, {})", rgb.r, rgb.g, rgb.b);
@@ -133,23 +137,23 @@ async fn main() -> anyhow::Result<()> {
                     println!("Type: Switch");
                     println!("Pressed: {}", switch.is_pressed);
                     if let Some(battery) = switch.battery_level {
-                        println!("Battery: {}%", battery);
+                        println!("Battery: {battery}%");
                     }
                 }
                 DeviceStateValue::Sensor(sensor) => {
                     println!("Type: Sensor");
                     if let Some(temp) = sensor.temperature {
-                        println!("Temperature: {:.1}°C", temp);
+                        println!("Temperature: {temp:.1}°C");
                     }
                     if let Some(humidity) = sensor.humidity {
-                        println!("Humidity: {:.1}%", humidity);
+                        println!("Humidity: {humidity:.1}%");
                     }
                 }
                 DeviceStateValue::Empty => {
                     println!("Type: Virtual Controller (no state)");
                 }
                 _ => {
-                    println!("State: {:?}", state);
+                    println!("State: {state:?}");
                 }
             }
         }
@@ -181,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
                 // Send update
                 client.set_light_state(&device_id, light_state).await?;
 
-                println!("✓ Light {} updated successfully", device_id);
+                println!("✓ Light {device_id} updated successfully");
 
                 // Show new state
                 let new_state = client.get_device_state(&device_id).await?;
@@ -189,14 +193,14 @@ async fn main() -> anyhow::Result<()> {
                     println!("\nNew state:");
                     println!("  On: {}", light.is_on);
                     if let Some(b) = light.brightness {
-                        println!("  Brightness: {}%", b);
+                        println!("  Brightness: {b}%");
                     }
                     if let Some(t) = light.color_temp {
-                        println!("  Color temp: {}K", t);
+                        println!("  Color temp: {t}K");
                     }
                 }
             } else {
-                anyhow::bail!("{} is not a light device", device_id);
+                anyhow::bail!("{device_id} is not a light device");
             }
         }
         Commands::Subscribe { device_ids, json } => {
@@ -221,6 +225,10 @@ async fn main() -> anyhow::Result<()> {
                             println!("{}", serde_json::to_string(&event)?);
                         } else {
                             // Pretty formatted output
+                            #[expect(
+                                clippy::cast_possible_truncation,
+                                reason = "event timestamps are near-present wall-clock millis; this only truncates past year ~292 million"
+                            )]
                             let timestamp_millis = event
                                 .timestamp
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -232,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
                                     .unwrap_or_else(chrono::Utc::now)
                                     .format("%H:%M:%S%.3f");
 
-                            print!("⚡ [{}] ", timestamp);
+                            print!("⚡ [{timestamp}] ");
 
                             match &event.event_type {
                                 EventType::AttributeChanged {
@@ -277,7 +285,7 @@ async fn main() -> anyhow::Result<()> {
                                 EventType::BatteryLevelChanged { new_level, .. } => {
                                     print!("🔋 BATTERY - {} at {}%", event.device_id, new_level);
                                 }
-                                _ => {
+                                EventType::StateChanged { .. } => {
                                     print!("📨 {:?} - {}", event.event_type, event.device_id);
                                 }
                             }
@@ -285,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     Err(e) => {
-                        eprintln!("❌ Error receiving event: {}", e);
+                        eprintln!("❌ Error receiving event: {e}");
                         break;
                     }
                 }
@@ -312,13 +320,11 @@ async fn main() -> anyhow::Result<()> {
 
             let access_token = tokio::fs::read_to_string(&token_path)
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to read access token from {}: {}", token_path, e)
-                })?
+                .map_err(|e| anyhow::anyhow!("Failed to read access token from {token_path}: {e}"))?
                 .trim()
                 .to_string();
 
-            println!("📡 Connecting to Dirigera at {}...", dirigera_host);
+            println!("📡 Connecting to Dirigera at {dirigera_host}...");
 
             // Create HTTP client that accepts self-signed certs
             let client = reqwest::Client::builder()
@@ -327,10 +333,10 @@ async fn main() -> anyhow::Result<()> {
                 .build()?;
 
             // Fetch raw device data
-            let url = format!("https://{}:8443/v1/devices", dirigera_host);
+            let url = format!("https://{dirigera_host}:8443/v1/devices");
             let response = client
                 .get(&url)
-                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Authorization", format!("Bearer {access_token}"))
                 .send()
                 .await?;
 
@@ -350,7 +356,7 @@ async fn main() -> anyhow::Result<()> {
             // Write to file
             tokio::fs::write(&output, &pretty).await?;
 
-            println!("✅ Dumped raw Dirigera data to: {}", output);
+            println!("✅ Dumped raw Dirigera data to: {output}");
             println!("📊 Total size: {} bytes", pretty.len());
 
             // Quick analysis
@@ -368,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
 
                 println!("\n  Device types:");
                 for (dtype, count) in type_counts {
-                    println!("    {}: {}", dtype, count);
+                    println!("    {dtype}: {count}");
                 }
 
                 println!("\n💡 TIP: Check the dump file to see actual capabilities fields!");

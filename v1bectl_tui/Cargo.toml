@@ -31,3 +31,6 @@ futures-util = { workspace = true }
 clap = { workspace = true }
 dirs = "5.0"
 tui-scrollview = "0.4"  # 🔥 SMART SCROLLING WIDGET! 💖
+
+[lints]
+workspace = true

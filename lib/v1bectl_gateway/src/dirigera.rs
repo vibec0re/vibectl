@@ -8,7 +8,11 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{connect_async, tungstenite};
 use tracing::{debug, error, info, warn};
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    ButtonPressType, Capability, DeviceEvent, DeviceId, DeviceInfo, DeviceStateValue, DeviceType,
+    EventStream, EventType, Gateway, GatewayError, GatewayHealth, LightState, SensorState,
+    SwitchState,
+};
 
 // 🔥 mDNS COLLISION FALLBACK TUNING 💖
 // Highest numeric collision suffix we probe: base + `-2`..=`-N`. IKEA's
@@ -118,9 +122,14 @@ struct DirigeraWsEvent {
 }
 
 impl DirigeraGateway {
+    /// # Panics
+    ///
+    /// Panics if the underlying `reqwest` HTTP client fails to build (e.g. the
+    /// TLS backend can't initialize) — this is an environment failure, not a
+    /// runtime condition callers are expected to recover from.
     pub fn new(host: &str, access_token: &str, timeout: Duration) -> Self {
-        let base_url = format!("https://{}:8443/v1", host);
-        let ws_url = format!("wss://{}:8443/v1", host);
+        let base_url = format!("https://{host}:8443/v1");
+        let ws_url = format!("wss://{host}:8443/v1");
         let client = Client::builder()
             .timeout(timeout)
             .danger_accept_invalid_certs(true) // Dirigera uses self-signed certs
@@ -147,13 +156,18 @@ impl DirigeraGateway {
     /// Create from access token (env var or file)
     ///
     /// Token resolution order:
-    /// 1. V1BECTL_ACCESS_TOKEN environment variable (for NixOS/systemd)
-    /// 2. $HOME/.local/state/v1bectl/access.token file
+    /// 1. `V1BECTL_ACCESS_TOKEN` environment variable (for NixOS/systemd)
+    /// 2. `$HOME/.local/state/v1bectl/access.token` file
     ///
     /// 🔁 The configured host is resolved against mDNS collision variants
     /// (see `resolve_reachable_host`, private to this module) before the
     /// gateway is built, so a hub that re-advertised itself as
     /// `gw2-xxxx-2.local` is still found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no access token can be found in the environment
+    /// variable or the state file.
     pub async fn from_token_file(host: &str, timeout: Duration) -> Result<Self, GatewayError> {
         let access_token = Self::load_access_token().await?;
 
@@ -188,8 +202,7 @@ impl DirigeraGateway {
             .await
             .map_err(|e| {
                 GatewayError::InternalError(format!(
-                    "Failed to read access token from {}: {}",
-                    token_path, e
+                    "Failed to read access token from {token_path}: {e}"
                 ))
             })?
             .trim()
@@ -239,9 +252,9 @@ impl DirigeraGateway {
             }
         };
 
-        push_unique(&mut candidates, format!("{}.local", base));
+        push_unique(&mut candidates, format!("{base}.local"));
         for n in 2..=max_suffix {
-            push_unique(&mut candidates, format!("{}-{}.local", base, n));
+            push_unique(&mut candidates, format!("{base}-{n}.local"));
         }
 
         candidates
@@ -273,10 +286,10 @@ impl DirigeraGateway {
             .ok()?;
 
         for (idx, candidate) in candidates.iter().enumerate() {
-            let url = format!("https://{}:8443/v1/status", candidate);
+            let url = format!("https://{candidate}:8443/v1/status");
             match client
                 .get(&url)
-                .header("Authorization", format!("Bearer {}", access_token))
+                .header("Authorization", format!("Bearer {access_token}"))
                 .send()
                 .await
             {
@@ -307,13 +320,11 @@ impl DirigeraGateway {
         None
     }
 
-    fn convert_dirigera_device(&self, device: DirigeraDevice) -> Result<DeviceInfo, GatewayError> {
+    fn convert_dirigera_device(device: DirigeraDevice) -> DeviceInfo {
         let device_type = match device.device_type.as_str() {
-            "light" => DeviceType::Light,
-            "outlet" => DeviceType::Light, // Outlets are controllable like lights but simpler
-            "blinds" => DeviceType::Switch, // Map blinds to switch for now
+            "light" | "outlet" => DeviceType::Light, // Outlets are controllable like lights but simpler
+            "blinds" | "controller" => DeviceType::Switch, // Map blinds to switch for now
             "sensor" => DeviceType::Sensor,
-            "controller" => DeviceType::Switch,
             _ => {
                 warn!(
                     "Unknown Dirigera device type: {}, mapping to Light",
@@ -333,13 +344,13 @@ impl DirigeraGateway {
                     "isOn" => cap_list.push(Capability::OnOff),
                     "lightLevel" => {
                         // 🍺 IKEA GONKS HAD TOO MUCH SCHNAPS! OUTLETS DON'T HAVE BRIGHTNESS! CHOOOM FIX! 💖
-                        if device.device_type != "outlet" {
-                            cap_list.push(Capability::Brightness);
-                        } else {
+                        if device.device_type == "outlet" {
                             warn!(
                                 "🍺 Ignoring bullshit lightLevel for outlet {} - IKEA gonks drunk!",
                                 device.id
                             );
+                        } else {
+                            cap_list.push(Capability::Brightness);
                         }
                     }
                     "colorTemperature" => cap_list.push(Capability::ColorTemperature),
@@ -380,10 +391,7 @@ impl DirigeraGateway {
                 device.id
             );
             match device.device_type.as_str() {
-                "light" => vec![Capability::OnOff],
-                "outlet" => vec![Capability::OnOff],
                 "sensor" => vec![Capability::Temperature, Capability::Humidity],
-                "controller" => vec![Capability::OnOff],
                 _ => vec![Capability::OnOff],
             }
         };
@@ -399,7 +407,7 @@ impl DirigeraGateway {
             .custom_name
             .unwrap_or_else(|| format!("{} {}", device.device_category, device.id));
 
-        Ok(DeviceInfo {
+        DeviceInfo {
             device_id: device.id,
             name: device_name,
             device_type,
@@ -410,12 +418,12 @@ impl DirigeraGateway {
             firmware_version: None,
             battery_powered: device.attributes.battery_percentage.is_some(),
             reachable: device.is_reachable,
-            last_seen: chrono::Utc::now().timestamp_millis() as u64,
+            last_seen: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             custom_attributes: HashMap::new(),
-        })
+        }
     }
 
-    fn convert_dirigera_state(&self, device: &DirigeraDevice) -> DeviceStateValue {
+    fn convert_dirigera_state(device: &DirigeraDevice) -> DeviceStateValue {
         match device.device_type.as_str() {
             "outlet" => {
                 // 🍺 OUTLETS ARE JUST ON/OFF - NO BRIGHTNESS! IKEA GONKS DRUNK! CHOOOM FIX! 💖
@@ -437,7 +445,7 @@ impl DirigeraGateway {
             "sensor" => DeviceStateValue::Sensor(SensorState {
                 temperature: device.attributes.current_temperature,
                 humidity: device.attributes.current_humidity,
-                last_updated: chrono::Utc::now().timestamp_millis() as u64,
+                last_updated: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             }),
             "controller" => DeviceStateValue::Switch(SwitchState {
                 is_pressed: device.attributes.is_pressed.unwrap_or(false),
@@ -458,6 +466,10 @@ impl DirigeraGateway {
 }
 
 #[async_trait]
+#[expect(
+    clippy::too_many_lines,
+    reason = "async-trait's macro expansion collapses each long async fn's too_many_lines diagnostic onto this attribute; splitting the trait methods is a real refactor, not this gate PR's job"
+)]
 impl Gateway for DirigeraGateway {
     async fn discover_devices(&self) -> Result<Vec<DeviceInfo>, GatewayError> {
         info!("🔍 Discovering devices from Dirigera hub - VIBEC0RE LIVE DATA! 🔥");
@@ -475,13 +487,12 @@ impl Gateway for DirigeraGateway {
             let error_text = response.text().await.unwrap_or_default();
             error!("Dirigera API error: HTTP {} - {}", status, error_text);
             return Err(GatewayError::InternalError(format!(
-                "HTTP {}: {}",
-                status, error_text
+                "HTTP {status}: {error_text}"
             )));
         }
 
         let devices: Vec<DirigeraDevice> = response.json().await.map_err(|e| {
-            GatewayError::InternalError(format!("Failed to parse Dirigera response: {}", e))
+            GatewayError::InternalError(format!("Failed to parse Dirigera response: {e}"))
         })?;
 
         info!("🚀 Found {} devices from Dirigera hub!", devices.len());
@@ -495,18 +506,12 @@ impl Gateway for DirigeraGateway {
                 device.device_category,
                 device.attributes.custom_name
             );
-            match self.convert_dirigera_device(device) {
-                Ok(device_info) => {
-                    debug!(
-                        "✅ Converted device: {} ({:?})",
-                        device_info.name, device_info.device_type
-                    );
-                    device_infos.push(device_info);
-                }
-                Err(e) => {
-                    warn!("❌ Failed to convert device: {}", e);
-                }
-            }
+            let device_info = Self::convert_dirigera_device(device);
+            debug!(
+                "✅ Converted device: {} ({:?})",
+                device_info.name, device_info.device_type
+            );
+            device_infos.push(device_info);
         }
 
         info!(
@@ -538,16 +543,15 @@ impl Gateway for DirigeraGateway {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             return Err(GatewayError::InternalError(format!(
-                "HTTP {}: {}",
-                status, error_text
+                "HTTP {status}: {error_text}"
             )));
         }
 
         let device: DirigeraDevice = response.json().await.map_err(|e| {
-            GatewayError::InternalError(format!("Failed to parse device response: {}", e))
+            GatewayError::InternalError(format!("Failed to parse device response: {e}"))
         })?;
 
-        let state = self.convert_dirigera_state(&device);
+        let state = Self::convert_dirigera_state(&device);
         debug!("🔧 Got state for device {}: {:?}", device_id, state);
         Ok(state)
     }
@@ -576,7 +580,7 @@ impl Gateway for DirigeraGateway {
         }
 
         let device: DirigeraDevice = device_response.json().await.map_err(|e| {
-            GatewayError::InternalError(format!("Failed to parse device response: {}", e))
+            GatewayError::InternalError(format!("Failed to parse device response: {e}"))
         })?;
 
         let dirigera_payload = match state {
@@ -696,8 +700,7 @@ impl Gateway for DirigeraGateway {
                 device_id, status, error_text
             );
             return Err(GatewayError::InternalError(format!(
-                "HTTP {}: {}",
-                status, error_text
+                "HTTP {status}: {error_text}"
             )));
         } else {
             // Log response body for debugging even on success
@@ -722,7 +725,7 @@ impl Gateway for DirigeraGateway {
             .send()
             .await;
 
-        let response_time = start.elapsed().as_millis() as u64;
+        let response_time = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
         match response {
             Ok(resp) if resp.status().is_success() => {
@@ -768,9 +771,7 @@ impl Gateway for DirigeraGateway {
             .header("Authorization", format!("Bearer {}", self.access_token))
             .header("Sec-WebSocket-Protocol", "v1.user")
             .body(())
-            .map_err(|e| {
-                GatewayError::InternalError(format!("Failed to build WS request: {}", e))
-            })?;
+            .map_err(|e| GatewayError::InternalError(format!("Failed to build WS request: {e}")))?;
 
         // Clone values for the spawned task
         let ws_url = self.ws_url.clone();
@@ -803,7 +804,7 @@ impl Gateway for DirigeraGateway {
                                                     // Check if this is a button press event
                                                     if let Some(is_pressed) = data
                                                         .get("isPressed")
-                                                        .and_then(|v| v.as_bool())
+                                                        .and_then(serde_json::Value::as_bool)
                                                     {
                                                         info!("🔘 DIRIGERA BUTTON PRESS DETECTED: Device {} - Pressed: {}", device_id, is_pressed);
                                                     }
@@ -872,7 +873,7 @@ impl Gateway for DirigeraGateway {
                                                     .data
                                                     .as_ref()
                                                     .and_then(|d| d.get("isReachable"))
-                                                    .and_then(|v| v.as_bool())
+                                                    .and_then(serde_json::Value::as_bool)
                                                     .unwrap_or(true);
                                                 EventType::DeviceReachabilityChanged { reachable }
                                             }

@@ -4,7 +4,9 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn, Level};
 use v1bectl_api::AxumServer;
 use v1bectl_gateway::{DirigeraGateway, Gateway};
-use v1bectl_sync::*;
+use v1bectl_sync::{
+    recv_lossy, DeviceEvent, DeviceStateValue, EventBus, EventType, StateStore, SyncEngine,
+};
 use v1bectl_virtual::DummyGateway;
 
 #[derive(Parser)]
@@ -67,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
             let gateway: Arc<dyn Gateway> = Arc::new(
                 DirigeraGateway::from_token_file(&host, Duration::from_secs(timeout))
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to create Dirigera gateway: {}", e))?,
+                    .map_err(|e| anyhow::anyhow!("Failed to create Dirigera gateway: {e}"))?,
             );
 
             run_server(gateway, port).await
@@ -257,7 +259,7 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                                     .add_virtual_device(Box::new(light_group))
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(()) => {
                                         info!(
                                             "✅ Light group {} registered successfully!",
                                             cfg.device_id
@@ -319,7 +321,7 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                                     .add_virtual_device(Box::new(light_group))
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(()) => {
                                         info!(
                                             "✅ Linear light group {} registered successfully!",
                                             cfg.device_id
@@ -383,7 +385,7 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                                     .add_virtual_device(Box::new(button_controller))
                                     .await
                                 {
-                                    Ok(_) => {
+                                    Ok(()) => {
                                         info!(
                                             "✅ Button controller {} registered successfully!",
                                             cfg.device_id
@@ -467,8 +469,9 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                         // Check if this is a switch/button state change
                         if attribute == "state" {
                             if let Some(state_obj) = new_value.as_object() {
-                                if let Some(is_pressed) =
-                                    state_obj.get("is_pressed").and_then(|v| v.as_bool())
+                                if let Some(is_pressed) = state_obj
+                                    .get("is_pressed")
+                                    .and_then(serde_json::Value::as_bool)
                                 {
                                     info!(
                                         "🎛️ SWITCH STATE: Device {} - Pressed: {} -> {}",
@@ -476,7 +479,7 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                                         old_value
                                             .as_object()
                                             .and_then(|o| o.get("is_pressed"))
-                                            .and_then(|v| v.as_bool())
+                                            .and_then(serde_json::Value::as_bool)
                                             .unwrap_or(false),
                                         is_pressed
                                     );
@@ -559,7 +562,7 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
     // Start gateway health monitor - VIBEC0RE MONITORING! 💓
     let gateway_monitor = gateway.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        let mut interval = tokio::time::interval(Duration::from_mins(1));
 
         loop {
             interval.tick().await;
