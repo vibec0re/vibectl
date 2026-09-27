@@ -27,7 +27,7 @@ ciborium = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
-futures-util = "0.3"
+futures-util = { workspace = true }
 
 # Parses `screens.kdl` — the curated layout shared with the GTK client (which
 # pins the same major version). Trimmed to the `screen` blocks in `screens.rs`.

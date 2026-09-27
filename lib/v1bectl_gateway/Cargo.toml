@@ -13,15 +13,11 @@ tokio = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
-uuid = { workspace = true }
 async-trait = { workspace = true }
-rand = { workspace = true }
 chrono = { workspace = true }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
-futures-util = "0.3"
+tokio-tungstenite = { workspace = true, features = ["native-tls"] }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 mockall = { workspace = true }
