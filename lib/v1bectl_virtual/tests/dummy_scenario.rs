@@ -510,3 +510,38 @@ async fn shipped_light_groups_accept_writes_against_dummy() {
             .unwrap_or_else(|e| panic!("writing {id} failed: {e}"));
     }
 }
+
+/// #35: the API simulates a press only for a device the dummy simulates, so
+/// every device of every dummy scenario must carry the mark, and a device
+/// shaped the way a real hub reports one must not.
+#[tokio::test]
+async fn every_dummy_device_is_simulated() {
+    for scenario in ["basic_home", "large_home"] {
+        let devices = DummyGateway::new(scenario)
+            .discover_devices()
+            .await
+            .expect("discover");
+        assert!(!devices.is_empty(), "{scenario}: no devices");
+        for info in &devices {
+            assert!(
+                is_simulated(info),
+                "{scenario}: {} isn't marked simulated",
+                info.device_id
+            );
+        }
+    }
+
+    let mut devices = DummyGateway::new("basic_home")
+        .discover_devices()
+        .await
+        .expect("discover");
+    let real = DeviceInfo {
+        manufacturer: Some("IKEA".to_string()),
+        custom_attributes: HashMap::new(),
+        ..devices.remove(0)
+    };
+    assert!(
+        !is_simulated(&real),
+        "a real hub's device counts as simulated"
+    );
+}

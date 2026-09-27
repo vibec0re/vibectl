@@ -13,6 +13,24 @@ use v1bectl_sync::{
     SensorState, SwitchState, Timestamp,
 };
 
+/// The [`DeviceInfo::custom_attributes`] key that marks a device the
+/// [`DummyGateway`] simulates, set to `true` on every one of them. See
+/// [`is_simulated`].
+pub const SIMULATED_ATTRIBUTE: &str = "simulated";
+
+/// Whether `info` is a device the [`DummyGateway`] simulates (it carries
+/// [`SIMULATED_ATTRIBUTE`]). The API simulates a button press only for one
+/// of those (#35). A real hub's devices never carry it, so against a real
+/// hub every simulated press is refused: a remote there is pressed by hand,
+/// and the server must not make up presses the hub never saw.
+#[must_use]
+pub fn is_simulated(info: &DeviceInfo) -> bool {
+    info.custom_attributes
+        .get(SIMULATED_ATTRIBUTE)
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 pub struct DummyGateway {
     devices: Arc<RwLock<HashMap<DeviceId, MockDevice>>>,
     response_delays: ResponseDelayConfig,
@@ -307,7 +325,10 @@ impl DummyGateway {
             ),
             reachable: true,
             last_seen: chrono::Utc::now().timestamp_millis().cast_unsigned(),
-            custom_attributes: HashMap::new(),
+            custom_attributes: HashMap::from([(
+                SIMULATED_ATTRIBUTE.to_string(),
+                serde_json::Value::Bool(true),
+            )]),
         };
 
         devices.insert(
