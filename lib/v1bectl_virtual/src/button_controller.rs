@@ -6,7 +6,8 @@ use crate::virtual_device::{
 use async_trait::async_trait;
 use std::sync::Arc;
 use v1bectl_sync::{
-    DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState, StateStore,
+    ButtonPressType, DeviceEvent, DeviceId, DeviceStateValue, EventBus, EventType, LightState,
+    StateStore,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,8 +178,54 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
     transition(old, new)
 }
 
-/// Button Controller: runs an action when its button is pressed, and
-/// another when it's released.
+/// Button Controller: runs its actions when its button is pressed.
+///
+/// It has an action for each edge of a press, and one for a long press:
+/// `press_on` runs when the button goes down (a press), `press_off` when it
+/// comes back up (a release), and `press_on_long`, in place of `press_on`,
+/// for a press the hub reports as held (a long press). `press_off_long` is
+/// accepted and checked, but nothing runs it yet: no event source reports
+/// the end of a long press. A missing or empty action does nothing.
+///
+/// A press reaches it in one of two shapes, and each maps onto those
+/// actions like this (#35):
+///
+/// | Event from its button | What happened | Actions run, in order |
+/// |---|---|---|
+/// | switch echo, `is_pressed` `false` → `true` | the button went down | `press_on` |
+/// | switch echo, `is_pressed` `true` → `false` | the button came up | `press_off` |
+/// | switch echo that keeps `is_pressed` (a battery tick) | nothing | nothing |
+/// | `ButtonPressed { SinglePress }` | a click: down, then up | `press_on`, `press_off` |
+/// | `ButtonPressed { DoublePress }` | two clicks | `press_on`, `press_off`, `press_on`, `press_off` |
+/// | `ButtonPressed { LongPress }` | a press, still held | `press_on_long` (`press_on` if there's none) |
+///
+/// The switch echo is the sync engine's `{"Switch": …}` state echo, and
+/// only a change of `is_pressed` is a press or a release (#34). A
+/// `ButtonPressed` is a gesture a hub recognised on its own and reports
+/// whole, over its event stream: a Dirigera remote's `clickPattern`, or the
+/// dummy's. Why each gesture maps the way it does:
+///
+/// - **A `SinglePress` is a press and a release.** A hub reports a click
+///   once the button is back up. It can't tell a click from a long press
+///   before the release, or from a double press before the double-click
+///   time is up. So a click has both edges, and runs both actions.
+/// - **A `DoublePress` is two clicks.** The hub folds them into one event,
+///   and a controller has no action of its own for that, so it runs what
+///   two clicks run. That's also what it would have run had the hub
+///   reported two `SinglePress`es, so the result doesn't hang on the hub's
+///   double-click timing. Ignoring it would drop two real presses.
+/// - **A `LongPress` is a press that's still held.** A hub reports it while
+///   the button is still down, once it has been held long enough, and
+///   never reports the release. So only the press edge runs, with the long
+///   action. Running a release action would make one up. With the shipped
+///   binding (`inc` on the long press, `dec` on its release) it would also
+///   undo the long press.
+///
+/// The event's `button_id` (which of the remote's buttons; `main` when the
+/// hub doesn't say) isn't matched: a controller binds a whole device.
+///
+/// A pair like the shipped `on`/`off` is hold-to-light: the lights are on
+/// while the button is down. So a click turns them on and off again.
 ///
 /// It makes no writes of its own. Once it's registered, the
 /// [`VirtualDeviceManager`](crate::VirtualDeviceManager) hands it its
@@ -192,19 +239,16 @@ pub struct ButtonController {
     button_id: String, // Button device to listen to
     press_on_action: Option<ButtonAction>,
     press_off_action: Option<ButtonAction>,
-    // kept: long-press actions are accepted and stored now; the long-press
-    // detection path is not wired up yet, so these aren't read.
-    #[allow(dead_code)]
-    press_on_long_action: Option<Vec<serde_json::Value>>,
-    #[allow(dead_code)]
-    press_off_long_action: Option<Vec<serde_json::Value>>,
+    press_on_long_action: Option<ButtonAction>,
+    press_off_long_action: Option<ButtonAction>,
 }
 
 impl ButtonController {
-    /// A controller for `button_id` that runs `press_on` on a press and
-    /// `press_off` on a release. Each is `[command, target, amount]` (see
-    /// [`ButtonAction::parse`]); an empty one does nothing, and a malformed
-    /// one fails here.
+    /// A controller for `button_id` that runs `press_on` on a press,
+    /// `press_off` on a release, and `press_on_long` on a long press (see
+    /// the type's docs for what runs when). Each is `[command, target,
+    /// amount]` (see [`ButtonAction::parse`]); a missing or empty one does
+    /// nothing, and a malformed one fails here, the long ones too.
     ///
     /// `state_store` and `event_bus` aren't used any more (the manager
     /// delivers the events and makes the writes). They stay so callers
@@ -242,9 +286,35 @@ impl ButtonController {
             button_id,
             press_on_action: parse(&press_on)?,
             press_off_action: parse(&press_off)?,
-            press_on_long_action: press_on_long,
-            press_off_long_action: press_off_long,
+            press_on_long_action: parse(press_on_long.as_deref().unwrap_or_default())?,
+            press_off_long_action: parse(press_off_long.as_deref().unwrap_or_default())?,
         })
+    }
+
+    /// The action for one edge of a press: `press_on` when the button goes
+    /// down, `press_off` when it comes back up.
+    fn edge(&self, is_pressed: bool) -> Option<&ButtonAction> {
+        if is_pressed {
+            self.press_on_action.as_ref()
+        } else {
+            self.press_off_action.as_ref()
+        }
+    }
+
+    /// The actions for a gesture the hub reports whole, in the order they
+    /// run. The type's docs have the table, and why.
+    fn gesture(&self, press_type: &ButtonPressType) -> Vec<&ButtonAction> {
+        let click = [self.edge(true), self.edge(false)];
+        match press_type {
+            ButtonPressType::SinglePress => click.into_iter().flatten().collect(),
+            ButtonPressType::DoublePress => click.into_iter().chain(click).flatten().collect(),
+            ButtonPressType::LongPress => self
+                .press_on_long_action
+                .as_ref()
+                .or_else(|| self.edge(true))
+                .into_iter()
+                .collect(),
+        }
     }
 }
 
@@ -271,17 +341,15 @@ impl VirtualDevice for ButtonController {
         if event.device_id != self.button_id {
             return Vec::new();
         }
+        if let EventType::ButtonPressed { press_type, .. } = &event.event_type {
+            tracing::debug!("🔘 Button {} reported a {:?}", self.button_id, press_type);
+            return self.gesture(press_type).into_iter().cloned().collect();
+        }
         let Some(is_pressed) = pressed(event) else {
             return Vec::new();
         };
         tracing::debug!("🔘 Button {} pressed: {}", self.button_id, is_pressed);
-
-        let action = if is_pressed {
-            &self.press_on_action
-        } else {
-            &self.press_off_action
-        };
-        action.iter().cloned().collect()
+        self.edge(is_pressed).into_iter().cloned().collect()
     }
 
     fn current_state(&self) -> DeviceStateValue {
@@ -296,9 +364,14 @@ impl VirtualDevice for ButtonController {
     fn output_devices(&self) -> Vec<DeviceId> {
         // The targets of its actions
         let mut devices = Vec::new();
-        for action in [&self.press_on_action, &self.press_off_action]
-            .into_iter()
-            .flatten()
+        for action in [
+            &self.press_on_action,
+            &self.press_off_action,
+            &self.press_on_long_action,
+            &self.press_off_long_action,
+        ]
+        .into_iter()
+        .flatten()
         {
             if !devices.contains(&action.target) {
                 devices.push(action.target.clone());
