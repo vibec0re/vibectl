@@ -18,8 +18,8 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use v1bectl_sync::{
-    recv_or_lag, ButtonPressType, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus,
-    EventType, Gateway, LightState, OutletState, Recv, RgbColor, SceneState, StateStore,
+    ButtonPressType, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus, EventType,
+    Gateway, LagAwareReceiver, LightState, OutletState, Recv, RgbColor, SceneState, StateStore,
     SyncEngine,
 };
 use v1bectl_virtual::{
@@ -43,17 +43,34 @@ pub struct AxumServer {
 
 /// What goes out to a WebSocket client unasked, next to the answers to its
 /// requests.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 enum Outbound {
     /// A bus event, sent as an `Event` frame.
     Event(DeviceEvent),
     /// Every device in the store, after the forwarder fell behind the bus
     /// and the client missed events (#15). It goes out as a `DeviceList`
-    /// response nobody asked for (see [`spawn_event_forwarder`]).
-    Resync(Vec<DeviceState>),
+    /// response nobody asked for (see [`spawn_event_forwarder`]). This is
+    /// that response, encoded once for every client (see [`Self::resync`]).
+    Resync(Arc<[u8]>),
+}
+
+impl std::fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Event(event) => f.debug_tuple("Event").field(event).finish(),
+            Self::Resync(response) => write!(f, "Resync({} bytes)", response.len()),
+        }
+    }
 }
 
 impl Outbound {
+    /// A resync with `devices`, the whole store.
+    fn resync(devices: Vec<DeviceState>) -> Result<Self, ciborium::ser::Error<std::io::Error>> {
+        Ok(Self::Resync(
+            cbor(&ApiResponse::device_list(devices))?.into(),
+        ))
+    }
+
     /// The binary WebSocket frame the client gets for this, with a
     /// correlation id of its own. A resync is a `DeviceList` `Response`,
     /// the answer to `DiscoverDevices`: every client already takes one,
@@ -63,10 +80,7 @@ impl Outbound {
     fn into_frame(self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
         let (message_type, payload) = match self {
             Self::Event(event) => (ApiMessageType::Event, cbor(&event)?),
-            Self::Resync(devices) => (
-                ApiMessageType::Response,
-                cbor(&ApiResponse::device_list(devices))?,
-            ),
+            Self::Resync(response) => (ApiMessageType::Response, response.to_vec()),
         };
         cbor(&ApiMessage {
             correlation_id: Uuid::new_v4().to_string(),
@@ -832,29 +846,43 @@ impl AxumServer {
 ///
 /// When the forwarder falls behind the bus, the events it missed never
 /// reach the clients, and their devices would show stale state until they
-/// changed again (#15). So it then sends each client every device in the
-/// store (see [`Outbound::Resync`]), and goes on with the events still
-/// buffered. Some of those may be older than that snapshot, but each device
-/// still ends at its last event, which is what the store holds.
+/// changed again (#15). So it first forwards the events still buffered,
+/// and then sends each client every device in the store (see
+/// [`Outbound::Resync`]), once, taken at the bus's edge (see
+/// [`LagAwareReceiver`]). No event older than that snapshot follows it, and
+/// a burst that goes on meanwhile doesn't make it resync again (#47
+/// review).
 fn spawn_event_forwarder(
-    mut event_rx: broadcast::Receiver<DeviceEvent>,
+    event_rx: broadcast::Receiver<DeviceEvent>,
     state_store: Arc<StateStore>,
     subscribers: Subscribers,
 ) {
     debug!("📢 API Server subscribed to EventBus - will forward events to WebSocket clients!");
 
     tokio::spawn(async move {
+        let mut events = LagAwareReceiver::new(event_rx, "WebSocket forwarder");
         loop {
-            let outbound = match recv_or_lag(&mut event_rx, "WebSocket forwarder").await {
+            let outbound = match events.recv().await {
                 Recv::Event(event) => {
                     debug!("🔥 Forwarding event to WebSocket clients: {:?}", event);
                     Outbound::Event(event)
                 }
                 Recv::Lagged(_) => {
+                    // Nobody missed anything (a client that connects later
+                    // asks for its device list anyway).
+                    if subscribers.read().await.is_empty() {
+                        continue;
+                    }
                     info!(
                         "🔧 Resyncing every WebSocket client with the store after missing events"
                     );
-                    Outbound::Resync(state_store.list_devices().await)
+                    match Outbound::resync(state_store.list_devices().await) {
+                        Ok(resync) => resync,
+                        Err(e) => {
+                            error!("Failed to encode the resync as CBOR: {}", e);
+                            continue;
+                        }
+                    }
                 }
                 Recv::Closed => break,
             };
@@ -1926,6 +1954,55 @@ mod tests {
         }
     }
 
+    /// What `client` gets, up to and including the first message `last`
+    /// matches. The timeout only bounds a failure.
+    async fn receive_until(
+        client: &mut tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+        last: impl Fn(&Outbound) -> bool,
+    ) -> Vec<Outbound> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut received = Vec::new();
+            while let Some(outbound) = client.recv().await {
+                let done = last(&outbound);
+                received.push(outbound);
+                if done {
+                    return received;
+                }
+            }
+            panic!("the client's channel closed");
+        })
+        .await
+        .expect("the forwarder never sent it")
+    }
+
+    fn is_event(device_id: &str) -> impl Fn(&Outbound) -> bool + '_ {
+        move |outbound| matches!(outbound, Outbound::Event(e) if e.device_id == device_id)
+    }
+
+    fn is_resync(outbound: &Outbound) -> bool {
+        matches!(outbound, Outbound::Resync(_))
+    }
+
+    /// A forwarder on a 4-slot bus, with one client. The client has a first
+    /// event once this returns, so the forwarder has run, and waits for the
+    /// next one (on the `current_thread` test runtime nothing else runs it).
+    async fn warm_forwarder(
+        store: Arc<StateStore>,
+    ) -> (
+        broadcast::Sender<DeviceEvent>,
+        Subscribers,
+        tokio::sync::mpsc::UnboundedReceiver<Outbound>,
+    ) {
+        let (bus, rx) = broadcast::channel(4);
+        let subscribers: Subscribers = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut client) = tokio::sync::mpsc::unbounded_channel();
+        subscribers.write().await.insert("client".to_string(), tx);
+        spawn_event_forwarder(rx, store, Arc::clone(&subscribers));
+        bus.send(removed("warmup")).expect("forwarder subscribed");
+        receive_until(&mut client, is_event("warmup")).await;
+        (bus, subscribers, client)
+    }
+
     /// #15: once the forwarder has fallen behind the bus, the client gets
     /// the whole store, then the live events again. A 4-slot bus overflows
     /// while the forwarder is held at the subscriber lock, and the kitchen
@@ -1934,15 +2011,15 @@ mod tests {
     ///
     /// The resync must come once, carry exactly what the store holds, and
     /// go out as the unsolicited `DeviceList` response every client already
-    /// takes as its new device list.
+    /// takes as its new device list. The forwarder has run before the burst
+    /// (see [`warm_forwarder`]), so a snapshot it took before it knew of the
+    /// lag would miss the kitchen light's move (#47 review, finding 2). And
+    /// no event from before the resync may follow it (finding 1): the
+    /// forwarder hands on what's still buffered first.
     #[tokio::test]
     async fn event_forwarder_resyncs_the_clients_after_falling_behind() {
         let home = home().await;
-        let (bus, rx) = broadcast::channel(4);
-        let subscribers: Subscribers = Arc::new(RwLock::new(HashMap::new()));
-        let (tx, mut client) = tokio::sync::mpsc::unbounded_channel();
-        subscribers.write().await.insert("client".to_string(), tx);
-        spawn_event_forwarder(rx, Arc::clone(&home.store), Arc::clone(&subscribers));
+        let (bus, subscribers, mut client) = warm_forwarder(Arc::clone(&home.store)).await;
 
         let kitchen = "light_kitchen".to_string();
         let moved = DeviceStateValue::Light(LightState {
@@ -1955,7 +2032,7 @@ mod tests {
         assert_ne!(before, moved, "the kitchen light must move");
         {
             // The forwarder gets no further than its first event before we
-            // let go. It may not even have been polled yet.
+            // let go.
             let _held = subscribers.write().await;
             bus.send(removed("first")).expect("forwarder subscribed");
             home.store
@@ -1976,55 +2053,74 @@ mod tests {
                 bus.send(removed("flood")).expect("forwarder subscribed");
             }
         }
-        bus.send(removed("live")).expect("forwarder subscribed");
 
-        // The timeout only bounds a failure; `live` ends the wait.
-        let received = tokio::time::timeout(Duration::from_secs(10), async {
-            let mut received = Vec::new();
-            while let Some(outbound) = client.recv().await {
-                let live = matches!(&outbound, Outbound::Event(e) if e.device_id == "live");
-                received.push(outbound);
-                if live {
-                    return received;
-                }
-            }
-            panic!("the client's channel closed");
-        })
-        .await
-        .expect("forwarding died behind the bus: `live` never reached the client");
-
-        let resyncs: Vec<&Outbound> = received
-            .iter()
-            .filter(|outbound| matches!(outbound, Outbound::Resync(_)))
-            .collect();
-        assert_eq!(resyncs.len(), 1, "one resync for the lag: {received:?}");
+        let received = receive_until(&mut client, is_resync).await;
         assert!(
-            !received
-                .iter()
-                .any(|o| matches!(o, Outbound::Event(e) if e.device_id == kitchen)),
-            "the kitchen echo should have been lost to the lag"
+            !received.iter().any(is_event(&kitchen)),
+            "the kitchen echo should have been lost to the lag: {received:?}"
         );
-        let resynced = by_id(decoded_by_a_client(resyncs[0].clone()));
-        assert_eq!(
-            resynced,
-            by_id(home.store.list_devices().await),
-            "the resync must be the store"
-        );
+        let resynced = by_id(decoded_by_a_client(received.last().unwrap().clone()));
         assert!(
             resynced
                 .iter()
                 .any(|d| d.device_id == kitchen && d.state == moved),
             "the resync must carry the kitchen light's move"
         );
+        assert_eq!(
+            resynced,
+            by_id(home.store.list_devices().await),
+            "the resync must be the store"
+        );
 
-        // And live events keep coming, with no more resyncs.
-        bus.send(removed("later")).expect("forwarder subscribed");
-        let later = tokio::time::timeout(Duration::from_secs(10), client.recv())
-            .await
-            .expect("`later` never reached the client");
+        // And then live events, with nothing from before the resync and no
+        // more resyncs.
+        bus.send(removed("live")).expect("forwarder subscribed");
+        let after = receive_until(&mut client, is_event("live")).await;
+        assert_eq!(after.len(), 1, "only `live` after the resync: {after:?}");
+    }
+
+    /// #47 review, finding 1: a burst that goes on while the forwarder
+    /// catches up must not make it resync again and again. The forwarder
+    /// falls behind a 4-slot bus, and while it's held at the subscriber lock
+    /// in the middle of catching up, another ring's worth of events comes
+    /// in. Resyncing right at the lag left it a whole ring behind the bus,
+    /// so those events lagged it again: a second resync (and, as long as
+    /// the burst went on, one after another, with no event forwarded in
+    /// between). It must be one resync for the lag, once what's buffered is
+    /// handed on, and then live events.
+    #[tokio::test]
+    async fn event_forwarder_resyncs_once_under_a_burst_that_goes_on() {
+        let (bus, subscribers, mut client) = warm_forwarder(StateStore::new()).await;
+        {
+            let _held = subscribers.write().await;
+            for _ in 0..8 {
+                bus.send(removed("flood")).expect("forwarder subscribed");
+            }
+            // The forwarder runs until it waits here, with its next message.
+            tokio::task::yield_now().await;
+            for _ in 0..4 {
+                bus.send(removed("burst")).expect("forwarder subscribed");
+            }
+        }
+
+        let mut received = receive_until(&mut client, is_resync).await;
+        bus.send(removed("live")).expect("forwarder subscribed");
+        let after = receive_until(&mut client, is_event("live")).await;
+        let resyncs = received.iter().chain(&after).filter(|o| is_resync(o));
+        assert_eq!(
+            resyncs.count(),
+            1,
+            "one resync for the lag: {received:?}, then {after:?}"
+        );
+        assert_eq!(after.len(), 1, "only `live` after the resync: {after:?}");
+        received.pop();
         assert!(
-            matches!(&later, Some(Outbound::Event(e)) if e.device_id == "later"),
-            "{later:?}"
+            received.first().is_some_and(is_event("flood")),
+            "the burst must come in while the forwarder catches up: {received:?}"
+        );
+        assert!(
+            received.iter().skip(1).all(is_event("burst")),
+            "the burst is handed on before the resync: {received:?}"
         );
     }
 
