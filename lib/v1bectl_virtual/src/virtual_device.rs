@@ -52,7 +52,9 @@ pub trait VirtualDevice: Send + Sync {
     /// Called when virtual device state should change (API request)
     async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError>;
 
-    /// Called when input device states change
+    /// Called when input device states change. `new_state` is the input as
+    /// the store holds it when the manager gets to the change, which can be
+    /// newer than the event that announced it.
     async fn on_input_changed(
         &mut self,
         device_id: &DeviceId,
@@ -61,6 +63,21 @@ pub trait VirtualDevice: Send + Sync {
         // Default implementation does nothing
         let _ = (device_id, new_state);
         Ok(())
+    }
+
+    /// Whether this device's current state already accounts for `state`,
+    /// which `input` (one of [`Self::input_devices`]) holds now. It does if
+    /// fanning the current state out again would leave `input` as it is.
+    /// The manager then skips [`Self::on_input_changed`] for it.
+    ///
+    /// This is how a group tells the echo of its own write from a real
+    /// outside change. It matters because re-deriving a group from its
+    /// members can be lossy (a linear group set to 50 reads back as 60).
+    ///
+    /// The default, `false`, re-derives on every input change.
+    fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
+        let _ = (input, state);
+        false
     }
 
     /// Get current virtual device state

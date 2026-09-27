@@ -281,7 +281,16 @@ impl SyncEngine {
         }
     }
 
+    /// The configuration this engine runs with.
+    pub fn config(&self) -> &SyncConfig {
+        &self.config
+    }
+
     // 🔥 OPTIMISTIC UPDATE - INSTANT UI FEEDBACK!
+    /// Queue `new_state` for the gateway. With `optimistic_updates` on, it
+    /// also goes into the store right away and is echoed on the event bus.
+    /// With it off, only the push is queued: the store and the echo follow
+    /// once a pull confirms the push.
     pub async fn apply_optimistic_update(
         &self,
         device_id: &DeviceId,

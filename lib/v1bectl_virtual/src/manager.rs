@@ -1,10 +1,19 @@
 use crate::virtual_device::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use v1bectl_sync::*;
 
 /// Virtual Device Manager - coordinates all virtual devices 🔥
+///
+/// A write to a virtual device ([`Self::set_virtual_device_state`]) fans out
+/// to its members. Input tracking ([`Self::start`]) re-derives a virtual
+/// device when one of its inputs changes from outside. Each of these runs
+/// start to finish under the `virtual_devices` lock: the device's new state,
+/// its members' commits, its store state and every echo. So they never
+/// interleave. A second write can't land between a first write's fan-out
+/// and its commits, and echoes go out in the order the store changed.
 pub struct VirtualDeviceManager {
     /// All virtual devices indexed by device ID
     virtual_devices: Arc<RwLock<HashMap<DeviceId, Box<dyn VirtualDevice>>>>,
@@ -16,21 +25,25 @@ pub struct VirtualDeviceManager {
     state_store: Arc<StateStore>,
     /// Event bus for notifications
     event_bus: Arc<EventBus>,
-    /// The physical write path. When attached, member writes a virtual device
-    /// fans out go through `SyncEngine::apply_optimistic_update`, the same call
-    /// a direct write makes (store + echo + gateway push). Without it, members
-    /// are only echoed.
+    /// The physical write path. When one is attached, a virtual write
+    /// commits each member it changes through
+    /// `SyncEngine::apply_optimistic_update`, the call a direct write to
+    /// that member makes, so the member reaches the gateway. Without one,
+    /// members are only echoed.
     sync_engine: Arc<OnceLock<Arc<SyncEngine>>>,
-    /// virtual ID -> member ID -> the state that virtual device last wrote to
-    /// that member. Lets `handle_device_state_change` tell our own fan-out's
-    /// echo apart from a real external change.
-    commanded: Arc<RwLock<HashMap<DeviceId, HashMap<DeviceId, DeviceStateValue>>>>,
+    /// Set once [`Self::start`] has run (see [`Self::add_virtual_device`]).
+    tracking: Arc<AtomicBool>,
 }
 
 /// A state echo for `device_id`, in the same `AttributeChanged{attribute:
 /// "state"}` shape the sync engine publishes for a physical write. That's the
 /// shape every client (TUI, widget, GTK, web) and this manager's own input
 /// tracking decode.
+///
+/// `old_value` is the state the store held before, as in the engine's
+/// GatewayWins and confirmation echoes. (The engine's optimistic echo sends
+/// `Null` there.) Clients read only `new_value`; the server's event log
+/// prints both.
 fn state_event(
     device_id: &DeviceId,
     old_state: Option<&DeviceStateValue>,
@@ -49,6 +62,14 @@ fn state_event(
     }
 }
 
+fn warn_dangling(virtual_id: &DeviceId, device_id: &DeviceId) {
+    tracing::warn!(
+        "⚠️ Virtual device {} references unknown device {}",
+        virtual_id,
+        device_id
+    );
+}
+
 impl VirtualDeviceManager {
     pub fn new(state_store: Arc<StateStore>, event_bus: Arc<EventBus>) -> Self {
         Self {
@@ -58,7 +79,7 @@ impl VirtualDeviceManager {
             state_store,
             event_bus,
             sync_engine: Arc::new(OnceLock::new()),
-            commanded: Arc::new(RwLock::new(HashMap::new())),
+            tracking: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -83,12 +104,43 @@ impl VirtualDeviceManager {
             .await;
     }
 
+    /// Store `state` as virtual device `device_id`'s and echo it. If the
+    /// store already holds exactly that, do neither, unless `even_unchanged`.
+    async fn store_state(
+        &self,
+        device_id: &DeviceId,
+        state: DeviceStateValue,
+        even_unchanged: bool,
+    ) -> Result<(), StateError> {
+        let old_state = self
+            .state_store
+            .get_device(device_id)
+            .await
+            .map(|d| d.state);
+        if !even_unchanged && old_state.as_ref() == Some(&state) {
+            return Ok(());
+        }
+        self.state_store
+            .update_device_state(device_id, state.clone())
+            .await?;
+        self.publish_state(device_id, old_state.as_ref(), &state)
+            .await;
+        Ok(())
+    }
+
     /// Commit one member state that a virtual write already put in the store.
-    /// A physical member goes through the sync engine when one is attached.
-    /// That call writes the store again (same value), publishes the echo and
-    /// queues the gateway push, so it is the member's only publisher. If there
-    /// is no engine, or the member is itself virtual (the gateway doesn't know
-    /// it), the member is echoed here.
+    ///
+    /// A physical member goes through the sync engine when one is attached,
+    /// the way a direct write to it does. That queues the gateway push. With
+    /// optimistic updates on (the default) it also writes the store again
+    /// (same value) and publishes the echo, so it is the member's only
+    /// publisher.
+    ///
+    /// Otherwise the echo is ours: with no engine, for a virtual member (the
+    /// gateway doesn't know it), and with optimistic updates off. In that
+    /// mode a direct write is echoed once a pull confirms it. But the
+    /// fan-out has already put this member's state in the store, so that
+    /// pull finds nothing new and would never echo it.
     async fn commit_member_write(
         &self,
         member_id: &DeviceId,
@@ -101,7 +153,8 @@ impl VirtualDeviceManager {
                 .apply_optimistic_update(member_id, new_state.clone())
                 .await
             {
-                Ok(()) => return,
+                Ok(()) if engine.config().optimistic_updates => return,
+                Ok(()) => {}
                 Err(e) => tracing::warn!(
                     "❌ Failed to sync member {} of a virtual write: {}",
                     member_id,
@@ -122,14 +175,13 @@ impl VirtualDeviceManager {
         let output_devices = device.output_devices();
 
         // A dangling reference doesn't fail registration, only a later write
-        // (see #2), so flag it now.
-        for input_id in &input_devices {
-            if self.state_store.get_device(input_id).await.is_none() {
-                tracing::warn!(
-                    "⚠️ Virtual device {} references unknown device {}",
-                    device_id,
-                    input_id
-                );
+        // (see #2), so flag it now. Until tracking starts, other virtual
+        // devices may still be loading, and this one could point at one of
+        // them. `start` checks everything once they are all in.
+        if self.tracking.load(Ordering::Acquire) {
+            let refs = input_devices.iter().chain(&output_devices).cloned();
+            for missing in self.missing(refs.collect()).await {
+                warn_dangling(&device_id, &missing);
             }
         }
 
@@ -169,6 +221,45 @@ impl VirtualDeviceManager {
         Ok(())
     }
 
+    /// Every `(virtual device, device it reads or writes)` pair the store
+    /// has no device for: a group's members, a scene's devices, a
+    /// controller's button and targets. A dangling reference doesn't fail
+    /// registration, only a later write (see #2). [`Self::start`] logs these.
+    pub async fn dangling_references(&self) -> Vec<(DeviceId, DeviceId)> {
+        let references: Vec<(DeviceId, Vec<DeviceId>)> = {
+            let devices = self.virtual_devices.read().await;
+            devices
+                .values()
+                .map(|device| {
+                    let mut refs = device.input_devices();
+                    refs.extend(device.output_devices());
+                    (device.device_id().clone(), refs)
+                })
+                .collect()
+        };
+
+        let mut dangling = Vec::new();
+        for (virtual_id, refs) in references {
+            for missing in self.missing(refs).await {
+                dangling.push((virtual_id.clone(), missing));
+            }
+        }
+        dangling.sort();
+        dangling
+    }
+
+    /// The ids in `refs` the store has no device for, each once.
+    async fn missing(&self, refs: Vec<DeviceId>) -> Vec<DeviceId> {
+        let mut seen = HashSet::new();
+        let mut missing = Vec::new();
+        for id in refs {
+            if seen.insert(id.clone()) && self.state_store.get_device(&id).await.is_none() {
+                missing.push(id);
+            }
+        }
+        missing
+    }
+
     /// Remove a virtual device
     pub async fn remove_virtual_device(
         &self,
@@ -199,7 +290,6 @@ impl VirtualDeviceManager {
                 let mut output_map = self.output_mappings.write().await;
                 output_map.remove(device_id);
             }
-            self.commanded.write().await.remove(device_id);
 
             // Remove from state store
             self.state_store.remove_device(device_id).await?;
@@ -208,7 +298,71 @@ impl VirtualDeviceManager {
         Ok(())
     }
 
-    /// Handle device state change from physical devices
+    /// Input tracking for one event from the bus. A device's `state` change
+    /// (`AttributeChanged{attribute: "state"}`, the shape of every state
+    /// echo) goes to [`Self::handle_device_state_change`]; anything else is
+    /// ignored. [`Self::start`] runs this for every event on the bus. Call
+    /// it directly to drive tracking yourself instead (the tests do, to
+    /// control exactly when it catches up).
+    pub async fn handle_event(&self, event: &DeviceEvent) -> Result<(), VirtualDeviceError> {
+        let EventType::AttributeChanged {
+            attribute,
+            new_value,
+            ..
+        } = &event.event_type
+        else {
+            return Ok(());
+        };
+        if attribute != "state" {
+            return Ok(());
+        }
+        let Ok(new_state) = serde_json::from_value::<DeviceStateValue>(new_value.clone()) else {
+            return Ok(());
+        };
+
+        let timestamp_millis = event
+            .timestamp
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let device_state = DeviceState {
+            device_id: event.device_id.clone(),
+            device_info: DeviceInfo {
+                device_id: event.device_id.clone(),
+                name: "Unknown".to_string(),
+                device_type: DeviceType::Light,
+                capabilities: vec![],
+                device_groups: vec![],
+                manufacturer: None,
+                model: None,
+                firmware_version: None,
+                battery_powered: false,
+                reachable: true,
+                last_seen: timestamp_millis,
+                custom_attributes: std::collections::HashMap::new(),
+            },
+            state: new_state,
+            last_updated: timestamp_millis,
+            last_synced_from_gateway: Some(timestamp_millis),
+            last_synced_to_gateway: Some(timestamp_millis),
+        };
+
+        self.handle_device_state_change(&event.device_id, &device_state)
+            .await
+    }
+
+    /// Handle a state change of `device_id`, an input of virtual devices.
+    /// Each one whose current state doesn't already account for the input
+    /// (see [`VirtualDevice::accounts_for`]) is re-derived, and echoed if
+    /// that moved it.
+    ///
+    /// The input is judged as the store holds it now, not as `new_state`
+    /// (the event) has it. That is only the fallback for a device the store
+    /// doesn't have. Tracking can run behind the writes: by the time it gets
+    /// to a member's echo, later writes may have replaced that state.
+    /// Judging the stale one would re-derive the group from members that
+    /// have moved on.
     pub async fn handle_device_state_change(
         &self,
         device_id: &DeviceId,
@@ -224,83 +378,45 @@ impl VirtualDeviceManager {
             return Ok(());
         }
 
-        // Notify all dependent virtual devices
-        let mut echoes = Vec::new();
+        // Take the lock before reading the input, so no virtual write is
+        // half-done while we look.
         let mut devices = self.virtual_devices.write().await;
+        let stored = self.state_store.get_device(device_id).await;
+        let input = stored.as_ref().unwrap_or(new_state);
+
+        // Notify all dependent virtual devices
         for virtual_id in virtual_device_ids {
-            if self
-                .is_own_fanout(&virtual_id, device_id, &new_state.state)
-                .await
-            {
-                // This is the echo of this device's own write to the member.
-                // It already holds the state it commanded. Re-deriving it from
-                // the members is lossy (linear ranges) and forgets brightness
-                // on off, so an on after an off would light nothing.
+            let Some(virtual_device) = devices.get_mut(&virtual_id) else {
+                continue;
+            };
+            if virtual_device.accounts_for(device_id, &input.state) {
+                // The input is where this device's own state puts it: the
+                // echo of its own write, or a change it already reflects.
+                // Re-deriving anyway is lossy (linear ranges) and forgets the
+                // level on off, so an on after an off would light nothing.
                 continue;
             }
 
-            if let Some(virtual_device) = devices.get_mut(&virtual_id) {
-                if let Err(e) = virtual_device.on_input_changed(device_id, new_state).await {
-                    tracing::warn!(
-                        "Virtual device {} failed to handle input change: {}",
-                        virtual_id,
-                        e
-                    );
-                    continue;
-                }
-
-                // Update virtual device state in store, and echo it if it moved
-                let new_virtual_state = virtual_device.current_state();
-                let old_virtual_state = self
-                    .state_store
-                    .get_device(&virtual_id)
-                    .await
-                    .map(|d| d.state);
-                if old_virtual_state.as_ref() == Some(&new_virtual_state) {
-                    continue;
-                }
-                if let Err(e) = self
-                    .state_store
-                    .update_device_state(&virtual_id, new_virtual_state.clone())
-                    .await
-                {
-                    tracing::error!("Failed to update virtual device state: {}", e);
-                    continue;
-                }
-                echoes.push((virtual_id, old_virtual_state, new_virtual_state));
+            if let Err(e) = virtual_device.on_input_changed(device_id, input).await {
+                tracing::warn!(
+                    "Virtual device {} failed to handle input change: {}",
+                    virtual_id,
+                    e
+                );
+                continue;
             }
-        }
-        drop(devices);
 
-        for (virtual_id, old_state, new_state) in echoes {
-            self.publish_state(&virtual_id, old_state.as_ref(), &new_state)
-                .await;
+            // Update virtual device state in store, and echo it if it moved
+            let new_virtual_state = virtual_device.current_state();
+            if let Err(e) = self
+                .store_state(&virtual_id, new_virtual_state, false)
+                .await
+            {
+                tracing::error!("Failed to update virtual device state: {}", e);
+            }
         }
 
         Ok(())
-    }
-
-    /// Whether `state` on `member_id` is exactly what `virtual_id` last wrote
-    /// there. If the member has since diverged, the stale record is dropped,
-    /// so a later return to that value counts as a real change again.
-    async fn is_own_fanout(
-        &self,
-        virtual_id: &DeviceId,
-        member_id: &DeviceId,
-        state: &DeviceStateValue,
-    ) -> bool {
-        let mut commanded = self.commanded.write().await;
-        let Some(members) = commanded.get_mut(virtual_id) else {
-            return false;
-        };
-        match members.get(member_id) {
-            Some(expected) if expected == state => true,
-            Some(_) => {
-                members.remove(member_id);
-                false
-            }
-            None => false,
-        }
     }
 
     /// Set virtual device state (called from API)
@@ -309,13 +425,19 @@ impl VirtualDeviceManager {
     /// whose state the write changed. Members are committed through the
     /// attached sync engine (see [`Self::attach_sync_engine`]), the same way
     /// a direct write to them is.
+    ///
+    /// A write can fail part-way (a missing member, as in #2). The members
+    /// it did change are still committed and echoed, and the device is
+    /// re-derived from them and echoed, so it shows what happened rather
+    /// than its old state. Then the error is returned.
     pub async fn set_virtual_device_state(
         &self,
         device_id: &DeviceId,
         new_state: DeviceStateValue,
     ) -> Result<(), VirtualDeviceError> {
+        // Held to the end (see the type's docs).
         let mut devices = self.virtual_devices.write().await;
-        let Some(virtual_device) = devices.get_mut(device_id) else {
+        let Some(virtual_device) = devices.get(device_id) else {
             return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
         };
 
@@ -323,11 +445,11 @@ impl VirtualDeviceManager {
         let mut outputs = virtual_device.output_devices();
         let mut seen = HashSet::new();
         outputs.retain(|id| seen.insert(id.clone()));
-        let old_self = self
-            .state_store
-            .get_device(device_id)
-            .await
-            .map(|d| d.state);
+        let virtual_outputs: HashSet<DeviceId> = outputs
+            .iter()
+            .filter(|id| devices.contains_key(*id))
+            .cloned()
+            .collect();
         let mut old_outputs = HashMap::new();
         for id in &outputs {
             if let Some(device) = self.state_store.get_device(id).await {
@@ -336,14 +458,10 @@ impl VirtualDeviceManager {
         }
 
         // Update virtual device (writes its members into the store)
+        let Some(virtual_device) = devices.get_mut(device_id) else {
+            return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
+        };
         let result = virtual_device.set_state(new_state).await;
-        let current_state = virtual_device.current_state();
-        let virtual_outputs: HashSet<DeviceId> = outputs
-            .iter()
-            .filter(|id| devices.contains_key(*id))
-            .cloned()
-            .collect();
-        drop(devices);
 
         let mut changed = Vec::new();
         for id in outputs {
@@ -356,31 +474,46 @@ impl VirtualDeviceManager {
             }
         }
 
-        // Record before publishing, so our own echoes are recognised.
-        if !changed.is_empty() {
-            let mut commanded = self.commanded.write().await;
-            let members = commanded.entry(device_id.clone()).or_default();
-            for (id, _, state) in &changed {
-                members.insert(id.clone(), state.clone());
+        // A failed write leaves the device's own state where it was, but
+        // some members may have moved: re-derive it from them.
+        if result.is_err() {
+            let inputs = virtual_device.input_devices();
+            let moved_input = changed
+                .iter()
+                .map(|(id, ..)| id)
+                .find(|id| inputs.contains(id));
+            if let Some(input_id) = moved_input {
+                if let Some(input) = self.state_store.get_device(input_id).await {
+                    if let Err(e) = virtual_device.on_input_changed(input_id, &input).await {
+                        tracing::warn!(
+                            "Virtual device {} failed to re-derive after a failed write: {}",
+                            device_id,
+                            e
+                        );
+                    }
+                }
             }
         }
+        let current_state = virtual_device.current_state();
 
-        // A write can fail part-way (e.g. a missing member). Whatever it did
-        // change is in the store by now, so commit and echo that first.
+        // Whatever the write changed is in the store by now: commit and echo it.
         for (id, old_state, state) in &changed {
             self.commit_member_write(id, old_state.as_ref(), state, virtual_outputs.contains(id))
                 .await;
         }
-        result?;
 
-        // Update state in store
-        self.state_store
-            .update_device_state(device_id, current_state.clone())
-            .await?;
-        self.publish_state(device_id, old_self.as_ref(), &current_state)
-            .await;
-
-        Ok(())
+        match result {
+            Ok(()) => {
+                self.store_state(device_id, current_state, true).await?;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(store_error) = self.store_state(device_id, current_state, false).await {
+                    tracing::error!("Failed to update virtual device state: {}", store_error);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Get virtual device state
@@ -420,67 +553,25 @@ impl VirtualDeviceManager {
         }
     }
 
-    /// Start the manager (subscribe to state change events)
+    /// Start the manager: input tracking runs [`Self::handle_event`] for
+    /// every event on the bus, in a background task. It also logs every
+    /// dangling reference (see [`Self::dangling_references`]). The server
+    /// calls this once all virtual devices are loaded.
     pub async fn start(&self) -> Result<(), VirtualDeviceError> {
         let manager = Arc::new(self.clone());
 
         // Subscribe to state change events
         let mut event_receiver = self.event_bus.subscribe();
 
+        self.tracking.store(true, Ordering::Release);
+        for (virtual_id, missing) in self.dangling_references().await {
+            warn_dangling(&virtual_id, &missing);
+        }
+
         tokio::spawn(async move {
             while let Ok(event) = event_receiver.recv().await {
-                // 🔥 Handle attribute changes as state updates
-                if let EventType::AttributeChanged {
-                    attribute,
-                    new_value,
-                    ..
-                } = &event.event_type
-                {
-                    if attribute == "state" {
-                        // Try to deserialize the new_value as a DeviceStateValue
-                        if let Ok(new_state) =
-                            serde_json::from_value::<DeviceStateValue>(new_value.clone())
-                        {
-                            let timestamp_millis = event
-                                .timestamp
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis()
-                                as u64;
-
-                            let device_state = DeviceState {
-                                device_id: event.device_id.clone(),
-                                device_info: DeviceInfo {
-                                    device_id: event.device_id.clone(),
-                                    name: "Unknown".to_string(),
-                                    device_type: DeviceType::Light,
-                                    capabilities: vec![],
-                                    device_groups: vec![],
-                                    manufacturer: None,
-                                    model: None,
-                                    firmware_version: None,
-                                    battery_powered: false,
-                                    reachable: true,
-                                    last_seen: timestamp_millis,
-                                    custom_attributes: std::collections::HashMap::new(),
-                                },
-                                state: new_state,
-                                last_updated: timestamp_millis,
-                                last_synced_from_gateway: Some(timestamp_millis),
-                                last_synced_to_gateway: Some(timestamp_millis),
-                            };
-
-                            if let Err(e) = manager
-                                .handle_device_state_change(&event.device_id, &device_state)
-                                .await
-                            {
-                                tracing::error!(
-                                    "Failed to handle state change for virtual devices: {}",
-                                    e
-                                );
-                            }
-                        }
-                    }
+                if let Err(e) = manager.handle_event(&event).await {
+                    tracing::error!("Failed to handle state change for virtual devices: {}", e);
                 }
             }
         });
@@ -498,17 +589,21 @@ impl Clone for VirtualDeviceManager {
             state_store: Arc::clone(&self.state_store),
             event_bus: Arc::clone(&self.event_bus),
             sync_engine: Arc::clone(&self.sync_engine),
-            commanded: Arc::clone(&self.commanded),
+            tracking: Arc::clone(&self.tracking),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    //! Input tracking doesn't run on its own in most of these: [`pump`]
+    //! feeds it the bus, so each test decides exactly when tracking catches
+    //! up, and nothing waits on a clock.
     use super::*;
-    use crate::LightGroup;
+    use crate::{DummyGateway, LightGroup, SceneController};
     use std::time::Duration;
-    use tokio::sync::broadcast;
+    use tokio::sync::broadcast::{self, error::TryRecvError};
+    use tokio::sync::watch;
 
     fn light_info(device_id: &str) -> DeviceInfo {
         DeviceInfo {
@@ -527,21 +622,26 @@ mod tests {
         }
     }
 
-    fn off() -> DeviceStateValue {
+    fn light(is_on: bool, brightness: u8) -> DeviceStateValue {
         DeviceStateValue::Light(LightState {
-            is_on: false,
-            brightness: Some(0),
+            is_on,
+            brightness: Some(brightness),
             color_temp: Some(2700),
             rgb_color: None,
         })
     }
 
-    /// A 1:1 `LightGroup` named `g` over `lights`, registered and tracking
-    /// its inputs, with no sync engine attached.
-    async fn manager_with_group(
+    /// What a `LightGroup` starts as.
+    fn off() -> DeviceStateValue {
+        light(false, 0)
+    }
+
+    /// A 1:1 `LightGroup` named `g` over `lights`, registered in `store`,
+    /// with no sync engine attached and input tracking not started.
+    async fn manager_with_group_in(
+        store: Arc<StateStore>,
         lights: &[&str],
-    ) -> (VirtualDeviceManager, Arc<StateStore>, Arc<EventBus>) {
-        let store = StateStore::new();
+    ) -> (VirtualDeviceManager, Arc<EventBus>) {
         let bus = Arc::new(EventBus::new(100));
         let curves: serde_json::Map<String, serde_json::Value> = lights
             .iter()
@@ -561,22 +661,40 @@ mod tests {
             config: serde_json::json!({ "lights": lights, "brightness_curves": curves }),
         };
         let group = LightGroup::new(config, store.clone()).expect("group");
-        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let manager = VirtualDeviceManager::new(store, bus.clone());
         manager
             .add_virtual_device(Box::new(group))
             .await
             .expect("register");
-        manager.start().await.expect("start");
+        (manager, bus)
+    }
+
+    async fn manager_with_group(
+        lights: &[&str],
+    ) -> (VirtualDeviceManager, Arc<StateStore>, Arc<EventBus>) {
+        let store = StateStore::new();
+        let (manager, bus) = manager_with_group_in(store.clone(), lights).await;
         (manager, store, bus)
     }
 
-    async fn drain(rx: &mut broadcast::Receiver<DeviceEvent>) -> Vec<DeviceEvent> {
+    /// Input tracking, caught up: hands the manager every event published so
+    /// far, in order, including the ones that handling publishes in turn.
+    /// Returns them all.
+    async fn pump(
+        manager: &VirtualDeviceManager,
+        rx: &mut broadcast::Receiver<DeviceEvent>,
+    ) -> Vec<DeviceEvent> {
         let mut events = Vec::new();
-        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
-        {
-            events.push(event);
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    manager.handle_event(&event).await.expect("input tracking");
+                    events.push(event);
+                }
+                Err(TryRecvError::Empty) => return events,
+                Err(e) => panic!("event bus: {e}"),
+            }
         }
-        events
     }
 
     fn echoes(events: &[DeviceEvent], device_id: &str) -> Vec<DeviceStateValue> {
@@ -612,17 +730,12 @@ mod tests {
         }
         let mut rx = bus.subscribe();
 
-        let on = DeviceStateValue::Light(LightState {
-            is_on: true,
-            brightness: Some(60),
-            color_temp: Some(2700),
-            rgb_color: None,
-        });
+        let on = light(true, 60);
         manager
             .set_virtual_device_state(&"g".to_string(), on.clone())
             .await
             .expect("write");
-        let events = drain(&mut rx).await;
+        let events = pump(&manager, &mut rx).await;
 
         assert_eq!(stored(&store, "g").await, on);
         assert_eq!(echoes(&events, "g"), vec![on.clone()], "group echo");
@@ -633,28 +746,305 @@ mod tests {
         }
     }
 
-    /// A write that fails part-way (a missing member, as in #2) still echoes
-    /// the members it did change, so the store never diverges silently.
+    /// With optimistic updates the sync engine echoes each member, and the
+    /// manager must not echo it again. Without them the engine only queues
+    /// the push and echoes nothing, so the echo is the manager's (#14
+    /// review, finding 3). Either way: once per member, and pushed.
     #[tokio::test]
-    async fn partial_group_write_echoes_what_it_changed() {
+    async fn members_echo_once_with_and_without_optimistic_updates() {
+        for optimistic_updates in [true, false] {
+            let (manager, store, bus) = manager_with_group(&["a", "b"]).await;
+            for id in ["a", "b"] {
+                store.add_device(light_info(id), off()).await;
+            }
+            let engine = Arc::new(SyncEngine::new(
+                store.clone(),
+                bus.clone(),
+                Arc::new(DummyGateway::new("basic_home")),
+                Some(SyncConfig {
+                    optimistic_updates,
+                    ..SyncConfig::default()
+                }),
+            ));
+            manager.attach_sync_engine(engine.clone());
+            let mut rx = bus.subscribe();
+
+            let on = light(true, 60);
+            manager
+                .set_virtual_device_state(&"g".to_string(), on.clone())
+                .await
+                .expect("write");
+            let events = pump(&manager, &mut rx).await;
+
+            assert_eq!(
+                echoes(&events, "g"),
+                vec![on.clone()],
+                "group echo (optimistic_updates: {optimistic_updates})"
+            );
+            for id in ["a", "b"] {
+                assert_eq!(stored(&store, id).await, on, "{id} state");
+                assert_eq!(
+                    echoes(&events, id),
+                    vec![on.clone()],
+                    "{id} must be echoed exactly once (optimistic_updates: {optimistic_updates})"
+                );
+                let status = engine.get_sync_status(&id.to_string()).await;
+                assert!(
+                    matches!(status, Some(SyncStatus::PendingSync { .. })),
+                    "{id} never queued for the gateway: {status:?}"
+                );
+            }
+        }
+    }
+
+    /// A write that fails part-way (a missing member, as in #2) commits and
+    /// echoes the members it did change. The group is re-derived from them
+    /// and echoed, so it shows what happened, not its old state (#14 review,
+    /// finding 5).
+    #[tokio::test]
+    async fn partial_group_write_re_derives_the_group() {
+        // `LightGroup` writes its lights in order: `a`, then `missing` fails.
         let (manager, store, bus) = manager_with_group(&["a", "missing"]).await;
         store.add_device(light_info("a"), off()).await;
         let mut rx = bus.subscribe();
 
-        let on = DeviceStateValue::Light(LightState {
-            is_on: true,
-            brightness: Some(60),
-            color_temp: Some(2700),
-            rgb_color: None,
-        });
+        let on = light(true, 60);
         let result = manager
             .set_virtual_device_state(&"g".to_string(), on.clone())
             .await;
         assert!(result.is_err(), "a missing member must fail the write");
-        let events = drain(&mut rx).await;
+        let events = pump(&manager, &mut rx).await;
 
         assert_eq!(stored(&store, "a").await, on);
-        assert_eq!(echoes(&events, "a"), vec![on], "changed member echo");
-        assert!(echoes(&events, "g").is_empty(), "failed group write echoed");
+        assert_eq!(
+            echoes(&events, "a"),
+            vec![on.clone()],
+            "changed member echo"
+        );
+        // `a` is the only member there, and on at 60: so is the group.
+        let group = stored(&store, "g").await;
+        assert_eq!(group, on, "group must follow the member that changed");
+        assert_eq!(echoes(&events, "g"), vec![group.clone()], "group echo");
+        assert_eq!(
+            manager
+                .get_virtual_device_state(&"g".to_string())
+                .await
+                .unwrap(),
+            group,
+            "the group's own state must match the store"
+        );
+    }
+
+    /// A write that fails before it changed anything leaves the group where
+    /// it was, in the store and in its own state, and echoes nothing (#14
+    /// review, finding 5).
+    #[tokio::test]
+    async fn failed_group_write_that_changed_nothing_keeps_the_group() {
+        // `missing` comes first, so the write fails before it reaches `a`.
+        let (manager, store, bus) = manager_with_group(&["missing", "a"]).await;
+        store.add_device(light_info("a"), off()).await;
+        let mut rx = bus.subscribe();
+
+        let result = manager
+            .set_virtual_device_state(&"g".to_string(), light(true, 60))
+            .await;
+        assert!(result.is_err(), "a missing member must fail the write");
+        let events = pump(&manager, &mut rx).await;
+
+        assert!(
+            events.is_empty(),
+            "nothing changed, nothing to echo: {events:?}"
+        );
+        assert_eq!(stored(&store, "a").await, off());
+        assert_eq!(stored(&store, "g").await, off());
+        assert_eq!(
+            manager
+                .get_virtual_device_state(&"g".to_string())
+                .await
+                .unwrap(),
+            off(),
+            "the group's own state must match the store"
+        );
+    }
+
+    /// Scene devices and controller targets are outputs, not inputs. A
+    /// missing one is reported just like a missing group member (#14 review,
+    /// nit).
+    #[tokio::test]
+    async fn dangling_references_include_outputs() {
+        let (manager, store, _bus) = manager_with_group(&["a", "missing_light"]).await;
+        store.add_device(light_info("a"), off()).await;
+        let on = serde_json::to_value(light(true, 50)).unwrap();
+        let scene = SceneController::new(
+            VirtualDeviceConfig {
+                device_id: "scene".to_string(),
+                device_type: VirtualDeviceType::SceneController,
+                name: "Scene".to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({ "scenes": { "evening": {
+                    "name": "evening",
+                    "device_states": { "a": on, "missing_scene_light": on },
+                    "transition_type": "Instant",
+                } } }),
+            },
+            store.clone(),
+        )
+        .expect("scene");
+        manager
+            .add_virtual_device(Box::new(scene))
+            .await
+            .expect("register");
+
+        assert_eq!(
+            manager.dangling_references().await,
+            vec![
+                ("g".to_string(), "missing_light".to_string()),
+                ("scene".to_string(), "missing_scene_light".to_string()),
+            ]
+        );
+    }
+
+    /// The dummy hub, with the sync engine's reads held at a gate and its
+    /// traffic counted. A test can then order its steps around the engine's
+    /// workers instead of sleeping through them.
+    struct GatedHub {
+        inner: DummyGateway,
+        /// Reads wait here until it's `true`.
+        reads_open: watch::Sender<bool>,
+        /// Reads that have started (before the gate), and reads answered.
+        reads_started: watch::Sender<usize>,
+        reads_done: watch::Sender<usize>,
+        /// Writes answered.
+        writes_done: watch::Sender<usize>,
+    }
+
+    impl GatedHub {
+        fn new(inner: DummyGateway) -> Self {
+            Self {
+                inner,
+                reads_open: watch::channel(false).0,
+                reads_started: watch::channel(0).0,
+                reads_done: watch::channel(0).0,
+                writes_done: watch::channel(0).0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Gateway for GatedHub {
+        async fn discover_devices(&self) -> Result<Vec<DeviceInfo>, GatewayError> {
+            self.inner.discover_devices().await
+        }
+
+        async fn get_device_state(
+            &self,
+            device_id: &DeviceId,
+        ) -> Result<DeviceStateValue, GatewayError> {
+            self.reads_started.send_modify(|n| *n += 1);
+            let mut open = self.reads_open.subscribe();
+            open.wait_for(|open| *open).await.expect("gate");
+            let state = self.inner.get_device_state(device_id).await;
+            self.reads_done.send_modify(|n| *n += 1);
+            state
+        }
+
+        async fn set_device_state(
+            &self,
+            device_id: &DeviceId,
+            state: DeviceStateValue,
+        ) -> Result<(), GatewayError> {
+            let result = self.inner.set_device_state(device_id, state).await;
+            self.writes_done.send_modify(|n| *n += 1);
+            result
+        }
+
+        async fn health_check(&self) -> Result<GatewayHealth, GatewayError> {
+            self.inner.health_check().await
+        }
+    }
+
+    /// Resolves once `counter` reaches `at_least`. The timeout only bounds
+    /// a failure; nothing waits on it when things work.
+    async fn reach(counter: &watch::Sender<usize>, at_least: usize, what: &str) {
+        let mut rx = counter.subscribe();
+        tokio::time::timeout(Duration::from_secs(20), rx.wait_for(|n| *n >= at_least))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: still at {}", *counter.borrow()))
+            .expect("hub");
+    }
+
+    /// The live-gateway half of #1: member writes must reach the hub, and
+    /// the pulls after them must leave them alone. If they only hit the
+    /// store, the pull worker (GatewayWins) reverts them.
+    #[tokio::test]
+    async fn virtual_member_writes_reach_the_gateway() {
+        const LIGHTS: [&str; 3] = ["light_bedroom", "light_living_room", "light_kitchen"];
+        let hub = Arc::new(GatedHub::new(DummyGateway::new("basic_home")));
+        let store = StateStore::new();
+        for info in hub.inner.discover_devices().await.expect("discover") {
+            let state = hub
+                .inner
+                .get_device_state(&info.device_id)
+                .await
+                .expect("initial state");
+            store.add_device(info, state).await;
+        }
+        let (manager, bus) = manager_with_group_in(store.clone(), &LIGHTS).await;
+        // A short pull interval only makes the pulls come sooner. The gate,
+        // not the interval, orders them against the write.
+        let engine = Arc::new(SyncEngine::new(
+            store.clone(),
+            bus.clone(),
+            hub.clone(),
+            Some(SyncConfig {
+                pull_interval: Duration::from_millis(100),
+                ..SyncConfig::default()
+            }),
+        ));
+        manager.attach_sync_engine(engine.clone());
+        // Tracking runs as the server runs it, and sees the confirmations.
+        manager.start().await.expect("start");
+        let runner = tokio::spawn({
+            let engine = engine.clone();
+            async move { engine.start().await }
+        });
+
+        // The first pull starts at once and holds at the gate. It compares
+        // the hub against the store as it was before the write, so it can't
+        // revert what the write does. No other pull starts before it's done.
+        reach(&hub.reads_started, 1, "first pull").await;
+        let on = light(true, 60);
+        manager
+            .set_virtual_device_state(&"g".to_string(), on.clone())
+            .await
+            .expect("write");
+
+        reach(&hub.writes_done, LIGHTS.len(), "member pushes").await;
+        for id in LIGHTS {
+            let on_hub = hub.inner.get_device_state(&id.to_string()).await;
+            assert_eq!(
+                on_hub.ok().as_ref(),
+                Some(&on),
+                "{id} never reached the gateway"
+            );
+        }
+
+        // Let the pulls through: the held one (it confirms the pushes), a
+        // full one after it, and the first read of the next, so the full one
+        // has been handled.
+        let cycle = store.device_count().await;
+        hub.reads_open.send_replace(true);
+        reach(&hub.reads_done, 2 * cycle + 1, "two pull cycles").await;
+        for id in LIGHTS {
+            assert_eq!(stored(&store, id).await, on, "{id} was reverted");
+        }
+        assert_eq!(stored(&store, "g").await, on, "group moved");
+
+        engine.stop().await;
+        runner
+            .await
+            .expect("sync engine task")
+            .expect("sync engine");
     }
 }

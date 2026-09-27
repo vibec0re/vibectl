@@ -898,9 +898,14 @@ async fn handle_websocket(socket: WebSocket, server: AxumServer) {
 mod tests {
     //! Write → echo round trips through `handle_api_request`, against the
     //! dummy `basic_home` hub, wired the way `v1bectl_server` wires them.
+    //!
+    //! Input tracking doesn't run on its own here (except in
+    //! `input_tracking_follows_the_bus`): [`pump`] feeds it the bus. So each
+    //! test decides exactly when tracking catches up, after every write or
+    //! only after several, and nothing waits on a clock.
     use super::*;
     use std::time::Duration;
-    use tokio::sync::broadcast;
+    use tokio::sync::broadcast::{self, error::TryRecvError};
 
     const GROUP: &str = "virtual_bedroom_lights";
     /// (member, its brightness when the group is on at 50%): the linear
@@ -910,13 +915,19 @@ mod tests {
         ("light_living_room", 65),
         ("light_kitchen", 25),
     ];
+    /// The same at 80%.
+    const MEMBERS_AT_80: [(&str, u8); 3] = [
+        ("light_bedroom", 96),
+        ("light_living_room", 80),
+        ("light_kitchen", 40),
+    ];
 
     struct Home {
         server: AxumServer,
         store: Arc<StateStore>,
         bus: Arc<EventBus>,
         engine: Arc<SyncEngine>,
-        gateway: Arc<dyn Gateway>,
+        manager: Arc<VirtualDeviceManager>,
     }
 
     /// Dummy devices seeded into the store as the server does at startup,
@@ -938,7 +949,7 @@ mod tests {
             gateway.clone(),
             None,
         ));
-        let server = AxumServer::new(0, store.clone(), bus.clone(), gateway.clone())
+        let server = AxumServer::new(0, store.clone(), bus.clone(), gateway)
             .with_sync_engine(engine.clone());
 
         let members = HashMap::from([
@@ -965,15 +976,13 @@ mod tests {
             .add_virtual_device(Box::new(group))
             .await
             .expect("register group");
-        // The manager's input tracking, as `AxumServer::start` runs it.
-        manager.start().await.expect("start manager");
 
         Home {
             server,
             store,
             bus,
             engine,
-            gateway,
+            manager,
         }
     }
 
@@ -993,14 +1002,25 @@ mod tests {
         server.handle_api_request(request, String::new()).await
     }
 
-    /// Everything published until the bus has been quiet for 300ms.
-    async fn drain(rx: &mut broadcast::Receiver<DeviceEvent>) -> Vec<DeviceEvent> {
+    /// Input tracking, caught up: hands the manager every event published so
+    /// far, in order, including the ones that handling publishes in turn.
+    /// Returns them all. Every write here publishes before it returns (the
+    /// sync engine's workers aren't running), so this sees all of them.
+    async fn pump(home: &Home, rx: &mut broadcast::Receiver<DeviceEvent>) -> Vec<DeviceEvent> {
         let mut events = Vec::new();
-        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
-        {
-            events.push(event);
+        loop {
+            match rx.try_recv() {
+                Ok(event) => {
+                    home.manager
+                        .handle_event(&event)
+                        .await
+                        .expect("input tracking");
+                    events.push(event);
+                }
+                Err(TryRecvError::Empty) => return events,
+                Err(e) => panic!("event bus: {e}"),
+            }
         }
-        events
     }
 
     /// The states echoed for `device_id`, in either shape clients decode.
@@ -1020,6 +1040,17 @@ mod tests {
             .collect()
     }
 
+    /// `(is_on, brightness)` of each light echoed for `device_id`.
+    fn levels(events: &[DeviceEvent], device_id: &str) -> Vec<(bool, Option<u8>)> {
+        echoes(events, device_id)
+            .into_iter()
+            .map(|state| match state {
+                DeviceStateValue::Light(light) => (light.is_on, light.brightness),
+                other => panic!("{device_id} echoed a non-light: {other:?}"),
+            })
+            .collect()
+    }
+
     async fn light(store: &StateStore, device_id: &str) -> LightState {
         match store.get_device(&device_id.to_string()).await {
             Some(DeviceState {
@@ -1027,6 +1058,21 @@ mod tests {
                 ..
             }) => light,
             other => panic!("{device_id} is not a light in the store: {other:?}"),
+        }
+    }
+
+    async fn assert_members(store: &StateStore, want: [(&str, u8); 3]) {
+        for (member, brightness) in want {
+            let state = light(store, member).await;
+            assert!(state.is_on, "{member} should be on: {state:?}");
+            assert_eq!(state.brightness, Some(brightness), "{member} brightness");
+        }
+    }
+
+    async fn assert_members_off(store: &StateStore) {
+        for (member, _) in MEMBERS_AT_50 {
+            let state = light(store, member).await;
+            assert!(!state.is_on, "{member} should be off: {state:?}");
         }
     }
 
@@ -1051,7 +1097,7 @@ mod tests {
             ),
             "unexpected response: {response:?}"
         );
-        let events = drain(&mut rx).await;
+        let events = pump(&home, &mut rx).await;
 
         let group = home.store.get_device(&GROUP.to_string()).await.unwrap();
         assert_eq!(
@@ -1080,32 +1126,80 @@ mod tests {
 
     /// The members' echoes of our own fan-out must not re-derive the group.
     /// If they did, an off would store brightness 0 and the next plain `on`
-    /// would light nothing.
+    /// would light nothing. Here tracking keeps up with every write.
     #[tokio::test]
     async fn group_off_then_on_restores_members() {
         let home = home().await;
         let mut rx = home.bus.subscribe();
 
         set_light(&home.server, GROUP, Some(true), Some(50)).await;
-        drain(&mut rx).await;
+        pump(&home, &mut rx).await;
         set_light(&home.server, GROUP, Some(false), None).await;
-        drain(&mut rx).await;
+        pump(&home, &mut rx).await;
 
         let group = light(&home.store, GROUP).await;
         assert!(!group.is_on, "group should be off: {group:?}");
         assert_eq!(group.brightness, Some(50), "group forgot its level");
-        for (member, _) in MEMBERS_AT_50 {
-            assert!(!light(&home.store, member).await.is_on, "{member} still on");
-        }
+        assert_members_off(&home.store).await;
 
         set_light(&home.server, GROUP, Some(true), None).await;
-        drain(&mut rx).await;
+        pump(&home, &mut rx).await;
+        assert_members(&home.store, MEMBERS_AT_50).await;
+    }
 
-        for (member, brightness) in MEMBERS_AT_50 {
-            let state = light(&home.store, member).await;
-            assert!(state.is_on, "{member} should be back on: {state:?}");
-            assert_eq!(state.brightness, Some(brightness), "{member} brightness");
-        }
+    /// #14 review, finding 1: two writes before tracking sees the first
+    /// one's echoes (a double toggle, two frames in one WS read, a busy
+    /// tracker). By the time tracking reads the first write's member echoes,
+    /// they are stale, and they must not re-derive the group.
+    #[tokio::test]
+    async fn back_to_back_on_then_off_keeps_the_level() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+
+        set_light(&home.server, GROUP, Some(true), Some(50)).await;
+        set_light(&home.server, GROUP, Some(false), None).await;
+        let events = pump(&home, &mut rx).await;
+
+        let group = light(&home.store, GROUP).await;
+        assert!(!group.is_on, "group should be off: {group:?}");
+        assert_eq!(group.brightness, Some(50), "group forgot its level");
+        assert_eq!(
+            levels(&events, GROUP),
+            vec![(true, Some(50)), (false, Some(50))],
+            "one group echo per write, and no re-derived one"
+        );
+        assert_members_off(&home.store).await;
+
+        // The next plain `on` (the widget's toggle) lights them again.
+        set_light(&home.server, GROUP, Some(true), None).await;
+        pump(&home, &mut rx).await;
+        assert_members(&home.store, MEMBERS_AT_50).await;
+    }
+
+    /// #14 review, finding 1: two level changes in a row (a slider drag)
+    /// end at the last one, not at a re-derived average of the members.
+    #[tokio::test]
+    async fn back_to_back_level_changes_end_at_the_last_level() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+
+        set_light(&home.server, GROUP, Some(true), Some(50)).await;
+        set_light(&home.server, GROUP, Some(true), Some(80)).await;
+        let events = pump(&home, &mut rx).await;
+
+        let group = light(&home.store, GROUP).await;
+        assert!(group.is_on, "group should be on: {group:?}");
+        assert_eq!(
+            group.brightness,
+            Some(80),
+            "group must end at the last level"
+        );
+        assert_eq!(
+            levels(&events, GROUP),
+            vec![(true, Some(50)), (true, Some(80))],
+            "one group echo per write, and no re-derived one"
+        );
+        assert_members(&home.store, MEMBERS_AT_80).await;
     }
 
     /// A direct write to a group member still echoes once (no double
@@ -1117,7 +1211,7 @@ mod tests {
         let mut rx = home.bus.subscribe();
 
         set_light(&home.server, "light_kitchen", Some(true), Some(40)).await;
-        let events = drain(&mut rx).await;
+        let events = pump(&home, &mut rx).await;
 
         let kitchen = light(&home.store, "light_kitchen").await;
         assert_eq!(kitchen.brightness, Some(40));
@@ -1136,50 +1230,114 @@ mod tests {
         );
     }
 
-    /// The live-gateway half of #1: member writes must reach the hub. If they
-    /// only hit the store, the pull worker (GatewayWins) reverts them.
+    /// #14 review, finding 2: after a group write, a real outside change to
+    /// one of its members must still re-derive the group, and echo it.
     #[tokio::test]
-    async fn virtual_member_writes_reach_the_gateway() {
+    async fn outside_member_change_after_a_group_write_re_derives_the_group() {
         let home = home().await;
-        let engine = home.engine.clone();
-        let runner = tokio::spawn(async move { engine.start().await });
-        // Let the immediate first pull finish before writing.
-        tokio::time::sleep(Duration::from_millis(800)).await;
+        let mut rx = home.bus.subscribe();
 
         set_light(&home.server, GROUP, Some(true), Some(50)).await;
+        pump(&home, &mut rx).await;
+        set_light(&home.server, "light_kitchen", Some(true), Some(40)).await;
+        let events = pump(&home, &mut rx).await;
 
-        for (member, _) in MEMBERS_AT_50 {
-            let want = home
-                .store
-                .get_device(&member.to_string())
-                .await
-                .unwrap()
-                .state;
-            let reached = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let hub = home.gateway.get_device_state(&member.to_string()).await;
-                    if hub.as_ref().ok() == Some(&want) {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+        let kitchen = light(&home.store, "light_kitchen").await;
+        assert_eq!(
+            echoes(&events, "light_kitchen"),
+            vec![DeviceStateValue::Light(kitchen)],
+            "a physical write must be echoed exactly once"
+        );
+        // Re-derived from the members: the average of 90, 65 and 40.
+        let group = light(&home.store, GROUP).await;
+        assert_eq!(
+            (group.is_on, group.brightness),
+            (true, Some(65)),
+            "group must follow the outside change: {group:?}"
+        );
+        assert_eq!(
+            echoes(&events, GROUP),
+            vec![DeviceStateValue::Light(group)],
+            "the re-derived group state must be echoed once"
+        );
+    }
+
+    /// #14 review, finding 4b: a hub reports a member's colour its own way
+    /// (a bulb without colour temperature has none, the RGB bulb its hue).
+    /// When that view lands in the store (GatewayWins, after the protection
+    /// window), the member is still where the group put it. So the group
+    /// must not be re-derived, which would be lossy: Bedroom Lights at 50
+    /// would read back as 60.
+    #[tokio::test]
+    async fn hub_normalised_member_colour_does_not_re_derive_the_group() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+
+        set_light(&home.server, GROUP, Some(true), Some(50)).await;
+        pump(&home, &mut rx).await;
+
+        // What the sync engine's GatewayWins does with the hub's view.
+        let member = "light_bedroom".to_string();
+        let ours = home.store.get_device(&member).await.unwrap().state;
+        let hub_view = DeviceStateValue::Light(LightState {
+            is_on: true,
+            brightness: Some(90),
+            color_temp: None,
+            rgb_color: Some(RgbColor { r: 255, g: 0, b: 0 }),
+        });
+        home.store
+            .update_device_state(&member, hub_view.clone())
+            .await
+            .unwrap();
+        home.bus
+            .publish(DeviceEvent {
+                timestamp: std::time::SystemTime::now(),
+                device_id: member.clone(),
+                event_type: EventType::AttributeChanged {
+                    attribute: "state".to_string(),
+                    old_value: serde_json::to_value(&ours).unwrap(),
+                    new_value: serde_json::to_value(&hub_view).unwrap(),
+                },
             })
             .await;
-            assert!(reached.is_ok(), "{member} never reached the gateway");
-        }
+        let events = pump(&home, &mut rx).await;
 
-        // Outlive a pull cycle (2s): nothing may be reverted.
-        tokio::time::sleep(Duration::from_millis(2500)).await;
-        for (member, brightness) in MEMBERS_AT_50 {
-            let state = light(&home.store, member).await;
-            assert!(state.is_on, "{member} was reverted: {state:?}");
-            assert_eq!(state.brightness, Some(brightness), "{member} was reverted");
-        }
+        let group = light(&home.store, GROUP).await;
+        assert_eq!(
+            (group.is_on, group.brightness),
+            (true, Some(50)),
+            "group was re-derived from a colour-only difference"
+        );
+        assert!(echoes(&events, GROUP).is_empty(), "group re-echoed");
+    }
 
-        home.engine.stop().await;
-        runner
-            .await
-            .expect("sync engine task")
-            .expect("sync engine");
+    /// The same tracking, run the way the server runs it
+    /// (`VirtualDeviceManager::start`) rather than pumped by the test.
+    #[tokio::test]
+    async fn input_tracking_follows_the_bus() {
+        let home = home().await;
+        home.manager.start().await.expect("start input tracking");
+        let mut rx = home.bus.subscribe();
+
+        set_light(&home.server, "light_kitchen", Some(true), Some(40)).await;
+
+        // The timeout only bounds a failure; the echo ends the wait.
+        let group_echo = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = rx.recv().await.expect("event bus");
+                if event.device_id == GROUP {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("the group was never re-derived");
+        let group = light(&home.store, GROUP).await;
+        assert!(group.is_on, "group should follow its lit member: {group:?}");
+        assert_eq!(
+            echoes(&[group_echo], GROUP),
+            vec![DeviceStateValue::Light(group)],
+            "the group echo must carry its stored state"
+        );
     }
 }
