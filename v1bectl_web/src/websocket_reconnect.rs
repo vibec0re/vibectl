@@ -21,11 +21,12 @@
 //   socket instead of leaking it: its task sees its fused "closer" fire and its
 //   outbound queue end (#29).
 // - Coming back to the page (#29): a plain tab switch pings an open socket
-//   first and reconnects only if nothing answers within `PROBE_TIMEOUT_MS`. A
-//   page restored from the back/forward cache, or a socket that has been
-//   silent for longer than the watchdog allows (an iOS resume, a sleeping
-//   laptop), reconnects straight away. A wake-up may pre-empt an attempt
-//   that has been connecting for `CONNECT_PREEMPT_MS`.
+//   first and reconnects unless that ping's PONG (matched by correlation id)
+//   is back within `PROBE_TIMEOUT_MS`. A page restored from the back/forward
+//   cache, or a socket that has been silent for longer than the watchdog
+//   allows (an iOS resume, a sleeping laptop), reconnects straight away. A
+//   wake-up may pre-empt an attempt that has been connecting for
+//   `CONNECT_PREEMPT_MS`.
 
 use futures::channel::{mpsc, oneshot};
 use futures::future::Fuse;
@@ -230,7 +231,7 @@ const BACKOFF_MAX_MS: u32 = 30_000;
 /// `visibilitychange` and `pageshow` back to back).
 const CONNECT_PREEMPT_MS: f64 = 2_000.0;
 /// Coming back to a tab with an open socket sends a PING first, and only
-/// reconnects if nothing arrives within this long.
+/// reconnects if that PING's PONG doesn't arrive within this long.
 const PROBE_TIMEOUT_MS: u32 = 2_000;
 
 /// Delay before the next attempt after `failures` consecutive failed
@@ -258,19 +259,20 @@ fn watchdog_expired(now_ms: f64, last_inbound_ms: f64, unanswered_ping_ms: Optio
 /// them. Whether anything has arrived since the last ping is tracked by that
 /// order, not by comparing `Date.now()` stamps, so a ping and a message in the
 /// same millisecond are never ambiguous. Pure, so it's unit-tested natively.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Liveness {
     last_inbound_ms: f64,
     /// When the latest ping was sent, if nothing has arrived since.
     unanswered_ping_ms: Option<f64>,
-    /// A tab-return probe is waiting for the server to answer.
-    probing: bool,
+    /// A tab-return probe is waiting for the PONG to its PING, which carries
+    /// this correlation id.
+    probe: Option<String>,
 }
 
 /// How a socket's task checks its socket when the tab comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeStep {
-    /// Send a ping, and reconnect unless something arrives within
+    /// Send a ping, and reconnect unless its pong arrives within
     /// `PROBE_TIMEOUT_MS`.
     SendPing,
     /// A probe is already waiting for its answer: leave it be.
@@ -286,15 +288,30 @@ impl Liveness {
         Self {
             last_inbound_ms: now_ms,
             unanswered_ping_ms: None,
-            probing: false,
+            probe: None,
         }
     }
 
-    /// Something arrived: the server is alive, which answers any ping or probe.
+    /// Something arrived. For the watchdog that answers any ping. It does not
+    /// answer a probe: see `on_pong`.
     fn on_inbound(&mut self, now_ms: f64) {
         self.last_inbound_ms = now_ms;
         self.unanswered_ping_ms = None;
-        self.probing = false;
+    }
+
+    /// A PONG to the ping with `correlation_id` arrived (after `on_inbound`
+    /// for the same frame). Only the pong to the probe's own ping answers the
+    /// probe. Anything else may have been sitting in the socket's buffers
+    /// since before it went half-open: an event, or the pong to an older
+    /// keepalive ping. Counting that as an answer would keep a dead socket
+    /// until the watchdog gives up on it, 65 s later. Returns whether this
+    /// answered the probe.
+    fn on_pong(&mut self, correlation_id: &str) -> bool {
+        let answered = self.probe.as_deref() == Some(correlation_id);
+        if answered {
+            self.probe = None;
+        }
+        answered
     }
 
     fn on_ping_sent(&mut self, now_ms: f64) {
@@ -305,22 +322,23 @@ impl Liveness {
         watchdog_expired(now_ms, self.last_inbound_ms, self.unanswered_ping_ms)
     }
 
-    /// The tab came back: how do we check the socket? `SendPing` marks the
-    /// probe as pending until something arrives.
-    fn begin_probe(&mut self, now_ms: f64) -> ProbeStep {
-        if self.probing {
+    /// The tab came back: how do we check the socket? `SendPing` means: send
+    /// a ping with `ping_id` as its correlation id. The probe then waits for
+    /// that ping's pong (`on_pong`).
+    fn begin_probe(&mut self, now_ms: f64, ping_id: &str) -> ProbeStep {
+        if self.probe.is_some() {
             return ProbeStep::AlreadyProbing;
         }
         if now_ms - self.last_inbound_ms >= WATCHDOG_TIMEOUT_MS {
             return ProbeStep::Reconnect;
         }
-        self.probing = true;
+        self.probe = Some(ping_id.to_owned());
         ProbeStep::SendPing
     }
 
     /// The probe's `PROBE_TIMEOUT_MS` is up: is it still unanswered?
     fn probe_unanswered(&self) -> bool {
-        self.probing
+        self.probe.is_some()
     }
 }
 
@@ -581,13 +599,20 @@ fn now_ms() -> f64 {
     web_sys::js_sys::Date::now()
 }
 
-/// Wrap a request in the CBOR `ApiMessage` envelope the server expects.
-fn encode_request(request: &ApiRequest) -> Result<Vec<u8>, String> {
+/// A fresh correlation id for an outgoing request. The server echoes it on
+/// its response.
+fn new_correlation_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Wrap a request in the CBOR `ApiMessage` envelope the server expects, under
+/// `correlation_id`.
+fn encode_request(request: &ApiRequest, correlation_id: String) -> Result<Vec<u8>, String> {
     let mut payload = Vec::new();
     ciborium::into_writer(request, &mut payload)
         .map_err(|e| format!("failed to encode request: {}", e))?;
     let api_message = ApiMessage {
-        correlation_id: Uuid::new_v4().to_string(),
+        correlation_id,
         message_type: ApiMessageType::Request,
         payload,
     };
@@ -801,13 +826,15 @@ enum PumpEnd {
     Unresponsive,
 }
 
-/// Send one ping and note it in `liveness`. A ping that can't be encoded
-/// (it's a unit variant, so it can't really happen) is logged and skipped.
+/// Send one ping with `correlation_id` and note it in `liveness`. A ping that
+/// can't be encoded (it's a unit variant, so it can't really happen) is logged
+/// and skipped.
 async fn send_ping(
     write: &mut SplitSink<WebSocket, Message>,
     liveness: &mut Liveness,
+    correlation_id: String,
 ) -> Result<(), WebSocketError> {
-    match encode_request(&ApiRequest::Ping) {
+    match encode_request(&ApiRequest::Ping, correlation_id) {
         Ok(data) => {
             write.send(Message::Bytes(data)).await?;
             liveness.on_ping_sent(now_ms());
@@ -846,7 +873,17 @@ async fn pump(
                         break PumpEnd::Superseded;
                     }
                     if let Message::Bytes(data) = msg {
-                        handle_message(ctx, &data);
+                        match decode_frame(&data) {
+                            Ok(Inbound::Pong { correlation_id }) => {
+                                if liveness.on_pong(&correlation_id) {
+                                    log::debug!("🏓 PONG to the tab-return PING");
+                                } else {
+                                    log::debug!("🏓 PONG received - connection alive!");
+                                }
+                            }
+                            Ok(inbound) => handle_message(ctx, inbound),
+                            Err(e) => log::error!("❌ {}", e),
+                        }
                     }
                 }
                 Some(Err(WebSocketError::ConnectionClose(event))) => {
@@ -873,26 +910,29 @@ async fn pump(
                         break PumpEnd::Lost;
                     }
                 }
-                Some(Outbound::Probe) => match liveness.begin_probe(now_ms()) {
-                    ProbeStep::SendPing => {
-                        log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
-                        if let Err(e) = send_ping(&mut write, &mut liveness).await {
-                            log::error!("❌ Failed to send PING: {:?}", e);
-                            break PumpEnd::Lost;
+                Some(Outbound::Probe) => {
+                    let ping_id = new_correlation_id();
+                    match liveness.begin_probe(now_ms(), &ping_id) {
+                        ProbeStep::SendPing => {
+                            log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
+                            if let Err(e) = send_ping(&mut write, &mut liveness, ping_id).await {
+                                log::error!("❌ Failed to send PING: {:?}", e);
+                                break PumpEnd::Lost;
+                            }
+                            probe_timer = TimeoutFuture::new(PROBE_TIMEOUT_MS).fuse();
                         }
-                        probe_timer = TimeoutFuture::new(PROBE_TIMEOUT_MS).fuse();
+                        ProbeStep::AlreadyProbing => {
+                            log::debug!("🏓 Already waiting for an answer to the last probe");
+                        }
+                        ProbeStep::Reconnect => {
+                            log::info!(
+                                "💔 Nothing from the server for {:.0}s - not waiting for a PONG, reconnecting",
+                                (now_ms() - liveness.last_inbound_ms) / 1000.0
+                            );
+                            break PumpEnd::Unresponsive;
+                        }
                     }
-                    ProbeStep::AlreadyProbing => {
-                        log::debug!("🏓 Already waiting for an answer to the last probe");
-                    }
-                    ProbeStep::Reconnect => {
-                        log::info!(
-                            "💔 Nothing from the server for {:.0}s - not waiting for a PONG, reconnecting",
-                            (now_ms() - liveness.last_inbound_ms) / 1000.0
-                        );
-                        break PumpEnd::Unresponsive;
-                    }
-                },
+                }
                 // Our sender was dropped: a newer connection replaced us.
                 None => break PumpEnd::Superseded,
             },
@@ -908,7 +948,7 @@ async fn pump(
             },
             _ = ping_timer.next() => {
                 log::debug!("🏓 Sending PING to keep connection alive!");
-                if let Err(e) = send_ping(&mut write, &mut liveness).await {
+                if let Err(e) = send_ping(&mut write, &mut liveness, new_correlation_id()).await {
                     log::error!("❌ Failed to send PING: {:?}", e);
                     break PumpEnd::Lost;
                 }
@@ -933,56 +973,64 @@ async fn pump(
     end
 }
 
-/// Decode one inbound CBOR frame and hand it to the UI.
-fn handle_message(ctx: &Ctx, data: &[u8]) {
-    let api_msg = match ciborium::from_reader::<ApiMessage, _>(data) {
-        Ok(api_msg) => api_msg,
-        Err(e) => {
-            log::error!("❌ Failed to decode CBOR message: {}", e);
-            return;
-        }
-    };
+/// One inbound frame, decoded.
+#[derive(Debug, PartialEq)]
+enum Inbound {
+    /// The PONG to the ping that carried this correlation id. It goes to the
+    /// socket's task (see `Liveness::on_pong`), not to the UI.
+    Pong { correlation_id: String },
+    /// Any other response, for the UI.
+    Response(ApiResponse),
+    /// A device event, for the UI.
+    Event(DeviceEvent),
+    /// A message type the UI doesn't handle.
+    Other,
+}
 
+/// Decode one inbound CBOR frame. Pure, so it's unit-tested natively.
+fn decode_frame(data: &[u8]) -> Result<Inbound, String> {
+    let api_msg = ciborium::from_reader::<ApiMessage, _>(data)
+        .map_err(|e| format!("Failed to decode CBOR message: {}", e))?;
+    let payload = api_msg.payload.as_slice();
     match api_msg.message_type {
-        ApiMessageType::Response => {
-            match ciborium::from_reader::<ApiResponse, _>(api_msg.payload.as_slice()) {
-                Ok(ApiResponse::Pong) => {
-                    log::debug!("🏓 PONG received - connection alive!");
-                }
-                Ok(response) => {
-                    log::info!("📥 Received response: {:?}", response);
-                    ctx.last_response.set(Some(response));
-                }
-                Err(e) => {
-                    log::error!("❌ Failed to decode response: {}", e);
-                }
-            }
-        }
-        ApiMessageType::Event => {
-            // Handle events - CBOR to JSON for now (TODO: pure CBOR) 🔥
-            log::info!("📢 Got Event message!");
-            match ciborium::from_reader::<DeviceEvent, _>(api_msg.payload.as_slice()) {
-                Ok(device_event) => {
-                    log::info!(
-                        "🔥 DeviceEvent: device_id={}, event_type={:?}",
-                        device_event.device_id,
-                        device_event.event_type
-                    );
+        ApiMessageType::Response => match ciborium::from_reader::<ApiResponse, _>(payload) {
+            Ok(ApiResponse::Pong) => Ok(Inbound::Pong {
+                correlation_id: api_msg.correlation_id,
+            }),
+            Ok(response) => Ok(Inbound::Response(response)),
+            Err(e) => Err(format!("Failed to decode response: {}", e)),
+        },
+        ApiMessageType::Event => ciborium::from_reader::<DeviceEvent, _>(payload)
+            .map(Inbound::Event)
+            .map_err(|e| format!("Failed to decode DeviceEvent: {}", e)),
+        ApiMessageType::Request | ApiMessageType::Error => Ok(Inbound::Other),
+    }
+}
 
-                    // Convert to JSON for UI compatibility (temporary)
-                    match serde_json::to_value(&device_event) {
-                        Ok(event_json) => ctx.last_event.set(Some(event_json)),
-                        Err(e) => {
-                            log::error!("❌ Failed to convert DeviceEvent to JSON: {}", e);
-                        }
-                    }
-                }
+/// Hand one decoded frame to the UI.
+fn handle_message(ctx: &Ctx, inbound: Inbound) {
+    match inbound {
+        Inbound::Response(response) => {
+            log::info!("📥 Received response: {:?}", response);
+            ctx.last_response.set(Some(response));
+        }
+        Inbound::Event(device_event) => {
+            // Handle events - CBOR to JSON for now (TODO: pure CBOR) 🔥
+            log::info!(
+                "🔥 DeviceEvent: device_id={}, event_type={:?}",
+                device_event.device_id,
+                device_event.event_type
+            );
+
+            // Convert to JSON for UI compatibility (temporary)
+            match serde_json::to_value(&device_event) {
+                Ok(event_json) => ctx.last_event.set(Some(event_json)),
                 Err(e) => {
-                    log::error!("❌ Failed to decode DeviceEvent: {}", e);
+                    log::error!("❌ Failed to convert DeviceEvent to JSON: {}", e);
                 }
             }
         }
-        _ => {}
+        Inbound::Pong { .. } | Inbound::Other => {}
     }
 }
 
@@ -1051,7 +1099,7 @@ pub fn use_websocket() -> UseWebSocketHandle {
             let state = state.clone();
 
             spawn_local(async move {
-                let data = match encode_request(&request) {
+                let data = match encode_request(&request, new_correlation_id()) {
                     Ok(data) => data,
                     Err(e) => {
                         log::error!("❌ {}", e);
@@ -1182,24 +1230,55 @@ mod tests {
         assert!(!live.watchdog_expired(later));
     }
 
+    /// Feed `live` one inbound PONG the way the pump does: `on_inbound`, then
+    /// `on_pong`. Returns whether it answered the probe.
+    fn pong(live: &mut Liveness, now_ms: f64, correlation_id: &str) -> bool {
+        live.on_inbound(now_ms);
+        live.on_pong(correlation_id)
+    }
+
     #[test]
-    fn tab_return_probe_pings_first_and_any_answer_keeps_the_socket() {
+    fn tab_return_probe_pings_first_and_its_pong_keeps_the_socket() {
         let mut live = Liveness::new(0.0);
         live.on_inbound(10.0 * S);
-        assert_eq!(live.begin_probe(20.0 * S), ProbeStep::SendPing);
+        assert_eq!(live.begin_probe(20.0 * S, "probe-1"), ProbeStep::SendPing);
         live.on_ping_sent(20.0 * S);
         assert!(live.probe_unanswered());
-        // The pong (or any other message) beats the probe timer.
-        live.on_inbound(20.05 * S);
+        // The probe's pong beats the probe timer.
+        assert!(pong(&mut live, 20.05 * S, "probe-1"));
         assert!(!live.probe_unanswered());
         // The next tab switch probes afresh.
-        assert_eq!(live.begin_probe(40.0 * S), ProbeStep::SendPing);
+        assert_eq!(live.begin_probe(40.0 * S, "probe-2"), ProbeStep::SendPing);
+    }
+
+    #[test]
+    fn a_frame_buffered_before_the_probe_does_not_answer_it() {
+        // #36 review: the socket went half-open with frames still in flight,
+        // an event and the pong to an earlier keepalive ping. They show up
+        // after the tab-return probe's ping went out, but they aren't its
+        // answer. Counting them kept the dead socket until the watchdog
+        // dropped it 65 s later.
+        let mut live = Liveness::new(0.0);
+        live.on_ping_sent(30.0 * S); // keepalive, id "keepalive"
+        assert_eq!(live.begin_probe(30.5 * S, "probe"), ProbeStep::SendPing);
+        live.on_ping_sent(30.5 * S);
+        live.on_inbound(30.51 * S); // the buffered event
+        assert!(!pong(&mut live, 30.52 * S, "keepalive"));
+        // The probe timer fires: still unanswered, so reconnect.
+        assert!(live.probe_unanswered());
+        // The watchdog is unchanged: any inbound frame counts for it.
+        assert!(!live.watchdog_expired(30.52 * S + WATCHDOG_TIMEOUT_MS - 1.0));
+        // Had the probe's own pong come back, that would have answered it.
+        assert!(pong(&mut live, 30.6 * S, "probe"));
+        assert!(!live.probe_unanswered());
+        // A late duplicate of it changes nothing.
+        assert!(!pong(&mut live, 30.7 * S, "probe"));
     }
 
     #[test]
     fn tab_return_probe_without_an_answer_reconnects() {
         let mut live = Liveness::new(0.0);
-        assert_eq!(live.begin_probe(5.0 * S), ProbeStep::SendPing);
+        assert_eq!(live.begin_probe(5.0 * S, "probe"), ProbeStep::SendPing);
         live.on_ping_sent(5.0 * S);
         // The probe timer fires and nothing has arrived.
         assert!(live.probe_unanswered());
@@ -1210,9 +1289,16 @@ mod tests {
         // visibilitychange twice in a row: one ping, one deadline.
         let mut live = Liveness::new(0.0);
         assert!(!live.probe_unanswered());
-        assert_eq!(live.begin_probe(1.0 * S), ProbeStep::SendPing);
-        assert_eq!(live.begin_probe(1.5 * S), ProbeStep::AlreadyProbing);
+        assert_eq!(live.begin_probe(1.0 * S, "first"), ProbeStep::SendPing);
+        assert_eq!(
+            live.begin_probe(1.5 * S, "second"),
+            ProbeStep::AlreadyProbing
+        );
         assert!(live.probe_unanswered());
+        // The probe still waits for the first ping's pong, not the second's
+        // (which was never sent).
+        assert!(!pong(&mut live, 1.6 * S, "second"));
+        assert!(pong(&mut live, 1.7 * S, "first"));
     }
 
     #[test]
@@ -1221,13 +1307,13 @@ mod tests {
         // that probably won't come.
         let mut live = Liveness::new(0.0);
         live.on_inbound(100.0 * S);
-        let mut just_in_time = live;
+        let mut just_in_time = live.clone();
         assert_eq!(
-            just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0),
+            just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0, "probe"),
             ProbeStep::SendPing
         );
         assert_eq!(
-            live.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS),
+            live.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS, "probe"),
             ProbeStep::Reconnect
         );
         assert!(!live.probe_unanswered());
@@ -1578,11 +1664,48 @@ mod tests {
 
     #[test]
     fn ping_request_round_trips_through_the_envelope() {
-        let data = encode_request(&ApiRequest::Ping).expect("encode");
+        let id = new_correlation_id();
+        assert_ne!(id, new_correlation_id());
+        let data = encode_request(&ApiRequest::Ping, id.clone()).expect("encode");
         let msg: ApiMessage = ciborium::from_reader(data.as_slice()).expect("envelope");
         assert_eq!(msg.message_type, ApiMessageType::Request);
-        assert!(!msg.correlation_id.is_empty());
+        assert_eq!(msg.correlation_id, id);
         let req: ApiRequest = ciborium::from_reader(msg.payload.as_slice()).expect("payload");
         assert!(matches!(req, ApiRequest::Ping));
+    }
+
+    /// A frame the way the server sends a response: `response` in an
+    /// `ApiMessage` that echoes the request's `correlation_id`.
+    fn response_frame(correlation_id: &str, response: &ApiResponse) -> Vec<u8> {
+        let mut payload = Vec::new();
+        ciborium::into_writer(response, &mut payload).expect("payload");
+        let msg = ApiMessage {
+            correlation_id: correlation_id.to_string(),
+            message_type: ApiMessageType::Response,
+            payload,
+        };
+        let mut data = Vec::new();
+        ciborium::into_writer(&msg, &mut data).expect("envelope");
+        data
+    }
+
+    #[test]
+    fn a_pong_frame_decodes_with_the_correlation_id_it_answers() {
+        // The pump matches this id against the probe's ping.
+        assert_eq!(
+            decode_frame(&response_frame("probe-7", &ApiResponse::Pong)),
+            Ok(Inbound::Pong {
+                correlation_id: "probe-7".to_string()
+            })
+        );
+        // Other responses still go to the UI.
+        let ack = ApiResponse::SubscriptionStarted {
+            subscriber_id: "sub".to_string(),
+        };
+        assert_eq!(
+            decode_frame(&response_frame("probe-7", &ack)),
+            Ok(Inbound::Response(ack))
+        );
+        assert!(decode_frame(b"not cbor").is_err());
     }
 }
