@@ -1,7 +1,7 @@
 // API handlers - placeholder
-use v1bectl_sync::*;
+use v1bectl_sync::DiscoverDevicesResponse;
 
-pub async fn handle_discover_devices() -> Result<DiscoverDevicesResponse, ApiError> {
+pub fn handle_discover_devices() -> Result<DiscoverDevicesResponse, ApiError> {
     // Placeholder
     Ok(DiscoverDevicesResponse {
         devices: vec![],
