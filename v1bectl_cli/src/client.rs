@@ -4,7 +4,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 use uuid::Uuid;
-use v1bectl_sync::*;
+use v1bectl_sync::{DeviceStateValue, DiscoverDevicesResponse, LightState, Message, MessageType};
 
 pub struct ApiClient {
     server_addr: String,
@@ -27,7 +27,7 @@ impl ApiClient {
             correlation_id: Uuid::new_v4().to_string(),
             message_type: MessageType::Request,
             payload,
-            timestamp: chrono::Utc::now().timestamp_millis() as u64,
+            timestamp: chrono::Utc::now().timestamp_millis().cast_unsigned(),
         };
 
         // Send request
@@ -44,7 +44,7 @@ impl ApiClient {
 
         if matches!(response.message_type, MessageType::Error) {
             let error_msg = String::from_utf8_lossy(&response.payload);
-            anyhow::bail!("Server error: {}", error_msg);
+            anyhow::bail!("Server error: {error_msg}");
         }
 
         Ok(response)
@@ -72,6 +72,10 @@ impl ApiClient {
         ser::into_writer(&state, &mut state_bytes)?;
 
         // Build payload: [device_id_len, ...device_id, ...state]
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "wire format's device-id length prefix is a single byte; truncation on a >255-byte id already changes wire behavior today and this PR keeps that as-is"
+        )]
         let mut data = vec![device_id.len() as u8];
         data.extend_from_slice(device_id.as_bytes());
         data.extend_from_slice(&state_bytes);

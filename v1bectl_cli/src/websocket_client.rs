@@ -2,7 +2,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use uuid::Uuid;
-use v1bectl_sync::*;
+use v1bectl_sync::{DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, LightState, RgbColor};
 
 // Mirror the API types from the server
 #[derive(Serialize, Deserialize, Debug)]
@@ -79,7 +79,7 @@ impl WebSocketClient {
         let server_url = if server_addr.starts_with("ws://") || server_addr.starts_with("wss://") {
             server_addr
         } else {
-            format!("ws://{}", server_addr)
+            format!("ws://{server_addr}")
         };
 
         Self { server_url }
@@ -94,7 +94,7 @@ impl WebSocketClient {
                 total_count,
             } => Ok((devices, total_count)),
             ApiResponse::Error { code, message } => {
-                anyhow::bail!("Server error {}: {}", code, message);
+                anyhow::bail!("Server error {code}: {message}");
             }
             _ => anyhow::bail!("Unexpected response type"),
         }
@@ -110,7 +110,7 @@ impl WebSocketClient {
         match response {
             ApiResponse::DeviceState { state } => Ok(state),
             ApiResponse::Error { code, message } => {
-                anyhow::bail!("Server error {}: {}", code, message);
+                anyhow::bail!("Server error {code}: {message}");
             }
             _ => anyhow::bail!("Unexpected response type"),
         }
@@ -134,7 +134,7 @@ impl WebSocketClient {
         match response {
             ApiResponse::LightUpdated { new_state } => Ok(new_state),
             ApiResponse::Error { code, message } => {
-                anyhow::bail!("Server error {}: {}", code, message);
+                anyhow::bail!("Server error {code}: {message}");
             }
             _ => anyhow::bail!("Unexpected response type"),
         }
@@ -187,9 +187,7 @@ impl WebSocketClient {
                                 api_message.payload.as_slice(),
                             ) {
                                 Ok(event) => Some(Ok(event)),
-                                Err(e) => {
-                                    Some(Err(anyhow::anyhow!("Failed to decode event: {}", e)))
-                                }
+                                Err(e) => Some(Err(anyhow::anyhow!("Failed to decode event: {e}"))),
                             }
                         }
                         Ok(api_message)
@@ -198,12 +196,12 @@ impl WebSocketClient {
                             // Skip response messages (subscription confirmation)
                             None
                         }
-                        Err(e) => Some(Err(anyhow::anyhow!("Failed to decode API message: {}", e))),
+                        Err(e) => Some(Err(anyhow::anyhow!("Failed to decode API message: {e}"))),
                         _ => None,
                     }
                 }
                 Ok(Message::Close(_)) => Some(Err(anyhow::anyhow!("WebSocket connection closed"))),
-                Err(e) => Some(Err(anyhow::anyhow!("WebSocket error: {}", e))),
+                Err(e) => Some(Err(anyhow::anyhow!("WebSocket error: {e}"))),
                 _ => None,
             }
         }))
