@@ -472,3 +472,46 @@ async fn push_time_restart_covers_a_queue_delay() {
     rig.hub.wait("both pushes", |log| log.sets_done >= 2).await;
     rig.shutdown().await;
 }
+
+/// A device removed from the store takes its pending confirmation with it
+/// (#32). Nothing else clears it: only a pull of the device does, and pulls
+/// only read devices in the store. If the device comes back under the same
+/// id, a stale entry would ignore its first real changes for the rest of
+/// that window.
+///
+/// `b` stays in the store so the pull cycles have something to read.
+#[tokio::test]
+async fn a_removed_device_takes_its_pending_confirmation_with_it() {
+    let rig = Rig::new(
+        &["a", "b"],
+        TestHub::new(OnSet::Ignore, false),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: Duration::from_secs(60),
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    // A write the hub never confirms: its entry would last the whole window.
+    rig.write("a", on()).await;
+    rig.hub.wait("push", |log| log.sets_done >= 1).await;
+    rig.store
+        .remove_device(&"a".to_string())
+        .await
+        .expect("remove a");
+    rig.full_pull_cycle().await;
+
+    // `a` comes back (rediscovered, say), and its switch is flipped.
+    rig.store.add_device(light_info("a"), off()).await;
+    let flipped = light(true, 40);
+    rig.hub.report("a", flipped.clone());
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored("a").await,
+        flipped,
+        "a pending entry from before the removal ignored the change"
+    );
+
+    rig.shutdown().await;
+}

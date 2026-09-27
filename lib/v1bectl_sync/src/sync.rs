@@ -1143,6 +1143,7 @@ impl SyncEngine {
     async fn pull_gateway_states(&self) -> anyhow::Result<()> {
         debug!("Pulling states from gateway");
 
+        self.forget_removed_devices().await;
         let devices = self.store.list_devices().await;
         let mut updated_count = 0;
 
@@ -1187,6 +1188,38 @@ impl SyncEngine {
         }
 
         Ok(())
+    }
+
+    /// 🧹 Drop the pending confirmations and optimistic-state records of
+    /// devices that are no longer in the store (#32).
+    ///
+    /// Nothing else would: a pending confirmation is only cleared by a pull
+    /// of its device (or a write's failed store write), and pulls only read
+    /// devices in the store. A device that came back under the same id
+    /// (rediscovered, say) would start with a stale window that ignores its
+    /// first real changes.
+    ///
+    /// This takes the buffer lock, then the pending one (the engine's lock
+    /// order), so it can't run in the middle of a write: a write arms its
+    /// entry and checks the store in one critical section under the buffer
+    /// lock (see [`Self::apply_optimistic_update`]).
+    async fn forget_removed_devices(&self) {
+        let _buffer = self.sync_buffer.write().await;
+        let mut pending = self.pending_confirmations.write().await;
+        let mut optimistic = self.optimistic_states.write().await;
+        let tracked: Vec<DeviceId> = pending.keys().chain(optimistic.keys()).cloned().collect();
+        for device_id in tracked {
+            if self.store.get_device(&device_id).await.is_none() {
+                let had_pending = pending.remove(&device_id).is_some();
+                optimistic.remove(&device_id);
+                if had_pending {
+                    debug!(
+                        "🧹 {} is gone from the store - dropped its pending confirmation",
+                        device_id
+                    );
+                }
+            }
+        }
     }
 
     /// ✅ A pull found the store and the hub agreeing on `gateway_state`. If
