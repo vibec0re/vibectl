@@ -171,7 +171,8 @@ impl VirtualDeviceManager {
     /// Add a virtual device to the manager. It first takes its state from
     /// its inputs as the store holds them (see
     /// [`VirtualDevice::seed_from_inputs`]), so register a group after its
-    /// members are in the store.
+    /// members are in the store. Once it's in the store, a `DeviceAdded`
+    /// event announces it, so clients pick it up without a refetch (#16).
     pub async fn add_virtual_device(
         &self,
         mut device: Box<dyn VirtualDevice>,
@@ -222,16 +223,35 @@ impl VirtualDeviceManager {
         }
 
         // Register virtual device in state store
-        let devices = self.virtual_devices.read().await;
-        if let Some(virtual_device) = devices.get(&device_id) {
+        let device_type = {
+            let devices = self.virtual_devices.read().await;
+            let Some(virtual_device) = devices.get(&device_id) else {
+                return Ok(());
+            };
             let device_info = virtual_device.device_info();
+            let device_type = format!("{:?}", device_info.device_type);
             let initial_state = virtual_device.current_state();
             self.state_store
                 .add_device(device_info, initial_state)
                 .await;
-        }
+            device_type
+        };
 
+        // Announced the way the server announces a discovered device.
+        self.publish_lifecycle(&device_id, EventType::DeviceAdded { device_type })
+            .await;
         Ok(())
+    }
+
+    /// Publish a `DeviceAdded`/`DeviceRemoved` event for `device_id`.
+    async fn publish_lifecycle(&self, device_id: &DeviceId, event_type: EventType) {
+        self.event_bus
+            .publish(DeviceEvent {
+                timestamp: std::time::SystemTime::now(),
+                device_id: device_id.clone(),
+                event_type,
+            })
+            .await;
     }
 
     /// Every `(virtual device, device it reads or writes)` pair the store
@@ -273,7 +293,9 @@ impl VirtualDeviceManager {
         missing
     }
 
-    /// Remove a virtual device
+    /// Remove a virtual device. A `DeviceRemoved` event announces it, so
+    /// clients drop it without a refetch (#16). Removing one the manager
+    /// doesn't have does nothing, and announces nothing.
     pub async fn remove_virtual_device(
         &self,
         device_id: &DeviceId,
@@ -306,6 +328,8 @@ impl VirtualDeviceManager {
 
             // Remove from state store
             self.state_store.remove_device(device_id).await?;
+            self.publish_lifecycle(device_id, EventType::DeviceRemoved)
+                .await;
         }
 
         Ok(())
@@ -1418,6 +1442,53 @@ mod tests {
             stored(&store, "a").await,
             off(),
             "the release never reached a"
+        );
+    }
+
+    /// #16: adding a virtual device announces it with `DeviceAdded`, and
+    /// removing it with `DeviceRemoved`, so clients see both without a
+    /// refetch. A second remove announces nothing.
+    #[tokio::test]
+    async fn add_and_remove_announce_the_device() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let mut rx = bus.subscribe();
+        let g = "g".to_string();
+        let lifecycle = |events: Vec<DeviceEvent>| -> Vec<(DeviceId, EventType)> {
+            events
+                .into_iter()
+                .map(|e| (e.device_id, e.event_type))
+                .collect()
+        };
+
+        manager
+            .add_virtual_device(Box::new(group("g", &["a"], &store)))
+            .await
+            .expect("register");
+        assert!(store.get_device(&g).await.is_some(), "g is in the store");
+        let added = EventType::DeviceAdded {
+            device_type: "VirtualLightGroup".to_string(),
+        };
+        assert_eq!(
+            lifecycle(pump(&manager, &mut rx).await),
+            vec![(g.clone(), added)]
+        );
+
+        manager.remove_virtual_device(&g).await.expect("remove");
+        assert!(store.get_device(&g).await.is_none(), "g left the store");
+        assert_eq!(
+            lifecycle(pump(&manager, &mut rx).await),
+            vec![(g.clone(), EventType::DeviceRemoved)]
+        );
+
+        manager
+            .remove_virtual_device(&g)
+            .await
+            .expect("remove again");
+        assert!(
+            pump(&manager, &mut rx).await.is_empty(),
+            "nothing to announce"
         );
     }
 
