@@ -88,6 +88,9 @@ pub struct HubLog {
     pub sets_started: Vec<(DeviceId, DeviceStateValue)>,
     /// `set_device_state` calls answered (applied, ignored or failed).
     pub sets_done: usize,
+    /// The PATCHes waiting at the gate now, by their index in
+    /// `sets_started`.
+    pub held: Vec<usize>,
 }
 
 impl HubLog {
@@ -113,6 +116,9 @@ pub struct TestHub {
     on_set: Mutex<OnSet>,
     /// PATCHes wait here for a permit. Closed means open: nothing waits.
     gate: Semaphore,
+    /// Held PATCHes let through out of order ([`TestHub::release_newest`]),
+    /// by their index in `sets_started`.
+    picked: watch::Sender<Vec<usize>>,
     log: watch::Sender<HubLog>,
 }
 
@@ -126,6 +132,7 @@ impl TestHub {
             reported: Mutex::new(HashMap::new()),
             on_set: Mutex::new(on_set),
             gate,
+            picked: watch::channel(vec![]).0,
             log: watch::channel(HubLog::default()).0,
         })
     }
@@ -151,6 +158,15 @@ impl TestHub {
         self.gate.add_permits(n);
     }
 
+    /// Let the most recent of the held PATCHes through, ahead of the older
+    /// ones: a hub may answer requests in any order. (Wait for it to be
+    /// answered before letting the others through: PATCHes let through
+    /// together are answered in whatever order the runtime runs them.)
+    pub fn release_newest(&self) {
+        let newest = *self.log().held.iter().max().expect("a PATCH at the gate");
+        self.picked.send_modify(|picked| picked.push(newest));
+    }
+
     /// Stop holding PATCHes, including the ones waiting now.
     pub fn open_gate(&self) {
         self.gate.close();
@@ -167,6 +183,15 @@ impl TestHub {
             .await
             .unwrap_or_else(|_| panic!("{what}: never happened, hub log {:?}", self.log()))
             .expect("hub log");
+    }
+
+    /// Whether the log satisfies `done` within `bound`. For a check that
+    /// something does *not* happen: bounded, so a slow machine can only let
+    /// a broken build pass, never fail a correct one.
+    pub async fn within(&self, bound: Duration, done: impl FnMut(&HubLog) -> bool) -> bool {
+        let mut rx = self.log.subscribe();
+        let happened = tokio::time::timeout(bound, rx.wait_for(done)).await.is_ok();
+        happened
     }
 }
 
@@ -197,12 +222,23 @@ impl Gateway for TestHub {
         device_id: &DeviceId,
         state: DeviceStateValue,
     ) -> Result<(), GatewayError> {
+        let mut index = 0;
         self.log.send_modify(|log| {
+            index = log.sets_started.len();
             log.sets_started.push((device_id.clone(), state.clone()));
+            log.held.push(index);
         });
-        if let Ok(permit) = self.gate.acquire().await {
-            permit.forget();
+        let mut picked = self.picked.subscribe();
+        tokio::select! {
+            permit = self.gate.acquire() => {
+                if let Ok(permit) = permit {
+                    permit.forget();
+                }
+            }
+            _ = picked.wait_for(|picked| picked.contains(&index)) => {}
         }
+        self.log
+            .send_modify(|log| log.held.retain(|held| *held != index));
         let on_set = *self.on_set.lock().unwrap();
         let result = match on_set {
             OnSet::Apply => {
@@ -364,6 +400,22 @@ impl Rig {
                 log.reads.contains(&sentinel)
             })
             .await;
+    }
+
+    /// Resolves once the engine's retry queue holds `n` retries (waiting out
+    /// their backoff: a due push retry leaves it for the sync buffer).
+    ///
+    /// The engine doesn't tell the hub when it takes a retry out, so this
+    /// polls `get_sync_stats`. The polls only order the test on the engine's
+    /// state; `WAIT` bounds them.
+    pub async fn wait_for_retry_queue(&self, what: &str, n: u32) {
+        tokio::time::timeout(WAIT, async {
+            while self.engine.get_sync_stats().await.retry_queue_size != n {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{what}: never happened, hub log {:?}", self.hub.log()));
     }
 
     /// Resolves once the pull worker (`Pulls::Periodic`) has run a whole
