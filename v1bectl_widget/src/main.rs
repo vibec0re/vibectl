@@ -595,12 +595,16 @@ impl VibeWidget {
 
 /// Whether a device gets a row (mirrors what the web UI renders). Gated on
 /// the *device type*, not the state shape: `VirtualLightGroup`s carry
-/// Light-shaped state too, but the server's virtual path emits no event
-/// echo, so an echo-driven toggle on a group latches — until the server
-/// publishes events for virtual writes, groups stay off the widget.
+/// Light-shaped state, and now that the virtual write path echoes a
+/// `DeviceEvent` (issue #1, shipped in #14/#22) and a plain `on` restores the
+/// group's last level instead of lighting nothing (#34), a group is
+/// echo-driven exactly like a physical light — same row, same toggle, same
+/// brightness slider, no local mutation either way.
 fn renders(dev: &DeviceState) -> bool {
     match dev.device_info.device_type {
-        DeviceType::Light => matches!(dev.state, DeviceStateValue::Light(_)),
+        DeviceType::Light | DeviceType::VirtualLightGroup => {
+            matches!(dev.state, DeviceStateValue::Light(_))
+        }
         DeviceType::Outlet => matches!(dev.state, DeviceStateValue::Outlet(_)),
         DeviceType::Sensor => matches!(dev.state, DeviceStateValue::Sensor(_)),
         _ => false,
@@ -778,10 +782,11 @@ fn toggle_or_label(
 
 /// The inline (horizontal) content for one device row — leading state icon +
 /// name (a flat toggle when interactive), then any trailing control: a
-/// brightness [`Node::Slider`] (lights) or a live-wattage / climate readout
-/// right-pinned by a [`Node::Spacer`]. `None` for devices we don't render
-/// (unknown/virtual — [`renders`] gates them, so an echo-less virtual group
-/// can't slip in via a config ref and latch on toggle).
+/// brightness [`Node::Slider`] (lights — including `VirtualLightGroup`s,
+/// which share the `Light` state shape) or a live-wattage / climate readout
+/// right-pinned by a [`Node::Spacer`]. `None` for devices we don't render at
+/// all (unknown types, and the non-light virtual kinds like `VirtualScene` —
+/// see [`renders`]).
 fn device_content(dev: &DeviceState, opts: &RowOpts) -> Option<Vec<Node>> {
     if !renders(dev) {
         return None;
@@ -1347,25 +1352,87 @@ screen "wz" {
     }
 
     #[test]
-    fn virtual_light_groups_are_not_rendered() {
+    fn virtual_light_groups_render_like_lights() {
+        // Unblocked by #1/#14/#22 (virtual writes echo a `DeviceEvent`) and
+        // #34 (a plain `on` restores the group's last level): a
+        // `VirtualLightGroup` is echo-driven exactly like a physical light,
+        // so the widget's gate lifts (issue #16).
         let mut group = light("g1", "Bedroom Lights", "virtual", true, Some(100));
         group.device_info.device_type = DeviceType::VirtualLightGroup;
-        let (mut m, rx) = model_with(vec![
+        let (mut m, mut rx) = model_with(vec![
             group,
             light("l1", "Taklampa", "living_room", true, Some(70)),
         ]);
         let all = texts(&m.view().tree);
         assert!(
-            !all.iter().any(|t| t.contains("Bedroom Lights")),
-            "the server's virtual path emits no event echo — groups stay off the widget"
+            all.iter().any(|t| t == "Bedroom Lights"),
+            "virtual groups now render like a light: {all:?}"
         );
         assert!(
             all.iter().any(|t| t == "Taklampa"),
             "the physical light still renders: {all:?}"
         );
-        // Defensively: even a synthetic event on a group id sends nothing.
+
+        let tree = m.view().tree;
+        let ids = ids(&tree);
+        assert!(
+            ids.iter().any(|i| i == "vw-l-g1"),
+            "the group gets the same clickable toggle as a light: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|i| i == "vw-sl-g1"),
+            "the group gets the same brightness slider as a light: {ids:?}"
+        );
+
+        // Toggling a group sends the same request shape as toggling a light:
+        // only `is_on`, never a `brightness: 0` — #34's "plain on restores
+        // the level" depends on the widget not overriding it.
         let _ = m.update(Input::event("vw-l-g1", EventKind::Click));
-        let _ = rx; // no assertion on cmd here — group still has Light state
+        assert!(
+            matches!(
+                rx.try_recv().unwrap(),
+                Cmd::SetLight {
+                    is_on: Some(false),
+                    brightness: None,
+                    ..
+                }
+            ),
+            "group toggle is is_on-only, same shape as a physical light"
+        );
+    }
+
+    #[test]
+    fn virtual_light_group_echo_updates_the_row() {
+        // The group's own echo (issue #1: virtual writes now publish
+        // DeviceEvents) reaches the widget through the same `apply_event`
+        // path a physical light's echo takes, and keeps the last known
+        // level per #34.
+        let mut group = light("g1", "Bedroom Lights", "virtual", false, Some(70));
+        group.device_info.device_type = DeviceType::VirtualLightGroup;
+        let (mut m, _rx) = model_with(vec![group]);
+
+        m.apply_event(
+            "g1",
+            EventType::StateChanged {
+                old_state: None,
+                new_state: Some(DeviceStateValue::Light(LightState {
+                    is_on: true,
+                    brightness: None,
+                    color_temp: None,
+                    rgb_color: None,
+                })),
+            },
+        );
+
+        assert!(
+            matches!(&m.devices[0].state, DeviceStateValue::Light(l) if l.is_on && l.brightness == Some(70)),
+            "echo updates the group's row and merges in the kept level"
+        );
+        let icons = icons(&m.view().tree);
+        assert!(
+            icons.iter().any(|i| i == "display-brightness-symbolic"),
+            "the updated row still renders as a light: {icons:?}"
+        );
     }
 
     #[test]
@@ -1924,9 +1991,10 @@ screen "wz" {
     }
 
     #[test]
-    fn config_skips_virtual_light_groups() {
-        // A `light` ref to a virtual group must not render — its echo-less
-        // toggle would latch. It's dropped; the real light still shows.
+    fn config_includes_virtual_light_groups() {
+        // A `light` ref to a virtual group now renders — same as a physical
+        // light, including its toggle and brightness slider — now that
+        // virtual writes echo (#1/#34, issue #16).
         let mut group = light("g1", "All LR", "lr", true, Some(100));
         group.device_info.device_type = DeviceType::VirtualLightGroup;
         let kdl = r#"
@@ -1941,12 +2009,26 @@ screen "wz" {
             vec![group, light("l1", "LR Shelf", "lr", true, Some(60))],
             kdl,
         );
-        let all = texts(&m.view().tree);
+        let tree = m.view().tree;
+        let all = texts(&tree);
         assert!(
-            !all.iter().any(|t| t.contains("GROUP")),
-            "virtual group skipped: {all:?}"
+            all.iter().any(|t| t == "GROUP"),
+            "virtual group renders via config ref: {all:?}"
         );
-        assert!(all.iter().any(|t| t == "MAIN"), "real light shown: {all:?}");
+        assert!(
+            all.iter().any(|t| t == "MAIN"),
+            "real light still shown: {all:?}"
+        );
+
+        let ids = ids(&tree);
+        assert!(
+            ids.iter().any(|i| i == "vw-l-g1"),
+            "config default switch=true gives the group a toggle: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|i| i == "vw-sl-g1"),
+            "config default slider=true gives the group a brightness slider: {ids:?}"
+        );
     }
 
     #[test]
