@@ -1,6 +1,6 @@
 //! 🛡️ Integration tests for the protection window of user writes (#23).
 //!
-//! A user (`SyncPriority::Critical`) write goes into the store at once and
+//! A user write (`apply_optimistic_update`) goes into the store at once and
 //! is pushed to the gateway later, from the sync buffer. Until the hub
 //! confirms it, a pull that still reports the old value must leave the store
 //! alone. The pending confirmation used to be armed only when the push went
@@ -10,7 +10,8 @@
 //! The engine runs for real, against the shared rig's `TestHub` (see
 //! `common`): a fake gateway whose PATCHes can be held at a gate and whose
 //! traffic is logged. The tests order their steps on that log, never on
-//! sleeps.
+//! sleeps, except `push_time_restart_covers_a_queue_delay`, whose subject is
+//! elapsed time.
 
 mod common;
 
@@ -404,5 +405,70 @@ async fn failed_push_stays_protected_within_the_window() {
     rig.pull("a").await;
     assert_eq!(rig.stored("a").await, on(), "pull right after the failure");
 
+    rig.shutdown().await;
+}
+
+/// The window restarts when the push goes out. A write that waited in the
+/// buffer for most of its window, whose push is then slow to be answered,
+/// must not be reverted by a pull that lands after the write's original
+/// window but inside the restarted one.
+///
+/// From the #31 review. The window is time, so this is the one test here
+/// that sleeps: the two sleeps are the queue delay and the slow answer, and
+/// the two timing asserts turn a machine too slow for them into a clear
+/// "test timing" failure rather than a false pass or fail.
+#[tokio::test]
+async fn push_time_restart_covers_a_queue_delay() {
+    let window = Duration::from_millis(1000);
+    let rig = Rig::new(
+        &["a", "b"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: window,
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    let written = Instant::now();
+    rig.write("a", on()).await;
+    rig.write("b", on()).await;
+    rig.hub
+        .wait("first PATCH at the gate", |log| log.sets_started.len() == 1)
+        .await;
+    let held = rig.hub.log().sets_started[0].0.clone();
+    let queued = if held == "a" { "b" } else { "a" };
+
+    // The queued write waits behind the held PATCH for 60% of its window.
+    tokio::time::sleep(window * 6 / 10).await;
+    rig.hub.release(1);
+    rig.hub
+        .wait("queued PATCH at the gate", |log| {
+            log.sets_started.len() == 2
+        })
+        .await;
+    let pushed_at = Instant::now();
+
+    // Its push is out but not answered. Wait until the window measured from
+    // the write is over, while the one measured from the push isn't.
+    tokio::time::sleep(window * 6 / 10).await;
+    assert!(
+        written.elapsed() > window,
+        "test timing: the original window is not over yet"
+    );
+    assert!(
+        pushed_at.elapsed() < window,
+        "test timing: the restarted window already ran out"
+    );
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored(queued).await,
+        on(),
+        "{queued}: reverted by a pull inside the restarted window (push-time restart missing)"
+    );
+
+    rig.hub.open_gate();
+    rig.hub.wait("both pushes", |log| log.sets_done >= 2).await;
     rig.shutdown().await;
 }

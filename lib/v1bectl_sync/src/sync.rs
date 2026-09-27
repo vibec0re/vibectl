@@ -173,6 +173,13 @@ pub struct SyncConfig {
     /// 🛡️ How long a user write is shielded from pulls that still report the
     /// old value. It starts at the write and restarts when the push goes out,
     /// so it covers both the wait in the sync buffer and the hub's round trip.
+    ///
+    /// The flip side: a physical-switch change on a device with a write in
+    /// flight is ignored for up to the write's queue delay plus this window.
+    /// That's at most about twice the window (10 s at the defaults): a write
+    /// that waits longer than one window is expired by the next pull that
+    /// disagrees, and its push then starts a fresh window. The same holds
+    /// with `optimistic_updates` off.
     pub protection_window: Duration,
 }
 
