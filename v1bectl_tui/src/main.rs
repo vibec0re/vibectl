@@ -514,7 +514,14 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
                         match api_message.message_type {
                             ApiMessageType::Response => {
                                 if let Ok(response) = ciborium::from_reader::<ApiResponse, _>(api_message.payload.as_slice()) {
-                                    handle_api_response(&mut app, response);
+                                    match response {
+                                        // A device list we didn't ask for: the server's resync
+                                        // after it fell behind its event bus (#15).
+                                        ApiResponse::DeviceList { devices, .. } if api_message.correlation_id != correlation_id => {
+                                            resync_devices(&mut app.devices, devices);
+                                        }
+                                        response => handle_api_response(&mut app, response),
+                                    }
                                 }
                             }
                             ApiMessageType::Event => {
@@ -611,6 +618,30 @@ fn handle_api_response(app: &mut App, response: ApiResponse) {
         }
         _ => {}
     }
+}
+
+/// Take `fresh`, every device the server has, as the device list, quietly:
+/// the server resyncs its clients this way after it fell behind its event
+/// bus (#15). Unlike the answer to our own `DiscoverDevices`, it leaves the
+/// status line and the event log alone, and only a device it changed (or a
+/// new one) shows as just updated, the way an event would. The rest keep
+/// their freshness, so the list doesn't flash.
+fn resync_devices(devices: &mut Vec<AppDevice>, fresh: Vec<DeviceState>) {
+    let mut before: std::collections::HashMap<String, AppDevice> = devices
+        .drain(..)
+        .map(|device| (device.info.device_id.clone(), device))
+        .collect();
+    devices.extend(fresh.into_iter().map(|device| {
+        let last_updated = match before.remove(&device.device_id) {
+            Some(old) if old.state == device.state => old.last_updated,
+            _ => Instant::now(),
+        };
+        AppDevice {
+            info: device.device_info,
+            state: device.state,
+            last_updated,
+        }
+    }));
 }
 
 fn handle_device_event(app: &mut App, event: &DeviceEvent) {
@@ -1516,4 +1547,66 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
             Constraint::Percentage((100 - percent_x) / 2),
         ])
         .split(popup_layout[1])[1]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn light(device_id: &str, is_on: bool) -> DeviceState {
+        let device_info = DeviceInfo {
+            device_id: device_id.to_string(),
+            name: device_id.to_string(),
+            device_type: DeviceType::Light,
+            capabilities: vec![],
+            device_groups: vec![],
+            manufacturer: None,
+            model: None,
+            firmware_version: None,
+            battery_powered: false,
+            reachable: true,
+            last_seen: 0,
+            custom_attributes: std::collections::HashMap::new(),
+        };
+        DeviceState {
+            device_id: device_id.to_string(),
+            device_info,
+            state: DeviceStateValue::Light(LightState {
+                is_on,
+                brightness: Some(50),
+                color_temp: None,
+                rgb_color: None,
+            }),
+            last_updated: 0,
+            last_synced_to_gateway: None,
+            last_synced_from_gateway: None,
+        }
+    }
+
+    /// #47 review, nit 3: a resync must not make every device look just
+    /// updated. `a` didn't change and keeps its freshness; `b` did, and `c`
+    /// is new, so those two show as just updated. The server's order wins.
+    #[test]
+    fn a_resync_only_freshens_the_devices_it_changed() {
+        let long_ago = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let mut devices: Vec<AppDevice> = [light("a", true), light("b", false)]
+            .into_iter()
+            .map(|device| AppDevice {
+                info: device.device_info,
+                state: device.state,
+                last_updated: long_ago,
+            })
+            .collect();
+
+        resync_devices(
+            &mut devices,
+            vec![light("c", true), light("b", true), light("a", true)],
+        );
+
+        let ids: Vec<&str> = devices.iter().map(|d| d.info.device_id.as_str()).collect();
+        assert_eq!(ids, ["c", "b", "a"]);
+        let fresh: Vec<bool> = devices.iter().map(|d| d.last_updated > long_ago).collect();
+        assert_eq!(fresh, [true, true, false], "just updated: c, b, not a");
+        assert_eq!(devices[1].state, light("b", true).state, "b's new state");
+    }
 }
