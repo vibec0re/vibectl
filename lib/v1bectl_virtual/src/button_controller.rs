@@ -4,10 +4,26 @@ use crate::virtual_device::{
     VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
 };
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 use v1bectl_sync::{
     ButtonPressType, DeviceEvent, DeviceId, DeviceStateValue, EventType, LightState,
 };
+
+/// How long after its button's last `ButtonPressed` a
+/// [`ButtonController`] drops that button's switch echoes (see the type's
+/// docs: one press fires once).
+///
+/// The echo of a press comes from the sync engine's pull. So it trails the
+/// gesture by up to a pull interval (2 s) and the pull's own time, and the
+/// release of a long press trails it by as long as the button was held.
+/// 15 s covers two pulls and a long hold, with room to spare. It's short
+/// enough that a button whose gestures stop coming (the hub's event stream
+/// dropped) works off its echoes again within seconds.
+pub const ECHO_QUIET_PERIOD: Duration = Duration::from_secs(15);
+
+/// Where a [`ButtonController`] reads the time for its quiet period.
+type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonCommand {
@@ -255,17 +271,25 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
 ///
 /// **One press fires once.** A remote can report one press both ways: as a
 /// `ButtonPressed` over the hub's event stream, and as an `is_pressed`
-/// change that the sync engine's pull picks up and echoes. So once its
-/// button has reported a gesture, a controller goes by those alone, and its
-/// button's switch echoes run nothing (#35). A button that never reports
-/// one (a switch that only has the flag, or a hub without an event stream)
-/// keeps working off its echoes, as in #34. It's not a time window because
-/// the echo comes from a pull: up to a pull interval (2 s) and the pull's
-/// own time after the press, or later for a long hold. No window both
-/// catches every echo and lets the next real press through. The gap: an
-/// echo that comes before the button's first `ButtonPressed` still runs.
-/// So the first press after a server start can run twice, if a pull lands
-/// while the button is down.
+/// change that the sync engine's pull picks up and echoes after it. So for
+/// a quiet period after its button's last `ButtonPressed`
+/// ([`ECHO_QUIET_PERIOD`], 15 s), a controller runs nothing for that
+/// button's switch echoes (#35). While the event stream is up, the next
+/// real press comes as a `ButtonPressed` too, so the window drops only
+/// echoes. Once it has passed, the echoes run again. So a button that
+/// never reports a gesture (a switch that only has the flag, or a hub
+/// without an event stream) works off its echoes, as in #34, and so does
+/// one whose gestures stop coming (the hub's event stream dropped) once
+/// the window after the last one is over. It used to stop for good at the
+/// first gesture, and then a dropped stream left the button dead until a
+/// restart.
+///
+/// The gaps: an echo that comes before its press's `ButtonPressed`, with
+/// no window open, still runs. That's the first press after a quiet
+/// spell, if a pull lands while the button is down. With a `toggle` click
+/// it then runs twice, and the click does nothing. The release echo of a
+/// hold longer than the window runs too (`press_off`, which a toggling
+/// controller doesn't have).
 ///
 /// It makes no writes of its own. Once it's registered, the
 /// [`VirtualDeviceManager`](crate::VirtualDeviceManager) hands it its
@@ -282,10 +306,12 @@ pub struct ButtonController {
     press_on_long_action: Option<ButtonAction>,
     press_off_long_action: Option<ButtonAction>,
     press_double_action: Option<ButtonAction>,
-    /// Set once its button has reported a gesture (`ButtonPressed`). From
-    /// then on, only those run anything, and its switch echoes don't (see
-    /// the type's docs: one press fires once).
-    reports_gestures: AtomicBool,
+    /// When its button last reported a gesture (`ButtonPressed`), if it
+    /// ever has. For `quiet_period` after that, its switch echoes run
+    /// nothing (see the type's docs: one press fires once).
+    last_gesture: Mutex<Option<Instant>>,
+    quiet_period: Duration,
+    clock: Clock,
 }
 
 impl ButtonController {
@@ -323,8 +349,27 @@ impl ButtonController {
             press_on_long_action: parse(press_on_long.unwrap_or_default())?,
             press_off_long_action: parse(press_off_long.unwrap_or_default())?,
             press_double_action: parse(press_double.unwrap_or_default())?,
-            reports_gestures: AtomicBool::new(false),
+            last_gesture: Mutex::new(None),
+            quiet_period: ECHO_QUIET_PERIOD,
+            clock: Arc::new(Instant::now),
         })
+    }
+
+    /// The same controller, with a quiet period of `quiet_period` after
+    /// each gesture instead of [`ECHO_QUIET_PERIOD`].
+    #[must_use]
+    pub fn with_echo_quiet_period(mut self, quiet_period: Duration) -> Self {
+        self.quiet_period = quiet_period;
+        self
+    }
+
+    /// The same controller, reading the time for its quiet period from
+    /// `clock` instead of [`Instant::now`]. A test hands it a clock it moves
+    /// by hand, so the window passes without a sleep.
+    #[must_use]
+    pub fn with_clock(mut self, clock: impl Fn() -> Instant + Send + Sync + 'static) -> Self {
+        self.clock = Arc::new(clock);
+        self
     }
 
     /// The action for one edge of a press: `press_on` when the button goes
@@ -355,6 +400,37 @@ impl ButtonController {
                 .collect(),
         }
     }
+
+    /// When its button last reported a gesture. The lock is only ever held
+    /// to read or swap it, so a poisoned one still holds a good value.
+    fn last_gesture(&self) -> MutexGuard<'_, Option<Instant>> {
+        self.last_gesture
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// A clock a test moves by hand, for a controller's quiet period: the
+/// window passes without a sleep.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestClock(Arc<Mutex<Instant>>);
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    pub(crate) fn advance(&self, by: Duration) {
+        *self.0.lock().unwrap() += by;
+    }
+
+    /// `controller`, reading the time from this clock.
+    pub(crate) fn drive(&self, controller: ButtonController) -> ButtonController {
+        let clock = self.clone();
+        controller.with_clock(move || *clock.0.lock().unwrap())
+    }
 }
 
 #[async_trait]
@@ -380,12 +456,14 @@ impl VirtualDevice for ButtonController {
         if event.device_id != self.button_id {
             return Vec::new();
         }
+        let now = (self.clock)();
         if let EventType::ButtonPressed { press_type, .. } = &event.event_type {
-            if !self.reports_gestures.swap(true, Ordering::Relaxed) {
+            if self.last_gesture().replace(now).is_none() {
                 tracing::info!(
-                    "🔘 Button {} reports its presses as ButtonPressed: {} ignores its switch echoes from now on",
+                    "🔘 Button {} reports its presses as ButtonPressed: {} ignores its switch echoes for {:?} after each one",
                     self.button_id,
-                    self.config.device_id
+                    self.config.device_id,
+                    self.quiet_period
                 );
             }
             tracing::debug!("🔘 Button {} reported a {:?}", self.button_id, press_type);
@@ -394,12 +472,17 @@ impl VirtualDevice for ButtonController {
         let Some(is_pressed) = pressed(event) else {
             return Vec::new();
         };
-        if self.reports_gestures.load(Ordering::Relaxed) {
-            // The same press as a `ButtonPressed` it has run, or will.
+        let last_gesture = *self.last_gesture();
+        if let Some(since) = last_gesture
+            .map(|at| now.saturating_duration_since(at))
+            .filter(|since| *since < self.quiet_period)
+        {
+            // The same press as a `ButtonPressed` it has run.
             tracing::debug!(
-                "🔘 Button {} pressed: {} (skipped: it reports its presses as ButtonPressed)",
+                "🔘 Button {} pressed: {} (skipped: {:?} after its last ButtonPressed)",
                 self.button_id,
-                is_pressed
+                is_pressed,
+                since
             );
             return Vec::new();
         }
@@ -677,6 +760,172 @@ mod tests {
             assert_ne!(once.is_on, from.is_on, "one toggle of {from:?}");
             assert_eq!(toggle.apply(once), from, "two toggles of {from:?}");
         }
+    }
+
+    /// A controller on `btn`: `inc a 10` on a press, `dec a 5` on a
+    /// release, on `clock`.
+    fn clocked(clock: &TestClock) -> ButtonController {
+        let config = VirtualDeviceConfig {
+            device_id: "ctrl".to_string(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: "ctrl".to_string(),
+            description: None,
+            enabled: true,
+            config: json!({}),
+        };
+        let [press_on, press_off] = [json!(["inc", "a", 10]), json!(["dec", "a", 5])]
+            .map(|v| v.as_array().cloned().unwrap());
+        let controller = ButtonController::new(
+            config,
+            "btn".to_string(),
+            &press_on,
+            &press_off,
+            None,
+            None,
+            None,
+        )
+        .expect("controller");
+        clock.drive(controller)
+    }
+
+    fn click() -> DeviceEvent {
+        DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: "btn".to_string(),
+            event_type: EventType::ButtonPressed {
+                button_id: "main".to_string(),
+                press_type: ButtonPressType::SinglePress,
+            },
+        }
+    }
+
+    /// The commands `controller` runs for `event`.
+    fn runs(controller: &ButtonController, event: &DeviceEvent) -> Vec<ButtonCommand> {
+        controller
+            .reactions(event)
+            .into_iter()
+            .map(|action| action.command)
+            .collect()
+    }
+
+    /// A press and its release as the sync engine echoes them: what runs
+    /// for each.
+    fn echo_press_and_release(controller: &ButtonController) -> [Vec<ButtonCommand>; 2] {
+        [
+            runs(
+                controller,
+                &attribute("state", switch(false, 85), switch(true, 85)),
+            ),
+            runs(
+                controller,
+                &attribute("state", switch(true, 85), switch(false, 85)),
+            ),
+        ]
+    }
+
+    const ECHO_RUNS: [&[ButtonCommand]; 2] = [&[ButtonCommand::Inc], &[ButtonCommand::Dec]];
+    const ECHO_SKIPPED: [&[ButtonCommand]; 2] = [&[], &[]];
+
+    /// #35 review, finding 2: a switch echo inside the quiet period after
+    /// a gesture runs nothing, up to the last instant of it. From the
+    /// moment it's over, echoes run again, and keep running while no
+    /// gesture comes: a button whose event stream dropped isn't dead. The
+    /// next gesture opens a new window.
+    #[test]
+    fn switch_echoes_run_nothing_for_the_quiet_period_after_a_gesture() {
+        let clock = TestClock::new();
+        let controller = clocked(&clock);
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "before any gesture"
+        );
+
+        assert_eq!(
+            runs(&controller, &click()),
+            [ButtonCommand::Inc, ButtonCommand::Dec]
+        );
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "right after it"
+        );
+        clock.advance(ECHO_QUIET_PERIOD.saturating_sub(Duration::from_millis(1)));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "at its last instant"
+        );
+
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "once it's over"
+        );
+        clock.advance(Duration::from_hours(1));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "an hour on, still no gesture"
+        );
+
+        assert_eq!(
+            runs(&controller, &click()),
+            [ButtonCommand::Inc, ButtonCommand::Dec]
+        );
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "after the next gesture"
+        );
+    }
+
+    /// #35 review, finding 2: the window runs from the *last* gesture, and
+    /// it's the configured one.
+    #[test]
+    fn the_quiet_period_runs_from_the_last_gesture() {
+        let clock = TestClock::new();
+        let controller = clocked(&clock);
+        runs(&controller, &click());
+        clock.advance(Duration::from_secs(10));
+        runs(&controller, &click());
+        clock.advance(Duration::from_secs(10));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_SKIPPED,
+            "20 s after the first gesture, 10 s after the second"
+        );
+        clock.advance(ECHO_QUIET_PERIOD.saturating_sub(Duration::from_secs(10)));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "the quiet period after the second"
+        );
+
+        let clock = TestClock::new();
+        let controller = clocked(&clock).with_echo_quiet_period(Duration::from_secs(1));
+        runs(&controller, &click());
+        assert_eq!(echo_press_and_release(&controller), ECHO_SKIPPED);
+        clock.advance(Duration::from_secs(1));
+        assert_eq!(
+            echo_press_and_release(&controller),
+            ECHO_RUNS,
+            "a 1 s window is over after 1 s"
+        );
+    }
+
+    /// #35 review, finding 2: an event of another device opens no window.
+    #[test]
+    fn a_gesture_of_another_button_opens_no_window() {
+        let clock = TestClock::new();
+        let controller = clocked(&clock);
+        let other = DeviceEvent {
+            device_id: "other".to_string(),
+            ..click()
+        };
+        assert!(runs(&controller, &other).is_empty());
+        assert_eq!(echo_press_and_release(&controller), ECHO_RUNS);
     }
 
     /// #35: `press_double` is parsed when the controller is made, like the

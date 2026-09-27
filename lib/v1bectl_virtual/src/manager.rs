@@ -812,9 +812,10 @@ mod tests {
     //! feeds it the bus, so each test decides exactly when tracking catches
     //! up, and nothing waits on a clock.
     use super::*;
+    use crate::button_controller::TestClock;
     use crate::{
         ButtonController, DummyGateway, LightGroup, LightGroupLinear, SceneController,
-        DEFAULT_GROUP_LEVEL,
+        DEFAULT_GROUP_LEVEL, ECHO_QUIET_PERIOD,
     };
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
@@ -1725,7 +1726,9 @@ mod tests {
     /// Light `a` starts on at 50; the press adds 20 and the release takes
     /// 5 off, so a click moves it by 15 and each echo that ran would show.
     /// Two presses, each reported both ways, end at 80: 50 → 70 → 65, then
-    /// 85 → 80. A battery tick of the remote runs nothing either.
+    /// 85 → 80. A battery tick of the remote runs nothing either. The
+    /// controllers' clock doesn't move, so every echo is inside the quiet
+    /// period after the gesture before it.
     ///
     /// And the dedupe is per button: a controller on `plain`, a switch that
     /// never reports a gesture, keeps running off its echoes (#34).
@@ -1737,14 +1740,16 @@ mod tests {
             store.add_device(light_info(id), light(true, 50)).await;
         }
         let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let clock = TestClock::new();
         for (id, button, target) in [("ctrl", "btn", "a"), ("ctrl_plain", "plain", "b")] {
             add_switch(&store, button).await;
             let (press_on, press_off) = (
                 serde_json::json!(["inc", target, 20]),
                 serde_json::json!(["dec", target, 5]),
             );
+            let controller = clock.drive(controller(id, button, press_on, press_off));
             manager
-                .add_virtual_device(Box::new(controller(id, button, press_on, press_off)))
+                .add_virtual_device(Box::new(controller))
                 .await
                 .expect("register");
         }
@@ -1777,6 +1782,84 @@ mod tests {
             vec![light(true, 70), light(true, 65)],
             "a button that never reported a gesture must still fire on its echoes"
         );
+    }
+
+    /// #35 review, finding 2: a button whose gestures stop coming (the
+    /// hub's event stream dropped) works off its switch echoes again once
+    /// the quiet period after its last gesture is over. It used to ignore
+    /// them for good after its first gesture, so it was dead from then on.
+    /// Light `a` starts on at 50; the press adds 10 and the release takes
+    /// 5 off, so each echo that ran shows.
+    #[tokio::test]
+    async fn a_button_whose_gestures_stop_works_off_its_echoes_again() {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(100));
+        store.add_device(light_info("a"), light(true, 50)).await;
+        add_switch(&store, "btn").await;
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let clock = TestClock::new();
+        let (press_on, press_off) = (
+            serde_json::json!(["inc", "a", 10]),
+            serde_json::json!(["dec", "a", 5]),
+        );
+        let controller = clock.drive(controller("ctrl", "btn", press_on, press_off));
+        manager
+            .add_virtual_device(Box::new(controller))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+        let levels = |events: Vec<DeviceEvent>| -> Vec<Option<u8>> {
+            echoes(&events, "a")
+                .into_iter()
+                .map(|state| match state {
+                    DeviceStateValue::Light(light) => light.brightness,
+                    other => panic!("a echoed {other:?}"),
+                })
+                .collect()
+        };
+
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        press(&store, &bus, true).await;
+        press(&store, &bus, false).await;
+        let ran = levels(pump(&manager, &mut rx).await);
+        assert_eq!(ran, [Some(60), Some(55)], "a click reported both ways");
+
+        // The event stream drops: only the pull's echoes come from now on.
+        for (case, by, want) in [
+            (
+                "just inside the window",
+                ECHO_QUIET_PERIOD.saturating_sub(Duration::from_millis(1)),
+                vec![],
+            ),
+            (
+                "once it's over",
+                Duration::from_millis(1),
+                vec![Some(65), Some(60)],
+            ),
+            (
+                "an hour on",
+                Duration::from_hours(1),
+                vec![Some(70), Some(65)],
+            ),
+        ] {
+            clock.advance(by);
+            press(&store, &bus, true).await;
+            press(&store, &bus, false).await;
+            let ran = levels(pump(&manager, &mut rx).await);
+            assert_eq!(ran, want, "the echoes of a press, {case}");
+        }
+
+        // The stream is back: the next gesture opens a new window.
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        press(&store, &bus, true).await;
+        press(&store, &bus, false).await;
+        let ran = levels(pump(&manager, &mut rx).await);
+        assert_eq!(
+            ran,
+            [Some(75), Some(70)],
+            "a click reported both ways again"
+        );
+        assert_eq!(stored(&store, "a").await, light(true, 70));
     }
 
     /// #35 review, finding 1: a controller that toggles on a click (as the
