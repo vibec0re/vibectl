@@ -24,9 +24,9 @@ help:
 	@echo "  static-cli    - Build static CLI"
 	@echo ""
 	@echo "Test:"
-	@echo "  test          - Run all tests"
-	@echo "  test-dummy    - Run tests with dummy gateway"
-	@echo "  test-real     - Run tests with real Dirigera"
+	@echo "  test          - Run native tests (mirrors CI: cargo test --workspace --exclude v1bectl_web)"
+	@echo "  test-dummy    - Alias for test"
+	@echo "  test-web      - Run v1bectl_web lib tests (mirrors CI's web job)"
 	@echo ""
 	@echo "Run:"
 	@echo "  run-server    - Run server (dummy gateway)"
@@ -36,7 +36,8 @@ help:
 	@echo ""
 	@echo "Other:"
 	@echo "  check         - Run cargo check"
-	@echo "  clippy        - Run clippy lints"
+	@echo "  clippy        - Run clippy lints (mirrors CI's native job)"
+	@echo "  clippy-web    - Run clippy for v1bectl_web on wasm32 (mirrors CI's web job)"
 	@echo "  fmt           - Format all code"
 	@echo "  clean         - Clean build artifacts"
 	@echo "  dev-setup     - Set up dev environment"
@@ -102,23 +103,23 @@ static-cli:
 	@echo "✅ Static CLI: $(STATIC_DIR)/v1bectl_cli"
 
 # Test targets
+# Mirrors CI's native job (cargo test --workspace --exclude v1bectl_web); the
+# web crate has its own wasm toolchain and is covered by `test-web` below.
 .PHONY: test
 test:
-	V1BECTL_GATEWAY_TYPE=dummy cargo test --workspace
+	cargo test --workspace --exclude v1bectl_web
 
+# `V1BECTL_GATEWAY_TYPE` / `V1BECTL_DUMMY_SCENARIO` used to vary this, but no
+# Rust code reads either var — DummyGateway is the only gateway exercised by
+# `cargo test` today. Kept as an alias since "test with the dummy gateway" is
+# still the intent.
 .PHONY: test-dummy
-test-dummy:
-	V1BECTL_GATEWAY_TYPE=dummy V1BECTL_DUMMY_SCENARIO=basic_home cargo test --workspace
+test-dummy: test
 
-.PHONY: test-real
-test-real:
-	@echo "Make sure V1BECTL_GATEWAY_HOST and V1BECTL_ACCESS_TOKEN are set"
-	V1BECTL_GATEWAY_TYPE=real cargo test --workspace
-
-.PHONY: test-scenario
-test-scenario:
-	@if [ -z "$(SCENARIO)" ]; then echo "Usage: make test-scenario SCENARIO=<scenario_name>"; exit 1; fi
-	V1BECTL_GATEWAY_TYPE=dummy V1BECTL_DUMMY_SCENARIO=$(SCENARIO) cargo test --workspace
+# Mirrors CI's web job test step.
+.PHONY: test-web
+test-web:
+	cargo test -p v1bectl_web --lib
 
 # Run targets
 .PHONY: run-server
@@ -152,7 +153,12 @@ check:
 
 .PHONY: clippy
 clippy:
-	cargo clippy --workspace -- -D warnings
+	cargo clippy --workspace --exclude v1bectl_web --all-targets -- -D warnings
+
+# Mirrors CI's web job clippy step (v1bectl_web only builds clean on wasm32).
+.PHONY: clippy-web
+clippy-web:
+	cargo clippy -p v1bectl_web --target wasm32-unknown-unknown -- -D warnings
 
 .PHONY: fmt
 fmt:
@@ -178,7 +184,7 @@ dev-setup:
 # Performance testing
 .PHONY: bench
 bench:
-	V1BECTL_GATEWAY_TYPE=dummy V1BECTL_DUMMY_SCENARIO=large_home cargo bench
+	cargo bench
 
 # Coverage (requires cargo-tarpaulin)
 .PHONY: coverage
@@ -187,20 +193,12 @@ coverage:
 		echo "Installing cargo-tarpaulin..."; \
 		cargo install cargo-tarpaulin; \
 	fi
-	V1BECTL_GATEWAY_TYPE=dummy cargo tarpaulin --workspace --out Html
+	cargo tarpaulin --workspace --out Html
 
 # Documentation
 .PHONY: docs
 docs:
 	cargo doc --workspace --no-deps --open
-
-# Integration test scenarios
-.PHONY: test-scenarios
-test-scenarios:
-	@echo "Testing all scenarios..."
-	make test-scenario SCENARIO=basic_home
-	make test-scenario SCENARIO=large_home
-	@echo "All scenarios tested successfully!"
 
 # Quick development cycle
 .PHONY: dev
