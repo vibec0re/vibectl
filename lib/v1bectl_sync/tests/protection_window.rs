@@ -1,396 +1,24 @@
 //! 🛡️ Integration tests for the protection window of user writes (#23).
 //!
-//! A user (`SyncPriority::Critical`) write goes into the store at once and
+//! A user write (`apply_optimistic_update`) goes into the store at once and
 //! is pushed to the gateway later, from the sync buffer. Until the hub
 //! confirms it, a pull that still reports the old value must leave the store
 //! alone. The pending confirmation used to be armed only when the push went
 //! out, so a pull that ran while a write was still queued (behind the other
 //! members of a group write, say) reverted it.
 //!
-//! The engine runs for real, against [`TestHub`]: a fake gateway whose
-//! PATCHes can be held at a gate and whose traffic is logged. The tests
-//! order their steps on that log, never on sleeps. Pulls come either from
-//! the periodic pull worker ([`Rig::full_pull_cycle`]) or, where a test
-//! needs one at an exact point, from a queued `PullFromGateway` task
-//! ([`Rig::pull`]).
+//! The engine runs for real, against the shared rig's `TestHub` (see
+//! `common`): a fake gateway whose PATCHes can be held at a gate and whose
+//! traffic is logged. The tests order their steps on that log, never on
+//! sleeps, except `push_time_restart_covers_a_queue_delay`, whose subject is
+//! elapsed time.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+mod common;
+
 use std::time::{Duration, Instant};
 
-use async_trait::async_trait;
-use tokio::sync::{broadcast, watch, Semaphore};
-use tokio::task::JoinHandle;
-use v1bectl_sync::{
-    Capability, DeviceEvent, DeviceId, DeviceInfo, DeviceStateValue, DeviceType, EventBus,
-    EventType, Gateway, GatewayError, GatewayHealth, LightState, StateStore, SyncConfig,
-    SyncEngine, SyncPriority, SyncTask, SyncTaskType,
-};
-
-/// Bounds a wait that should resolve. Nothing sleeps through it when things
-/// work; it only turns a hang into a failure.
-const WAIT: Duration = Duration::from_secs(20);
-
-fn light(is_on: bool, brightness: u8) -> DeviceStateValue {
-    DeviceStateValue::Light(LightState {
-        is_on,
-        brightness: Some(brightness),
-        color_temp: None,
-        rgb_color: None,
-    })
-}
-
-fn off() -> DeviceStateValue {
-    light(false, 10)
-}
-
-fn on() -> DeviceStateValue {
-    light(true, 80)
-}
-
-fn light_info(id: &str) -> DeviceInfo {
-    DeviceInfo {
-        device_id: id.to_string(),
-        name: format!("Light {id}"),
-        device_type: DeviceType::Light,
-        capabilities: vec![Capability::OnOff, Capability::Brightness],
-        device_groups: vec![],
-        manufacturer: Some("IKEA".to_string()),
-        model: Some("TRADFRI".to_string()),
-        firmware_version: None,
-        battery_powered: false,
-        reachable: true,
-        last_seen: 0,
-        custom_attributes: HashMap::new(),
-    }
-}
-
-// ---------------------------------------------------------------------
-// The fake hub
-// ---------------------------------------------------------------------
-
-/// What the hub does with a PATCH once the gate lets it through.
-#[derive(Clone, Copy, Debug)]
-enum OnSet {
-    /// Accept it and report the new value from then on, like a real hub.
-    Apply,
-    /// Accept it, but the device never changes: the hub keeps reporting the
-    /// old value (a device that dropped off the mesh, say).
-    Ignore,
-    /// Fail it.
-    Fail,
-}
-
-/// Everything the engine asked the hub, in order.
-#[derive(Clone, Debug, Default)]
-struct HubLog {
-    /// Every `get_device_state`, by device, logged as it's answered.
-    reads: Vec<DeviceId>,
-    /// Every `set_device_state`, logged as it arrives (before the gate).
-    sets_started: Vec<(DeviceId, DeviceStateValue)>,
-    /// `set_device_state` calls answered (applied, ignored or failed).
-    sets_done: usize,
-}
-
-impl HubLog {
-    fn sets_for(&self, id: &str) -> Vec<DeviceStateValue> {
-        self.sets_started
-            .iter()
-            .filter(|(device, _)| device == id)
-            .map(|(_, state)| state.clone())
-            .collect()
-    }
-}
-
-struct TestHub {
-    /// What a pull reads, per device. A device not in here (a sentinel)
-    /// reads as `Empty`.
-    reported: Mutex<HashMap<DeviceId, DeviceStateValue>>,
-    on_set: OnSet,
-    /// PATCHes wait here for a permit. Closed means open: nothing waits.
-    gate: Semaphore,
-    log: watch::Sender<HubLog>,
-}
-
-impl TestHub {
-    fn new(on_set: OnSet, gated: bool) -> Arc<Self> {
-        let gate = Semaphore::new(0);
-        if !gated {
-            gate.close();
-        }
-        Arc::new(Self {
-            reported: Mutex::new(HashMap::new()),
-            on_set,
-            gate,
-            log: watch::channel(HubLog::default()).0,
-        })
-    }
-
-    /// What the hub reports for `id` from now on (a physical switch, or
-    /// another client).
-    fn report(&self, id: &str, state: DeviceStateValue) {
-        self.reported.lock().unwrap().insert(id.to_string(), state);
-    }
-
-    fn reported(&self, id: &str) -> Option<DeviceStateValue> {
-        self.reported.lock().unwrap().get(id).cloned()
-    }
-
-    /// Let `n` held PATCHes through, in arrival order.
-    fn release(&self, n: usize) {
-        self.gate.add_permits(n);
-    }
-
-    /// Stop holding PATCHes, including the ones waiting now.
-    fn open_gate(&self) {
-        self.gate.close();
-    }
-
-    fn log(&self) -> HubLog {
-        self.log.borrow().clone()
-    }
-
-    /// Resolves once the log satisfies `done`.
-    async fn wait(&self, what: &str, done: impl FnMut(&HubLog) -> bool) {
-        let mut rx = self.log.subscribe();
-        tokio::time::timeout(WAIT, rx.wait_for(done))
-            .await
-            .unwrap_or_else(|_| panic!("{what}: never happened, hub log {:?}", self.log()))
-            .expect("hub log");
-    }
-}
-
-#[async_trait]
-impl Gateway for TestHub {
-    async fn discover_devices(&self) -> Result<Vec<DeviceInfo>, GatewayError> {
-        Ok(vec![])
-    }
-
-    async fn get_device_state(
-        &self,
-        device_id: &DeviceId,
-    ) -> Result<DeviceStateValue, GatewayError> {
-        let state = self
-            .reported
-            .lock()
-            .unwrap()
-            .get(device_id)
-            .cloned()
-            .unwrap_or(DeviceStateValue::Empty);
-        self.log
-            .send_modify(|log| log.reads.push(device_id.clone()));
-        Ok(state)
-    }
-
-    async fn set_device_state(
-        &self,
-        device_id: &DeviceId,
-        state: DeviceStateValue,
-    ) -> Result<(), GatewayError> {
-        self.log.send_modify(|log| {
-            log.sets_started.push((device_id.clone(), state.clone()));
-        });
-        if let Ok(permit) = self.gate.acquire().await {
-            permit.forget();
-        }
-        let result = match self.on_set {
-            OnSet::Apply => {
-                self.report(device_id, state);
-                Ok(())
-            }
-            OnSet::Ignore => Ok(()),
-            OnSet::Fail => Err(GatewayError::NetworkError("hub unreachable".to_string())),
-        };
-        self.log.send_modify(|log| log.sets_done += 1);
-        result
-    }
-
-    async fn health_check(&self) -> Result<GatewayHealth, GatewayError> {
-        Ok(GatewayHealth {
-            reachable: true,
-            response_time_ms: 0,
-            connected_devices: 0,
-            last_error: None,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------
-// The rig: store + bus + running engine around a TestHub
-// ---------------------------------------------------------------------
-
-/// How the test gets its pulls.
-#[derive(Clone, Copy)]
-enum Pulls {
-    /// The pull worker runs back to back. Wait on [`Rig::full_pull_cycle`].
-    Periodic,
-    /// The pull worker only runs its first cycle, at start. Pull with
-    /// [`Rig::pull`].
-    OnDemand,
-}
-
-struct Rig {
-    hub: Arc<TestHub>,
-    store: Arc<StateStore>,
-    bus: Arc<EventBus>,
-    engine: SyncEngine,
-    runner: JoinHandle<anyhow::Result<()>>,
-    sentinels: AtomicUsize,
-}
-
-impl Rig {
-    /// Lights `ids`, all `off()` in the store and on the hub, with the
-    /// engine started. `config` fills in everything but the intervals.
-    async fn new(ids: &[&str], hub: Arc<TestHub>, pulls: Pulls, config: SyncConfig) -> Self {
-        let store = StateStore::new();
-        for id in ids {
-            store.add_device(light_info(id), off()).await;
-            hub.report(id, off());
-        }
-        let bus = Arc::new(EventBus::new(1000));
-        let config = match pulls {
-            Pulls::Periodic => SyncConfig {
-                pull_interval: Duration::from_millis(2),
-                ..config
-            },
-            Pulls::OnDemand => SyncConfig {
-                pull_interval: Duration::from_secs(3600),
-                push_interval: Duration::from_millis(5),
-                ..config
-            },
-        };
-        let engine = SyncEngine::new(store.clone(), bus.clone(), hub.clone(), Some(config));
-        let runner = tokio::spawn({
-            let engine = engine.clone();
-            async move { engine.start().await }
-        });
-        // The first pull cycle starts at once. Let it read everything, so it
-        // took its snapshot of the store before the test writes anything.
-        hub.wait("first pull cycle", |log| log.reads.len() >= ids.len())
-            .await;
-        Self {
-            hub,
-            store,
-            bus,
-            engine,
-            runner,
-            sentinels: AtomicUsize::new(0),
-        }
-    }
-
-    /// A user write, the way the API server and the virtual manager make it.
-    async fn write(&self, id: &str, state: DeviceStateValue) {
-        self.engine
-            .apply_optimistic_update(&id.to_string(), state)
-            .await
-            .expect("write");
-    }
-
-    async fn stored(&self, id: &str) -> DeviceStateValue {
-        self.store
-            .get_device(&id.to_string())
-            .await
-            .expect("device in store")
-            .state
-    }
-
-    /// One pull of `id` (`Pulls::OnDemand`), handled completely on return.
-    ///
-    /// The push worker runs queued tasks one at a time, in order, so a
-    /// sentinel pull queued right behind it is read only once `id`'s pull
-    /// is done. The sentinel isn't in the store, so it changes nothing.
-    async fn pull(&self, id: &str) {
-        let sentinel = format!(
-            "sentinel-{}",
-            self.sentinels.fetch_add(1, Ordering::Relaxed)
-        );
-        for device_id in [id.to_string(), sentinel.clone()] {
-            self.engine
-                .queue_sync(SyncTask {
-                    device_id,
-                    task_type: SyncTaskType::PullFromGateway,
-                    created_at: Instant::now(),
-                    priority: SyncPriority::Normal,
-                })
-                .await;
-        }
-        self.hub
-            .wait(&format!("pull of {id}"), |log| {
-                log.reads.contains(&sentinel)
-            })
-            .await;
-    }
-
-    /// Resolves once the pull worker (`Pulls::Periodic`) has run a whole
-    /// cycle that started after this call.
-    ///
-    /// A cycle snapshots the store, then reads each of its `n` devices once,
-    /// so cycles end on read counts that are multiples of `n`. The first
-    /// boundary after `start` reads is at most `start + n`. The cycle after
-    /// it snapshots the store after this call, and has been handled
-    /// completely once the next cycle's first read (at most
-    /// `start + 2n + 1`) comes in.
-    async fn full_pull_cycle(&self) {
-        let n = self.store.device_count().await;
-        let start = self.hub.log().reads.len();
-        self.hub
-            .wait("a full pull cycle", |log| log.reads.len() > start + 2 * n)
-            .await;
-    }
-
-    async fn shutdown(self) {
-        self.hub.open_gate();
-        self.engine.stop().await;
-        self.runner
-            .await
-            .expect("sync engine task")
-            .expect("sync engine");
-    }
-}
-
-/// `(device, old_value, new_value)` of every state event received so far.
-fn drain_events(rx: &mut broadcast::Receiver<DeviceEvent>) -> Vec<(DeviceId, Value, Value)> {
-    let mut events = vec![];
-    while let Ok(event) = rx.try_recv() {
-        if let EventType::AttributeChanged {
-            old_value,
-            new_value,
-            ..
-        } = event.event_type
-        {
-            events.push((event.device_id, old_value, new_value));
-        }
-    }
-    events
-}
-
-/// Waits for a state event on `id` whose new value is `state`.
-async fn wait_for_echo(
-    rx: &mut broadcast::Receiver<DeviceEvent>,
-    id: &str,
-    state: &DeviceStateValue,
-) {
-    let want = json(state);
-    tokio::time::timeout(WAIT, async {
-        loop {
-            let event = rx.recv().await.expect("event bus");
-            if let EventType::AttributeChanged { new_value, .. } = event.event_type {
-                if event.device_id == id && new_value == want {
-                    return;
-                }
-            }
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("{id} was never set to {state:?}"));
-}
-
-type Value = serde_json::Value;
-
-fn json(state: &DeviceStateValue) -> Value {
-    serde_json::to_value(state).expect("state to json")
-}
+use common::*;
+use v1bectl_sync::SyncConfig;
 
 // ---------------------------------------------------------------------
 // Tests
@@ -494,6 +122,86 @@ async fn hub_confirmation_clears_the_pending_entry() {
 
     // Someone flips the physical switch right after. With the pending
     // entry still there, this pull would be ignored as "not our change".
+    let flipped = light(false, 40);
+    rig.hub.report("a", flipped.clone());
+    rig.pull("a").await;
+    assert_eq!(rig.stored("a").await, flipped, "external change after it");
+
+    rig.shutdown().await;
+}
+
+/// The same lifecycle through the periodic pull (#32). With optimistic
+/// updates the store shows the write before the hub does, so once the push
+/// lands, the pull finds the store and the hub equal and has nothing to
+/// reconcile. It must still take that as the confirmation: a physical
+/// switch right after must be taken, not ignored for the rest of the
+/// window. (The window is long, so it can't run out during the test.)
+#[tokio::test]
+async fn periodic_pull_confirmation_clears_the_pending_entry() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Apply, false),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: Duration::from_secs(60),
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    rig.write("a", on()).await;
+    rig.hub.wait("push", |log| log.sets_done >= 1).await;
+    // A whole cycle that finds `on` in the store and on the hub.
+    rig.full_pull_cycle().await;
+    assert_eq!(rig.stored("a").await, on(), "after the hub confirmed");
+
+    let flipped = light(false, 40);
+    rig.hub.report("a", flipped.clone());
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored("a").await,
+        flipped,
+        "the switch change after the confirmation was ignored: the pending \
+         entry outlived the periodic pull's confirmation"
+    );
+
+    rig.shutdown().await;
+}
+
+/// Every user write is protected, whatever its priority (#32). With
+/// `client_priority_boost: false` a write is queued `High`, not `Critical`,
+/// and used to get no pending confirmation at all: a pull before its push
+/// landed reverted it. The rest of the lifecycle is the same as with the
+/// boost: the hub confirms, and the next external change is taken.
+#[tokio::test]
+async fn writes_without_the_priority_boost_are_protected_too() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::OnDemand,
+        SyncConfig {
+            client_priority_boost: false,
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    rig.write("a", on()).await;
+    rig.hub
+        .wait("PATCH at the gate", |log| !log.sets_started.is_empty())
+        .await;
+    rig.pull("a").await;
+    assert_eq!(
+        rig.stored("a").await,
+        on(),
+        "a pull before the push landed reverted a write queued without the \
+         priority boost"
+    );
+
+    rig.hub.release(1);
+    rig.hub.wait("push", |log| log.sets_done >= 1).await;
+    rig.pull("a").await;
+    assert_eq!(rig.stored("a").await, on(), "after the hub confirmed");
     let flipped = light(false, 40);
     rig.hub.report("a", flipped.clone());
     rig.pull("a").await;
@@ -696,6 +404,246 @@ async fn failed_push_stays_protected_within_the_window() {
     rig.hub.wait("failed push", |log| log.sets_done >= 1).await;
     rig.pull("a").await;
     assert_eq!(rig.stored("a").await, on(), "pull right after the failure");
+
+    rig.shutdown().await;
+}
+
+/// The window restarts when the push goes out. A write that waited in the
+/// buffer for most of its window, whose push is then slow to be answered,
+/// must not be reverted by a pull that lands after the write's original
+/// window but inside the restarted one.
+///
+/// From the #31 review. The window is time, so this is the one test here
+/// that sleeps: the two sleeps are the queue delay and the slow answer, and
+/// the two timing asserts turn a machine too slow for them into a clear
+/// "test timing" failure rather than a false pass or fail.
+#[tokio::test]
+async fn push_time_restart_covers_a_queue_delay() {
+    let window = Duration::from_millis(1000);
+    let rig = Rig::new(
+        &["a", "b"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: window,
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    let written = Instant::now();
+    rig.write("a", on()).await;
+    rig.write("b", on()).await;
+    rig.hub
+        .wait("first PATCH at the gate", |log| log.sets_started.len() == 1)
+        .await;
+    let held = rig.hub.log().sets_started[0].0.clone();
+    let queued = if held == "a" { "b" } else { "a" };
+
+    // The queued write waits behind the held PATCH for 60% of its window.
+    tokio::time::sleep(window * 6 / 10).await;
+    rig.hub.release(1);
+    rig.hub
+        .wait("queued PATCH at the gate", |log| {
+            log.sets_started.len() == 2
+        })
+        .await;
+    let pushed_at = Instant::now();
+
+    // Its push is out but not answered. Wait until the window measured from
+    // the write is over, while the one measured from the push isn't.
+    tokio::time::sleep(window * 6 / 10).await;
+    assert!(
+        written.elapsed() > window,
+        "test timing: the original window is not over yet"
+    );
+    assert!(
+        pushed_at.elapsed() < window,
+        "test timing: the restarted window already ran out"
+    );
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored(queued).await,
+        on(),
+        "{queued}: reverted by a pull inside the restarted window (push-time restart missing)"
+    );
+
+    rig.hub.open_gate();
+    rig.hub.wait("both pushes", |log| log.sets_done >= 2).await;
+    rig.shutdown().await;
+}
+
+/// Which device of a two-write batch the toggle-back tests toggle back.
+#[derive(Clone, Copy, Debug)]
+enum ToggledBack {
+    /// The device whose `on` PATCH the batch sends first: the toggle-back is
+    /// made while that PATCH is in flight.
+    HeldFirst,
+    /// The device whose `on` PATCH waits behind the other one: the
+    /// toggle-back is made while its stale `on` is out of the buffer but not
+    /// sent yet.
+    Behind,
+}
+
+/// A pull of `id` the way `pulls` makes them: a whole periodic cycle, or
+/// a queued `PullFromGateway` of `id`.
+async fn pull_now(rig: &Rig, pulls: Pulls, id: &str) {
+    match pulls {
+        Pulls::Periodic => rig.full_pull_cycle().await,
+        Pulls::OnDemand => rig.pull(id).await,
+    }
+}
+
+/// From the #32 review: a pull may only take a value for a write's
+/// confirmation once that value's push went out. The user toggles a light
+/// on and back off while the `on` PATCH is in flight (a double click, a
+/// slider snapped back). The hub still reports `off`, which is also what
+/// the toggle-back expects, but only by coincidence: the `on` PATCH is
+/// about to move the hub. The toggle-back must stay protected until its own
+/// push lands, whichever order the batch sends its PATCHes in, and the UI
+/// must never show it `on` again.
+///
+/// `Pulls::Periodic` takes the periodic pull's path (`clear_confirmed`, the
+/// store and the hub agree); `Pulls::OnDemand` a queued pull's
+/// (`handle_gateway_state_change`).
+async fn toggle_back_during_an_in_flight_patch(pulls: Pulls, toggled_back: ToggledBack) {
+    let rig = Rig::new(
+        &["h", "a", "b"],
+        TestHub::new(OnSet::Apply, true),
+        pulls,
+        SyncConfig::default(),
+    )
+    .await;
+    let first = rig.write_one_batch("h", &[("a", on()), ("b", on())]).await;
+    let behind = if first == "a" { "b" } else { "a" };
+    let toggled = match toggled_back {
+        ToggledBack::HeldFirst => first.as_str(),
+        ToggledBack::Behind => behind,
+    };
+    let case = format!("{pulls:?}, {toggled_back:?}: {toggled}");
+    let mut rx = rig.bus.subscribe();
+
+    // Toggle back before the hub answered: it still reports `off`.
+    rig.write(toggled, off()).await;
+    pull_now(&rig, pulls, toggled).await;
+    assert_eq!(
+        rig.stored(toggled).await,
+        off(),
+        "{case}: before the `on` PATCH landed"
+    );
+
+    // The batch's `on` PATCHes land, but not the toggle-back's own push.
+    rig.hub.release(1);
+    rig.hub
+        .wait("the batch's second PATCH at the gate", |log| {
+            log.sets_started.len() == 3
+        })
+        .await;
+    if let ToggledBack::Behind = toggled_back {
+        assert_eq!(
+            rig.hub.log().sets_started[2],
+            (toggled.to_string(), on()),
+            "{case}: the stale `on` goes out"
+        );
+        rig.hub.release(1);
+        rig.hub
+            .wait("the stale `on` landed", |log| log.sets_done >= 3)
+            .await;
+    }
+    // Held first: `toggled`'s `on` landed; the buffer worker is held on
+    // `behind`, and the toggle-back still waits in the buffer. Behind: its
+    // stale `on` landed; the toggle-back's push may be out, but not landed.
+    assert_eq!(rig.hub.reported(toggled), Some(on()), "{case}: the hub");
+    pull_now(&rig, pulls, toggled).await;
+    assert_eq!(
+        rig.stored(toggled).await,
+        off(),
+        "{case}: the toggle-back was reverted: the pull that found the hub \
+         still on the old value took it for the confirmation"
+    );
+
+    // The toggle-back's push lands, and that is its confirmation.
+    rig.hub.open_gate();
+    rig.hub
+        .wait("the toggle-back's push landed", |log| {
+            log.sets_for(toggled).last() == Some(&off()) && log.sets_done == log.sets_started.len()
+        })
+        .await;
+    pull_now(&rig, pulls, toggled).await;
+    assert_eq!(rig.hub.reported(toggled), Some(off()), "{case}: the hub");
+    assert_eq!(rig.stored(toggled).await, off(), "{case}: the store");
+    let shown: Vec<Value> = drain_events(&mut rx)
+        .into_iter()
+        .filter(|(id, _, _)| id == toggled)
+        .map(|(_, _, new)| new)
+        .collect();
+    assert!(
+        shown.iter().all(|new| *new == json(&off())),
+        "{case}: the UI showed the toggled-back light on again: {shown:?}"
+    );
+
+    rig.shutdown().await;
+}
+
+#[tokio::test]
+async fn toggle_back_during_its_own_in_flight_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::Periodic, ToggledBack::HeldFirst).await;
+}
+
+#[tokio::test]
+async fn toggle_back_behind_another_devices_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::Periodic, ToggledBack::Behind).await;
+}
+
+#[tokio::test]
+async fn queued_pull_toggle_back_during_its_own_in_flight_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::OnDemand, ToggledBack::HeldFirst).await;
+}
+
+#[tokio::test]
+async fn queued_pull_toggle_back_behind_another_devices_patch_is_not_reverted() {
+    toggle_back_during_an_in_flight_patch(Pulls::OnDemand, ToggledBack::Behind).await;
+}
+
+/// A device removed from the store takes its pending confirmation with it
+/// (#32). Nothing else clears it: only a pull of the device does, and pulls
+/// only read devices in the store. If the device comes back under the same
+/// id, a stale entry would ignore its first real changes for the rest of
+/// that window.
+///
+/// `b` stays in the store so the pull cycles have something to read.
+#[tokio::test]
+async fn a_removed_device_takes_its_pending_confirmation_with_it() {
+    let rig = Rig::new(
+        &["a", "b"],
+        TestHub::new(OnSet::Ignore, false),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: Duration::from_secs(60),
+            ..SyncConfig::default()
+        },
+    )
+    .await;
+
+    // A write the hub never confirms: its entry would last the whole window.
+    rig.write("a", on()).await;
+    rig.hub.wait("push", |log| log.sets_done >= 1).await;
+    rig.store
+        .remove_device(&"a".to_string())
+        .await
+        .expect("remove a");
+    rig.full_pull_cycle().await;
+
+    // `a` comes back (rediscovered, say), and its switch is flipped.
+    rig.store.add_device(light_info("a"), off()).await;
+    let flipped = light(true, 40);
+    rig.hub.report("a", flipped.clone());
+    rig.full_pull_cycle().await;
+    assert_eq!(
+        rig.stored("a").await,
+        flipped,
+        "a pending entry from before the removal ignored the change"
+    );
 
     rig.shutdown().await;
 }
