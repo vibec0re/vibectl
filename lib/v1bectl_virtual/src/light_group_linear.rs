@@ -1,5 +1,6 @@
 // 🔥 LINEAR LIGHT GROUP - IMPROVED BRIGHTNESS MAPPING! 💖
 
+use crate::light_group::fanned_out;
 use crate::virtual_device::*;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -67,23 +68,27 @@ impl LightGroupLinear {
         }
     }
 
-    /// Apply mapped brightness to all member lights
-    async fn apply_brightness_mapping(&self) -> Result<(), VirtualDeviceError> {
-        let group_brightness = self.current_state.brightness.unwrap_or(100);
+    /// What the group state `group` fans out to the member called `name`.
+    fn member_state(&self, name: &str, group: &LightState) -> LightState {
+        let member_brightness = if group.is_on {
+            self.map_brightness(name, group.brightness.unwrap_or(100))
+        } else {
+            0
+        };
 
+        LightState {
+            is_on: member_brightness > 0,
+            brightness: Some(member_brightness),
+            color_temp: group.color_temp,
+            rgb_color: group.rgb_color.clone(),
+        }
+    }
+
+    /// Apply the mapped brightness for the group state `group` to all member lights
+    async fn apply_brightness_mapping(&self, group: &LightState) -> Result<(), VirtualDeviceError> {
         for (name, device_id) in &self.members {
-            let member_brightness = if self.current_state.is_on {
-                self.map_brightness(name, group_brightness)
-            } else {
-                0
-            };
-
-            let device_state = LightState {
-                is_on: member_brightness > 0,
-                brightness: Some(member_brightness),
-                color_temp: self.current_state.color_temp,
-                rgb_color: self.current_state.rgb_color.clone(),
-            };
+            let device_state = self.member_state(name, group);
+            let member_brightness = device_state.brightness.unwrap_or(0);
 
             // Update member light state
             self.state_store
@@ -95,7 +100,7 @@ impl LightGroupLinear {
                 name,
                 device_id,
                 member_brightness,
-                group_brightness
+                group.brightness.unwrap_or(100)
             );
         }
 
@@ -149,11 +154,12 @@ impl VirtualDevice for LightGroupLinear {
     async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError> {
         match new_state {
             DeviceStateValue::Light(light_state) => {
-                // Update virtual group state
+                // Apply linear brightness mapping to all members, and only
+                // then take the new state: if a member fails, the group keeps
+                // its old one (the manager then re-derives it from the
+                // members that did change).
+                self.apply_brightness_mapping(&light_state).await?;
                 self.current_state = light_state;
-
-                // Apply linear brightness mapping to all members
-                self.apply_brightness_mapping().await?;
 
                 Ok(())
             }
@@ -175,6 +181,12 @@ impl VirtualDevice for LightGroupLinear {
         self.calculate_group_state().await?;
 
         Ok(())
+    }
+
+    fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
+        self.members.iter().any(|(name, device_id)| {
+            device_id == input && fanned_out(&self.member_state(name, &self.current_state), state)
+        })
     }
 
     fn current_state(&self) -> DeviceStateValue {
