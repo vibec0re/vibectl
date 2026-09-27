@@ -1013,8 +1013,8 @@ mod tests {
         ButtonController::new(
             config,
             button.to_string(),
-            &action(press_on),
-            &action(press_off),
+            action(press_on),
+            action(press_off),
             None,
             None,
             store.clone(),

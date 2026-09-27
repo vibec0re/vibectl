@@ -212,11 +212,18 @@ impl ButtonController {
     // kept: constructor takes the full set of button actions and dependencies;
     // grouping them into a struct would change the public API.
     #[allow(clippy::too_many_arguments)]
+    // kept by value: callers outside this PR's lane (v1bectl_server) pass an
+    // owned Vec (some via `cfg.press_on.clone()`); v1bectl_server joins the
+    // ratchet separately, so its call sites aren't touched here.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "v1bectl_server passes owned Vecs here and is outside this PR's lane"
+    )]
     pub fn new(
         config: VirtualDeviceConfig,
         button_id: String,
-        press_on: &[serde_json::Value],
-        press_off: &[serde_json::Value],
+        press_on: Vec<serde_json::Value>,
+        press_off: Vec<serde_json::Value>,
         press_on_long: Option<Vec<serde_json::Value>>,
         press_off_long: Option<Vec<serde_json::Value>>,
         _state_store: Arc<StateStore>,
@@ -233,8 +240,8 @@ impl ButtonController {
         Ok(Self {
             config,
             button_id,
-            press_on_action: parse(press_on)?,
-            press_off_action: parse(press_off)?,
+            press_on_action: parse(&press_on)?,
+            press_off_action: parse(&press_off)?,
             press_on_long_action: press_on_long,
             press_off_long_action: press_off_long,
         })
