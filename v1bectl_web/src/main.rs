@@ -7,14 +7,6 @@ mod cyber_app;
 mod screen_renderer;
 mod screens;
 mod websocket_reconnect;
-mod websocket_simple;
-
-// Legacy modules (keep for now)
-mod context;
-mod favorites;
-mod hooks;
-mod pages;
-mod router;
 
 use cyber_app::CyberApp;
 
