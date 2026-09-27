@@ -27,18 +27,18 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
-      # The gtk and web crates need extra toolchains (GTK4/libadwaita, wasm + trunk),
-      # so CI builds and tests only the native server/CLI/TUI + library crates.
+      # The web crate needs an extra toolchain (wasm + trunk), so CI builds and
+      # tests only the native server/CLI/TUI + library crates.
       - name: Format
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --workspace --exclude v1bectl_gtk --exclude v1bectl_web --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude v1bectl_web --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --workspace --exclude v1bectl_gtk --exclude v1bectl_web
+        run: cargo test --workspace --exclude v1bectl_web
 
       - name: Docs
-        run: cargo doc --workspace --exclude v1bectl_gtk --exclude v1bectl_web --no-deps
+        run: cargo doc --workspace --exclude v1bectl_web --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"

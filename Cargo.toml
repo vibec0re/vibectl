@@ -4,7 +4,6 @@ members = [
     "v1bectl_cli",
     "v1bectl_tui",
     "v1bectl_web",
-    "v1bectl_gtk",
     "v1bectl_widget",
     "lib/v1bectl_state",
     "lib/v1bectl_sync",

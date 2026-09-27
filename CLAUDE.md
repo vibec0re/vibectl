@@ -41,7 +41,6 @@ spirit: extreme performance, clean architecture, and infectious enthusiasm!
 - `v1bectl_cli`: Command-line client
 - `v1bectl_tui`: Terminal UI (ratatui-based)
 - `v1bectl_web`: Web UI (Yew / WASM)
-- `v1bectl_gtk`: GTK4 desktop app
 - `v1bectl_widget`: trollshell sidebar widget — out-of-process plugin over hytte-plugin 🔌
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed design.
@@ -93,7 +92,7 @@ Keep messages clear and descriptive — and a little celebratory energy is on-br
 nix develop                                   # full toolchain shell
 cargo run -p v1bectl_server -- dummy --scenario basic_home
 cargo run -p v1bectl_cli -- light <device_id> --on true --brightness 50
-cargo test --workspace --exclude v1bectl_gtk --exclude v1bectl_web
+cargo test --workspace --exclude v1bectl_web
 ```
 
 ### Performance Targets
