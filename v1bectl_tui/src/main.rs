@@ -28,8 +28,11 @@ use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tui_scrollview::ScrollViewState; // 🔥 FOR SCROLLVIEW DASHBOARD! 💖
 use uuid::Uuid;
-use v1bectl_sync::*;
-use v1bectl_virtual::*;
+use v1bectl_sync::{
+    DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, DeviceType, EventType, LightState,
+    RgbColor,
+};
+use v1bectl_virtual::VirtualDeviceConfig;
 
 #[derive(Parser)]
 #[command(name = "v1bectl_tui")]
@@ -213,13 +216,13 @@ impl App {
         Ok(())
     }
 
-    fn toggle_favorite(&mut self, device_id: String) -> anyhow::Result<()> {
-        if let Some(pos) = self.favorites.iter().position(|id| id == &device_id) {
+    fn toggle_favorite(&mut self, device_id: &str) -> anyhow::Result<()> {
+        if let Some(pos) = self.favorites.iter().position(|id| id == device_id) {
             self.favorites.remove(pos);
-            self.add_event(format!("💔 Removed {} from favorites", device_id));
+            self.add_event(&format!("💔 Removed {device_id} from favorites"));
         } else {
-            self.favorites.push(device_id.clone());
-            self.add_event(format!("💖 Added {} to favorites", device_id));
+            self.favorites.push(device_id.to_string());
+            self.add_event(&format!("💖 Added {device_id} to favorites"));
         }
         self.save_favorites()?;
         Ok(())
@@ -241,7 +244,7 @@ impl App {
         if let Some(pos) = self.favorites.iter().position(|id| id == &device_id) {
             if pos > 0 {
                 self.favorites.swap(pos, pos - 1);
-                self.add_event(format!("⬆️ Moved {} up", device_name));
+                self.add_event(&format!("⬆️ Moved {device_name} up"));
                 self.save_favorites()?;
 
                 // 🔥 UPDATE SCROLL TO FOLLOW MOVED ITEM! 💖
@@ -273,7 +276,7 @@ impl App {
         if let Some(pos) = self.favorites.iter().position(|id| id == &device_id) {
             if pos < self.favorites.len() - 1 {
                 self.favorites.swap(pos, pos + 1);
-                self.add_event(format!("⬇️ Moved {} down", device_name));
+                self.add_event(&format!("⬇️ Moved {device_name} down"));
                 self.save_favorites()?;
 
                 // 🔥 UPDATE SCROLL TO FOLLOW MOVED ITEM! 💖
@@ -404,7 +407,7 @@ impl App {
         self.devices.get_mut(self.selected_device)
     }
 
-    fn add_event(&mut self, event: String) {
+    fn add_event(&mut self, event: &str) {
         self.events.push(format!(
             "{}: {}",
             chrono::Utc::now().format("%H:%M:%S"),
@@ -456,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
     terminal.show_cursor()?;
 
     if let Err(err) = res {
-        println!("{:?}", err)
+        println!("{err:?}");
     }
 
     Ok(())
@@ -489,7 +492,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
     };
 
     ws_sender.send(Message::Binary(message_bytes)).await?;
-    app.add_event("🔍 Discovering devices...".to_string());
+    app.add_event("🔍 Discovering devices...");
 
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(100);
@@ -501,7 +504,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
 
         // Handle WebSocket messages
         tokio::select! {
-            _ = tokio::time::sleep(timeout) => {
+            () = tokio::time::sleep(timeout) => {
                 last_tick = Instant::now();
             }
 
@@ -511,12 +514,12 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
                         match api_message.message_type {
                             ApiMessageType::Response => {
                                 if let Ok(response) = ciborium::from_reader::<ApiResponse, _>(api_message.payload.as_slice()) {
-                                    handle_api_response(&mut app, response).await;
+                                    handle_api_response(&mut app, response);
                                 }
                             }
                             ApiMessageType::Event => {
                                 if let Ok(event) = ciborium::from_reader::<DeviceEvent, _>(api_message.payload.as_slice()) {
-                                    handle_device_event(&mut app, event).await;
+                                    handle_device_event(&mut app, &event);
                                 }
                             }
                             _ => {}
@@ -536,7 +539,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
                                     }
                                 }
                                 Err(e) => {
-                                    app.status_message = format!("❌ Error: {}", e);
+                                    app.status_message = format!("❌ Error: {e}");
                                 }
                             }
                         }
@@ -556,7 +559,7 @@ async fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> anyhow
     Ok(())
 }
 
-async fn handle_api_response(app: &mut App, response: ApiResponse) {
+fn handle_api_response(app: &mut App, response: ApiResponse) {
     match response {
         ApiResponse::DeviceList {
             devices,
@@ -572,13 +575,13 @@ async fn handle_api_response(app: &mut App, response: ApiResponse) {
                 })
                 .collect();
 
-            app.status_message = format!("🎯 Found {} devices!", total_count);
-            app.add_event(format!("📡 Loaded {} devices", total_count));
+            app.status_message = format!("🎯 Found {total_count} devices!");
+            app.add_event(&format!("📡 Loaded {total_count} devices"));
         }
         ApiResponse::DeviceState { state } => {
             // For now, just update the first matching device by type
             // TODO: Need device_id in the state response to match properly
-            for device in app.devices.iter_mut() {
+            for device in &mut app.devices {
                 let type_matches = matches!(
                     (&device.state, &state),
                     (DeviceStateValue::Light(_), DeviceStateValue::Light(_))
@@ -600,17 +603,17 @@ async fn handle_api_response(app: &mut App, response: ApiResponse) {
         }
         ApiResponse::LightUpdated { new_state: _ } => {
             app.status_message = "💡 Light updated!".to_string();
-            app.add_event("💡 Light state changed".to_string());
+            app.add_event("💡 Light state changed");
         }
         ApiResponse::Error { code, message } => {
-            app.status_message = format!("❌ {}: {}", code, message);
-            app.add_event(format!("❌ Error: {}", message));
+            app.status_message = format!("❌ {code}: {message}");
+            app.add_event(&format!("❌ Error: {message}"));
         }
         _ => {}
     }
 }
 
-async fn handle_device_event(app: &mut App, event: DeviceEvent) {
+fn handle_device_event(app: &mut App, event: &DeviceEvent) {
     // 🔥 Handle new event format
     if let EventType::AttributeChanged {
         attribute,
@@ -621,12 +624,16 @@ async fn handle_device_event(app: &mut App, event: DeviceEvent) {
         if attribute == "state" {
             if let Ok(new_state) = serde_json::from_value::<DeviceStateValue>(new_value.clone()) {
                 app.update_device_state(&event.device_id, new_state);
-                app.add_event(format!("⚡ {} updated", event.device_id));
+                app.add_event(&format!("⚡ {} updated", event.device_id));
             }
         }
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one big per-key match over every TUI keybinding; splitting each arm out is a real restructure, not this gate PR's job"
+)]
 async fn handle_key_event(
     app: &mut App,
     ws_sender: &mut futures_util::stream::SplitSink<
@@ -685,7 +692,7 @@ async fn handle_key_event(
                             None,
                         )
                         .await?;
-                        app.add_event(format!("💡 Toggled {}", device.info.name));
+                        app.add_event(&format!("💡 Toggled {}", device.info.name));
                     }
                     DeviceType::Outlet => {
                         let is_on = match &device.state {
@@ -693,7 +700,7 @@ async fn handle_key_event(
                             _ => true,
                         };
                         send_outlet_command(ws_sender, &device.info.device_id, is_on).await?;
-                        app.add_event(format!("🔌 Toggled {}", device.info.name));
+                        app.add_event(&format!("🔌 Toggled {}", device.info.name));
                     }
                     _ => {}
                 }
@@ -717,7 +724,7 @@ async fn handle_key_event(
                         None,
                     )
                     .await?;
-                    app.add_event(format!("🔆 Brightness up: {}%", new_brightness));
+                    app.add_event(&format!("🔆 Brightness up: {new_brightness}%"));
                 }
             }
         }
@@ -739,7 +746,7 @@ async fn handle_key_event(
                         None,
                     )
                     .await?;
-                    app.add_event(format!("🔅 Brightness down: {}%", new_brightness));
+                    app.add_event(&format!("🔅 Brightness down: {new_brightness}%"));
                 }
             }
         }
@@ -748,7 +755,7 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, None, Some(6500))
                         .await?;
-                    app.add_event("🔵 Cool white (6500K)".to_string());
+                    app.add_event("🔵 Cool white (6500K)");
                 }
             }
         }
@@ -757,7 +764,7 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, None, Some(2700))
                         .await?;
-                    app.add_event("🟡 Warm white (2700K)".to_string());
+                    app.add_event("🟡 Warm white (2700K)");
                 }
             }
         }
@@ -767,7 +774,7 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, Some(10), None)
                         .await?;
-                    app.add_event("💡 10% brightness".to_string());
+                    app.add_event("💡 10% brightness");
                 }
             }
         }
@@ -776,7 +783,7 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, Some(25), None)
                         .await?;
-                    app.add_event("💡 25% brightness".to_string());
+                    app.add_event("💡 25% brightness");
                 }
             }
         }
@@ -785,7 +792,7 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, Some(50), None)
                         .await?;
-                    app.add_event("💡 50% brightness".to_string());
+                    app.add_event("💡 50% brightness");
                 }
             }
         }
@@ -794,7 +801,7 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, Some(75), None)
                         .await?;
-                    app.add_event("💡 75% brightness".to_string());
+                    app.add_event("💡 75% brightness");
                 }
             }
         }
@@ -803,14 +810,15 @@ async fn handle_key_event(
                 if matches!(device.info.device_type, DeviceType::Light) {
                     send_light_command(ws_sender, &device.info.device_id, None, Some(100), None)
                         .await?;
-                    app.add_event("💡 100% FULL BRIGHTNESS!".to_string());
+                    app.add_event("💡 100% FULL BRIGHTNESS!");
                 }
             }
         }
         // 🔥 TOGGLE FAVORITE WITH 'f' KEY! 💖
         KeyCode::Char('f') => {
             if let Some(device) = app.get_selected_device() {
-                app.toggle_favorite(device.info.device_id.clone())?;
+                let device_id = device.info.device_id.clone();
+                app.toggle_favorite(&device_id)?;
             }
         }
         _ => {}
@@ -911,7 +919,7 @@ fn ui(f: &mut Frame, app: &mut App) {
         .split(f.area());
 
     // Header with tabs
-    let tab_titles: Vec<Line> = app.tab_names.iter().cloned().map(Line::from).collect();
+    let tab_titles: Vec<Line> = app.tab_names.iter().copied().map(Line::from).collect();
     let tabs = Tabs::new(tab_titles)
         .block(
             Block::default()
@@ -1006,9 +1014,9 @@ fn render_devices_tab(f: &mut Frame, app: &mut App, area: Rect) {
 
             ListItem::new(Line::from(vec![
                 Span::raw(fav_icon),
-                Span::raw(format!("{} ", icon)),
+                Span::raw(format!("{icon} ")),
                 Span::styled(device.info.name.clone(), style),
-                Span::raw(format!(" [{}]", status)),
+                Span::raw(format!(" [{status}]")),
             ]))
         })
         .collect();
@@ -1126,13 +1134,13 @@ fn render_light_controls(f: &mut Frame, device: &AppDevice, area: Rect) {
                     .title("💡 Brightness"),
             )
             .gauge_style(Style::default().fg(Color::Yellow))
-            .ratio(brightness as f64 / 100.0)
-            .label(format!("{}%", brightness));
+            .ratio(f64::from(brightness) / 100.0)
+            .label(format!("{brightness}%"));
         f.render_widget(brightness_gauge, chunks[1]);
 
         // Color temperature
         if let Some(temp) = light.color_temp {
-            let temp_text = format!("{}K", temp);
+            let temp_text = format!("{temp}K");
             let temp_color = if temp < 3000 {
                 Color::Red
             } else if temp > 5000 {
@@ -1181,8 +1189,8 @@ fn render_sensor_display(f: &mut Frame, device: &AppDevice, area: Rect) {
                         .title("🌡️ Temperature"),
                 )
                 .gauge_style(Style::default().fg(Color::Red))
-                .ratio((temp.clamp(0.0, 50.0) / 50.0) as f64)
-                .label(format!("{:.1}°C", temp));
+                .ratio(f64::from(temp.clamp(0.0, 50.0) / 50.0))
+                .label(format!("{temp:.1}°C"));
             f.render_widget(temp_gauge, chunks[0]);
         }
 
@@ -1190,8 +1198,8 @@ fn render_sensor_display(f: &mut Frame, device: &AppDevice, area: Rect) {
             let humidity_gauge = Gauge::default()
                 .block(Block::default().borders(Borders::ALL).title("💧 Humidity"))
                 .gauge_style(Style::default().fg(Color::Blue))
-                .ratio((humidity / 100.0) as f64)
-                .label(format!("{:.1}%", humidity));
+                .ratio(f64::from(humidity / 100.0))
+                .label(format!("{humidity:.1}%"));
             f.render_widget(humidity_gauge, chunks[1]);
         }
     }
@@ -1231,8 +1239,8 @@ fn render_switch_display(f: &mut Frame, device: &AppDevice, area: Rect) {
             let battery_gauge = Gauge::default()
                 .block(Block::default().borders(Borders::ALL).title("🔋 Battery"))
                 .gauge_style(Style::default().fg(Color::Green))
-                .ratio(battery as f64 / 100.0)
-                .label(format!("{}%", battery));
+                .ratio(f64::from(battery) / 100.0)
+                .label(format!("{battery}%"));
             f.render_widget(battery_gauge, chunks[1]);
         }
     }
@@ -1246,6 +1254,10 @@ fn render_scenes_tab(f: &mut Frame, _app: &mut App, area: Rect) {
     f.render_widget(placeholder, area);
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one flat function laying out every stats-tab widget in order; splitting each stat block out is a real restructure, not this gate PR's job"
+)]
 fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
     // 🔥 THREE-COLUMN LAYOUT FOR MAXIMUM STATS! 💖
     let main_chunks = Layout::default()
@@ -1313,7 +1325,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(vec![
             Span::styled("DEVICES: ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{}/{}", online_devices, total_devices),
+                format!("{online_devices}/{total_devices}"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1322,7 +1334,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(vec![
             Span::styled("FAVS:    ", Style::default().fg(Color::Magenta)),
             Span::styled(
-                format!("💖 {}", favorited),
+                format!("💖 {favorited}"),
                 Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
@@ -1331,7 +1343,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(vec![
             Span::styled("LIGHTS:  ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{} ON", lights_on),
+                format!("{lights_on} ON"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1386,7 +1398,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("💡 ", Style::default().fg(Color::Yellow)),
             Span::styled("LIGHTS: ", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{}", lights_count),
+                format!("{lights_count}"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
@@ -1396,7 +1408,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("🌡️ ", Style::default().fg(Color::Blue)),
             Span::styled("SENSORS:", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{}", sensors_count),
+                format!("{sensors_count}"),
                 Style::default()
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
@@ -1406,7 +1418,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("🔘 ", Style::default().fg(Color::Gray)),
             Span::styled("SWITCHES:", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{}", switches_count),
+                format!("{switches_count}"),
                 Style::default()
                     .fg(Color::Gray)
                     .add_modifier(Modifier::BOLD),
@@ -1416,7 +1428,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("🔌 ", Style::default().fg(Color::Red)),
             Span::styled("OUTLETS: ", Style::default().fg(Color::White)),
             Span::styled(
-                format!("{}", outlets_count),
+                format!("{outlets_count}"),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -1424,7 +1436,7 @@ fn render_stats_tab(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(vec![
             Span::styled("TOTAL: ", Style::default().fg(Color::Green)),
             Span::styled(
-                format!("{}", total_devices),
+                format!("{total_devices}"),
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
