@@ -427,9 +427,11 @@ impl VirtualDeviceManager {
     /// a direct write to them is.
     ///
     /// A write can fail part-way (a missing member, as in #2). The members
-    /// it did change are still committed and echoed, and the device is
-    /// re-derived from them and echoed, so it shows what happened rather
-    /// than its old state. Then the error is returned.
+    /// it did change are still committed and echoed, and then the error is
+    /// returned. A group keeps its old state on failure, which no longer
+    /// accounts for those members, so input tracking re-derives it from
+    /// them like after any outside change: the group ends up showing what
+    /// happened.
     pub async fn set_virtual_device_state(
         &self,
         device_id: &DeviceId,
@@ -474,29 +476,10 @@ impl VirtualDeviceManager {
             }
         }
 
-        // A failed write leaves the device's own state where it was, but
-        // some members may have moved: re-derive it from them.
-        if result.is_err() {
-            let inputs = virtual_device.input_devices();
-            let moved_input = changed
-                .iter()
-                .map(|(id, ..)| id)
-                .find(|id| inputs.contains(id));
-            if let Some(input_id) = moved_input {
-                if let Some(input) = self.state_store.get_device(input_id).await {
-                    if let Err(e) = virtual_device.on_input_changed(input_id, &input).await {
-                        tracing::warn!(
-                            "Virtual device {} failed to re-derive after a failed write: {}",
-                            device_id,
-                            e
-                        );
-                    }
-                }
-            }
-        }
         let current_state = virtual_device.current_state();
 
-        // Whatever the write changed is in the store by now: commit and echo it.
+        // Whatever the write changed is in the store by now, even if it
+        // failed part-way: commit and echo it.
         for (id, old_state, state) in &changed {
             self.commit_member_write(id, old_state.as_ref(), state, virtual_outputs.contains(id))
                 .await;
@@ -508,6 +491,8 @@ impl VirtualDeviceManager {
                 Ok(())
             }
             Err(e) => {
+                // The groups keep their state on failure, but a device that
+                // moved before failing must not leave the store behind.
                 if let Err(store_error) = self.store_state(device_id, current_state, false).await {
                     tracing::error!("Failed to update virtual device state: {}", store_error);
                 }
@@ -798,9 +783,10 @@ mod tests {
     }
 
     /// A write that fails part-way (a missing member, as in #2) commits and
-    /// echoes the members it did change. The group is re-derived from them
-    /// and echoed, so it shows what happened, not its old state (#14 review,
-    /// finding 5).
+    /// echoes the members it did change. The group keeps its old state,
+    /// which doesn't account for them, so tracking re-derives it from them
+    /// and echoes that: the group shows what happened, not its old state
+    /// (#14 review, finding 5).
     #[tokio::test]
     async fn partial_group_write_re_derives_the_group() {
         // `LightGroup` writes its lights in order: `a`, then `missing` fails.
