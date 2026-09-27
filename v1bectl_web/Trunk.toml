@@ -4,6 +4,21 @@
 target = "index.html"
 dist = "dist"
 
+# 🔥 Pin exact versions so trunk uses the nix devShell's tools instead of
+# downloading its own (generic, dynamically linked binaries that can't run on
+# NixOS). Keep these in lockstep with flake.nix's devShell/package inputs —
+# always check from INSIDE `nix develop` (the flake's pinned nixpkgs, not
+# whatever `nixpkgs#foo` resolves to on your machine):
+#   - wasm_bindgen must match Cargo.lock's `wasm-bindgen` crate version exactly
+#     (trunk requires an exact match or it downloads one itself)
+#   - sass is `nix develop --command sass --version`
+#   - wasm_opt is `version_<n>` where n is
+#     `nix develop --command wasm-opt --version` (release builds only)
+[tools]
+sass = "1.100.0"
+wasm_bindgen = "0.2.100"
+wasm_opt = "version_129"
+
 [watch]
 watch = ["src", "assets", "index.html"]
 

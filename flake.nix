@@ -119,24 +119,46 @@
           targets = [ "wasm32-unknown-unknown" ];
         };
 
+        # 🔥 trunk requires an EXACT version match against its [tools] config
+        # (v1bectl_web/Trunk.toml) or it downloads a generic, dynamically
+        # linked binary that can't run on NixOS (no nix-ld). Pin
+        # wasm-bindgen-cli to the version in Cargo.lock's `wasm-bindgen` crate
+        # — bump both together with `cargo update -p wasm-bindgen`. 💖
+        wasmBindgenCli = devPkgs.wasm-bindgen-cli_0_2_100;
+
+        # 🔥 `pkgs.sass` is the old Ruby Sass — NOT what trunk (or our .scss
+        # assets) expects. `dart-sass` is the real deal and is what trunk
+        # downloads by default. 💖
+        webToolInputs = [
+          devPkgs.trunk
+          wasmBindgenCli
+          devPkgs.dart-sass
+          devPkgs.binaryen # provides wasm-opt, used by `trunk build --release`
+        ];
+
         # 🔥 WEB UI BUILD (WASM) - uses rust-overlay for wasm target 💖
         v1bectl_web = devPkgs.stdenv.mkDerivation {
           pname = "v1bectl_web";
           version = "0.1.0";
-          src = ./v1bectl_web;
+          # Needs the whole workspace: Cargo.lock and the workspace Cargo.toml
+          # live at the root, and trunk shells out to `cargo build` under the
+          # hood, which resolves the workspace by walking up from src/. 💖
+          src = ./.;
+
+          # 🔥 Same one-lockfile-for-everything vendoring the other packages
+          # use, so trunk's internal `cargo build --offline` never touches the
+          # network inside the nix sandbox. 💖
+          cargoDeps = devPkgs.rustPlatform.importCargoLock cargoLock;
 
           nativeBuildInputs = [
             rustToolchain
-            devPkgs.trunk
-            devPkgs.wasm-bindgen-cli
-            devPkgs.binaryen
-            devPkgs.sass
-          ];
+            devPkgs.rustPlatform.cargoSetupHook
+          ] ++ webToolInputs;
 
           buildPhase = ''
             export HOME=$TMPDIR
-            export CARGO_HOME=$TMPDIR/.cargo
-            trunk build --release
+            cd v1bectl_web
+            trunk build --release --offline
           '';
 
           installPhase = ''
@@ -167,11 +189,9 @@
             rust-analyzer
             cargo-watch
             cargo-edit
-            trunk
-            wasm-bindgen-cli
             openssl
             pkg-config
-          ];
+          ] ++ webToolInputs;
 
           shellHook = ''
             echo "🔥 VIBEC0RE Dev Shell Ready! 💖"
