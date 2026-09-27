@@ -1,6 +1,6 @@
 // 🔥 LINEAR LIGHT GROUP - IMPROVED BRIGHTNESS MAPPING! 💖
 
-use crate::light_group::fanned_out;
+use crate::light_group::{fanned_out, initial_group_state, re_derive, resolve_write};
 use crate::virtual_device::*;
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -38,12 +38,7 @@ impl LightGroupLinear {
             config,
             members,
             brightness_ranges,
-            current_state: LightState {
-                is_on: false,
-                brightness: Some(0),
-                color_temp: Some(2700),
-                rgb_color: None,
-            },
+            current_state: initial_group_state(),
             state_store,
         })
     }
@@ -107,32 +102,22 @@ impl LightGroupLinear {
         Ok(())
     }
 
-    /// Calculate group state from member states (inverse mapping)
+    /// Calculate group state from member states (inverse mapping, see
+    /// [`re_derive`]): with no member lit, the group keeps its level.
     async fn calculate_group_state(&mut self) -> Result<(), VirtualDeviceError> {
-        let mut total_brightness = 0u32;
-        let mut lights_on = 0;
-        let mut any_on = false;
-
+        let mut on_levels = Vec::new();
         for device_id in self.members.values() {
             if let Some(device_state) = self.state_store.get_device(device_id).await {
                 if let DeviceStateValue::Light(light_state) = device_state.state {
                     if light_state.is_on {
-                        any_on = true;
-                        lights_on += 1;
                         // TODO: Inverse map member brightness to group brightness
-                        total_brightness += light_state.brightness.unwrap_or(100) as u32;
+                        on_levels.push(light_state.brightness.unwrap_or(100));
                     }
                 }
             }
         }
 
-        self.current_state.is_on = any_on;
-        if lights_on > 0 {
-            self.current_state.brightness = Some((total_brightness / lights_on as u32) as u8);
-        } else {
-            self.current_state.brightness = Some(0);
-        }
-
+        re_derive(&mut self.current_state, &on_levels);
         Ok(())
     }
 }
@@ -158,6 +143,7 @@ impl VirtualDevice for LightGroupLinear {
                 // then take the new state: if a member fails, the group keeps
                 // its old one (the manager then re-derives it from the
                 // members that did change).
+                let light_state = resolve_write(&self.current_state, light_state);
                 self.apply_brightness_mapping(&light_state).await?;
                 self.current_state = light_state;
 
@@ -165,6 +151,10 @@ impl VirtualDevice for LightGroupLinear {
             }
             _ => Err(VirtualDeviceError::InvalidStateType),
         }
+    }
+
+    async fn seed_from_inputs(&mut self) -> Result<(), VirtualDeviceError> {
+        self.calculate_group_state().await
     }
 
     async fn on_input_changed(

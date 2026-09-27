@@ -1,27 +1,23 @@
-# 🔥 LIGHT GROUP - VIBEC0RE VIRTUAL DEVICE! 💖
+# 🔥 BUTTON CONTROLLER - VIBEC0RE VIRTUAL DEVICE! 💖
 
 type = "button_controller"
 device_id = "ctrl_lightgroup_bed"
 name = "Bedroom Lights Controller"
 
-# Button (example device ID — replace with your own)
-button = "44444444-4444-4444-4444-444444444444_1"
+# The button to listen to. `switch_hallway` is the switch the dummy
+# `basic_home` scenario registers, so the controller binds out of the box with
+# `v1bectl_server dummy`. On a real hub, replace it with your own remote's
+# Dirigera device ID (it ends in `_1`; `v1bectl_cli list` shows it).
+# Bind a button to one controller only, or one press runs two actions.
+button = "switch_hallway"
 
+# Each action is [command, target, amount]. The commands are on, off, inc,
+# dec and set; inc/dec take a step (default 10), set takes a level (default
+# 50). The target is a light or a light group. `on` restores the group's last
+# level.
 press_on = ["on", "virtual_bedroom_lights"]
+press_off = ["off", "virtual_bedroom_lights"]
+
+# Long presses are accepted, but not detected yet.
 press_on_long = ["inc", "virtual_bedroom_lights", 10]
-press_off =["off", "virtual_bedroom_lights"]
 press_off_long = ["dec", "virtual_bedroom_lights", 10]
-
-
-# press_on_long = 
-# press_off_long = 
-
-# VirtualDevice LightCtrl implements inc, dec, set, on, off
-# inc t.ex. get bright from device ID -> next value -> set bright to device id
-#  [ cmd, deviceid, .... opt values params]
-
-# Controller must spawn internally and subscribe to events
-# need to react so can bind and set state of output device id :))
-
-
-

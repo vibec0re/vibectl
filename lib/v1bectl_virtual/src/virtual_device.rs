@@ -1,3 +1,4 @@
+use crate::button_controller::ButtonAction;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,6 +53,14 @@ pub trait VirtualDevice: Send + Sync {
     /// Called when virtual device state should change (API request)
     async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError>;
 
+    /// Take the state this device's inputs give it, as the store holds them
+    /// now. The manager calls this once, when it registers the device. So a
+    /// group starts out showing its members, and with a level to light them
+    /// at (#16), instead of a made-up "off at 0". The default does nothing.
+    async fn seed_from_inputs(&mut self) -> Result<(), VirtualDeviceError> {
+        Ok(())
+    }
+
     /// Called when input device states change. `new_state` is the input as
     /// the store holds it when the manager gets to the change, which can be
     /// newer than the event that announced it.
@@ -74,10 +83,32 @@ pub trait VirtualDevice: Send + Sync {
     /// outside change. It matters because re-deriving a group from its
     /// members can be lossy (a linear group set to 50 reads back as 60).
     ///
+    /// After a re-derive, a group's state is usually one its members don't
+    /// hold (an average), so it accounts for none of them. Every later
+    /// event of a member then re-derives it again, until a write fans a
+    /// state out to them. That's harmless: the members haven't moved, so
+    /// the re-derive lands on the same state, and the manager echoes nothing
+    /// for an unchanged one (#22 re-review: a 50-event storm, no echo).
+    ///
     /// The default, `false`, re-derives on every input change.
     fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
         let _ = (input, state);
         false
+    }
+
+    /// The writes this device asks for in reaction to `event`, an event of
+    /// one of its [`Self::input_devices`]: a button controller's action for
+    /// a press. Unlike [`Self::on_input_changed`], this sees the event
+    /// itself, not the input as the store holds it: a press is an event, and
+    /// by the time the manager gets to it the store may hold the release.
+    ///
+    /// The manager makes each write after it has tracked the event, the way
+    /// it makes an API write: through `set_virtual_device_state` for a
+    /// virtual target (fan-out, echoes, gateway), and like a direct write
+    /// for a physical one. The default asks for nothing.
+    fn reactions(&self, event: &DeviceEvent) -> Vec<ButtonAction> {
+        let _ = event;
+        Vec::new()
     }
 
     /// Get current virtual device state
