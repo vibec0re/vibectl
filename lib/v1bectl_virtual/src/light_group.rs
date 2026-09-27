@@ -51,6 +51,19 @@ impl BrightnessCurve {
     }
 }
 
+/// Whether a member that holds `actual` is where fanning `target` out to it
+/// would put it, as far as re-deriving its group goes: on/off, and the level
+/// while on. That is all a re-derive reads. Colour doesn't count: it's never
+/// derived back into a group, and a hub reports it its own way (a bulb
+/// without colour temperature has none). Nor does the level of a light
+/// that's off.
+pub(crate) fn fanned_out(target: &LightState, actual: &DeviceStateValue) -> bool {
+    let DeviceStateValue::Light(actual) = actual else {
+        return false;
+    };
+    actual.is_on == target.is_on && (!target.is_on || actual.brightness == target.brightness)
+}
+
 /// Light Group Virtual Device - controls multiple lights as one unit 💡
 pub struct LightGroup {
     config: VirtualDeviceConfig,
@@ -103,22 +116,27 @@ impl LightGroup {
         })
     }
 
-    /// Apply brightness curves to all member lights
-    async fn apply_brightness_curves(&self) -> Result<(), VirtualDeviceError> {
-        for light_id in &self.lights {
-            let curve = &self.brightness_curves[light_id];
-            let device_brightness = if self.current_state.is_on {
-                curve.interpolate(self.current_state.brightness.unwrap_or(100))
-            } else {
-                0
-            };
+    /// What the group state `group` fans out to `light_id`, one of its lights.
+    fn member_state(&self, light_id: &DeviceId, group: &LightState) -> LightState {
+        let curve = &self.brightness_curves[light_id];
+        let device_brightness = if group.is_on {
+            curve.interpolate(group.brightness.unwrap_or(100))
+        } else {
+            0
+        };
 
-            let device_state = LightState {
-                is_on: device_brightness > 0,
-                brightness: Some(device_brightness),
-                color_temp: self.current_state.color_temp,
-                rgb_color: self.current_state.rgb_color.clone(),
-            };
+        LightState {
+            is_on: device_brightness > 0,
+            brightness: Some(device_brightness),
+            color_temp: group.color_temp,
+            rgb_color: group.rgb_color.clone(),
+        }
+    }
+
+    /// Apply brightness curves for the group state `group` to all member lights
+    async fn apply_brightness_curves(&self, group: &LightState) -> Result<(), VirtualDeviceError> {
+        for light_id in &self.lights {
+            let device_state = self.member_state(light_id, group);
 
             // Set physical light state
             self.state_store
@@ -175,11 +193,12 @@ impl VirtualDevice for LightGroup {
     async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError> {
         match new_state {
             DeviceStateValue::Light(light_state) => {
-                // Update virtual group state
+                // Apply to all member lights using brightness curves, and
+                // only then take the new state: if a member fails, the group
+                // keeps its old one (the manager then re-derives it from the
+                // members that did change).
+                self.apply_brightness_curves(&light_state).await?;
                 self.current_state = light_state;
-
-                // Apply to all member lights using brightness curves
-                self.apply_brightness_curves().await?;
 
                 Ok(())
             }
@@ -201,6 +220,11 @@ impl VirtualDevice for LightGroup {
         self.calculate_group_state().await?;
 
         Ok(())
+    }
+
+    fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
+        self.lights.contains(input)
+            && fanned_out(&self.member_state(input, &self.current_state), state)
     }
 
     fn current_state(&self) -> DeviceStateValue {
