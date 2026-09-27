@@ -2,7 +2,7 @@
 
 ## System Components
 
-### Core Server (`v1bectl-server`)
+### Core Server (`v1bectl_server`)
 - **Purpose**: Central state management and device coordination
 - **Language**: Rust
 - **Responsibilities**:
@@ -12,7 +12,7 @@
   - Manage virtual device logic
   - WebSocket subscriptions for real-time updates
 
-### CLI Client (`v1bectl-cli`)
+### CLI Client (`v1bectl_cli`)
 - **Purpose**: Testing and manual control interface
 - **Language**: Rust
 - **Responsibilities**:
@@ -61,7 +61,8 @@ v1bectl/
 │   └── v1bectl_api/          # WebSocket/TCP API server
 ├── v1bectl_tui/              # Terminal UI (ratatui)
 ├── v1bectl_web/              # Web UI (Yew/WASM)
-└── v1bectl_gtk/              # GTK4 desktop app
+├── v1bectl_gtk/              # GTK4 desktop app
+└── v1bectl_widget/           # trollshell sidebar widget (out-of-process hytte-plugin)
 ```
 
 ## Communication Protocols

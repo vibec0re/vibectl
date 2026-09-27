@@ -32,16 +32,17 @@ spirit: extreme performance, clean architecture, and infectious enthusiasm!
 ```
 
 ### Crates:
-- `v1bectl_state`: Core device state types
-- `v1bectl_sync`: Bidirectional sync engine + event store
-- `v1bectl_gateway`: Gateway trait and Dirigera implementation
-- `v1bectl_virtual`: Virtual devices and DummyGateway
-- `v1bectl_api`: WebSocket / TCP API server
+- `lib/v1bectl_state`: Core device state types
+- `lib/v1bectl_sync`: Bidirectional sync engine + event store
+- `lib/v1bectl_gateway`: Gateway trait and Dirigera implementation
+- `lib/v1bectl_virtual`: Virtual devices and DummyGateway
+- `lib/v1bectl_api`: WebSocket / TCP API server
 - `v1bectl_server`: Main server binary
 - `v1bectl_cli`: Command-line client
 - `v1bectl_tui`: Terminal UI (ratatui-based)
 - `v1bectl_web`: Web UI (Yew / WASM)
 - `v1bectl_gtk`: GTK4 desktop app
+- `v1bectl_widget`: trollshell sidebar widget — out-of-process plugin over hytte-plugin 🔌
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the detailed design.
 
