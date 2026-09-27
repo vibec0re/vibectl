@@ -998,6 +998,9 @@ impl SyncEngine {
         resolution
     }
 
+    /// Schedule (another) retry of `task`, which just failed, with
+    /// exponential backoff. After `max_retry_attempts` failures in a row the
+    /// device's retry is dropped.
     async fn queue_retry(&self, task: &SyncTask, error: String) {
         let mut retry_queue = self.retry_queue.write().await;
 
@@ -1005,15 +1008,28 @@ impl SyncEngine {
             Some(entry) => {
                 entry.attempts += 1;
                 entry.last_error = Some(error);
+                entry.task = task.clone();
 
                 if entry.attempts >= self.config.max_retry_attempts {
-                    warn!("Max retry attempts reached for device: {}", task.device_id);
+                    // ❌ Drop it. Leaving the entry in place kept it due at
+                    // every retry tick, so it was retried forever (#32).
+                    warn!(
+                        "❌ Max retry attempts ({}) reached for device {}, giving up",
+                        entry.attempts, task.device_id
+                    );
+                    retry_queue.remove(&task.device_id);
                     return;
                 }
 
-                // Exponential backoff
-                let delay = self.config.base_retry_delay * 2_u32.pow(entry.attempts - 1);
-                let delay = delay.min(self.config.max_retry_delay);
+                // Exponential backoff, capped. Saturating, so a large
+                // `max_retry_attempts` can't overflow it.
+                let factor = 2_u32.saturating_pow(entry.attempts - 1);
+                let delay = self
+                    .config
+                    .base_retry_delay
+                    .checked_mul(factor)
+                    .unwrap_or(self.config.max_retry_delay)
+                    .min(self.config.max_retry_delay);
                 entry.next_retry = Instant::now() + delay;
 
                 entry.clone()
@@ -1048,17 +1064,70 @@ impl SyncEngine {
         };
 
         for retry_entry in ready_retries {
-            debug!(
-                "Processing retry for device: {}",
-                retry_entry.task.device_id
-            );
+            let device_id = &retry_entry.task.device_id;
+            debug!("Processing retry for device: {}", device_id);
 
-            if let Err(e) = self.execute_sync_task(&retry_entry.task).await {
-                self.queue_retry(&retry_entry.task, e.to_string()).await;
+            // 🔁 A push retry sends the device's latest value, read now, not
+            // the value that failed (#32): that one may be older than a write
+            // made since, and landing after it would overwrite it on the hub.
+            let task = match &retry_entry.task.task_type {
+                SyncTaskType::PushToGateway { .. } => match self.latest_push_state(device_id).await
+                {
+                    Some(new_state) => SyncTask {
+                        task_type: SyncTaskType::PushToGateway { new_state },
+                        ..retry_entry.task.clone()
+                    },
+                    None => {
+                        debug!(
+                            "🔁 Retry for {} dropped: a newer write is queued, or the device is gone",
+                            device_id
+                        );
+                        self.retry_queue.write().await.remove(device_id);
+                        continue;
+                    }
+                },
+                _ => retry_entry.task.clone(),
+            };
+
+            // 🛡️ Straight to the gateway, not through the buffer: a retry
+            // doesn't restart the protection window. Only a write does, and
+            // its push going out.
+            if let Err(e) = self.execute_sync_task(&task).await {
+                self.queue_retry(&task, e.to_string()).await;
             }
         }
 
         Ok(())
+    }
+
+    /// 🔁 What a push retry for `device_id` sends now, or `None` if there's
+    /// nothing left to retry.
+    ///
+    /// - A write waiting in the sync buffer supersedes the retry: the next
+    ///   drain pushes it, and it gets its own retries if that fails.
+    /// - Otherwise a pending confirmation's `expected_state` is the latest
+    ///   user write (every write re-arms it, under the buffer lock held
+    ///   here). With `optimistic_updates` off, the store doesn't have it yet.
+    /// - Otherwise it's the store's value: what the engine now holds for the
+    ///   device. Once a write's window ran out and the hub's value won, that
+    ///   is the hub's own value, so the write is abandoned rather than
+    ///   pushed after the UI already showed it reverted.
+    /// - A device that's no longer in the store has nothing to retry.
+    async fn latest_push_state(&self, device_id: &DeviceId) -> Option<DeviceStateValue> {
+        {
+            let buffer = self.sync_buffer.read().await;
+            if buffer.contains_key(device_id) {
+                return None;
+            }
+            let pending = self.pending_confirmations.read().await;
+            if let Some(confirmation) = pending.get(device_id) {
+                return Some(confirmation.expected_state.clone());
+            }
+        }
+        self.store
+            .get_device(device_id)
+            .await
+            .map(|device| device.state)
     }
 
     /// One pull cycle: read every device in the store from the gateway and

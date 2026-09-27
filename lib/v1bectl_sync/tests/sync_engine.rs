@@ -136,3 +136,161 @@ async fn a_device_error_does_not_end_the_pull_cycle() {
 
     rig.shutdown().await;
 }
+
+// ---------------------------------------------------------------------
+// Retries
+// ---------------------------------------------------------------------
+
+/// Fast retries: due 1 ms after a failure, checked every 5 ms.
+fn fast_retries() -> SyncConfig {
+    SyncConfig {
+        base_retry_delay: Duration::from_millis(1),
+        max_retry_delay: Duration::from_millis(1),
+        retry_interval: Duration::from_millis(5),
+        max_retry_attempts: 100,
+        ..SyncConfig::default()
+    }
+}
+
+/// A retry sends the device's latest value, read when it goes out, not the
+/// value that failed (#32). Resending that one can land after a newer write
+/// and overwrite it on the hub.
+///
+/// Every PATCH waits at the gate, so the order is fixed: the older write's
+/// push fails, its first retry is held, the newer write's push is held
+/// behind it, the retry fails, and the next retry is the only thing that
+/// can PATCH (the buffer worker is held on the newer push).
+#[tokio::test]
+async fn a_retry_sends_the_latest_value_not_the_failed_one() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Fail, true),
+        Pulls::OnDemand,
+        fast_retries(),
+    )
+    .await;
+    let (older, newer) = (light(true, 30), light(true, 70));
+
+    rig.write("a", older.clone()).await;
+    rig.hub
+        .wait("the older push at the gate", |log| {
+            log.sets_started.len() == 1
+        })
+        .await;
+    rig.hub.release(1);
+    rig.hub
+        .wait("its first retry at the gate", |log| {
+            log.sets_started.len() == 2
+        })
+        .await;
+
+    rig.write("a", newer.clone()).await;
+    rig.hub
+        .wait("the newer push at the gate", |log| {
+            log.sets_started.len() == 3
+        })
+        .await;
+
+    rig.hub.release(1);
+    rig.hub
+        .wait("the next retry at the gate", |log| {
+            log.sets_started.len() == 4
+        })
+        .await;
+    assert_eq!(
+        rig.hub.log().sets_for("a"),
+        vec![older.clone(), older.clone(), newer.clone(), newer.clone()],
+        "PATCHes: the retry after the newer write resent the older value"
+    );
+
+    // The hub recovers and answers everything it holds. It ends on the
+    // newer write.
+    rig.hub.set_on_set(OnSet::Apply);
+    rig.hub.open_gate();
+    rig.hub
+        .wait("all four answered", |log| log.sets_done >= 4)
+        .await;
+    assert_eq!(rig.hub.reported("a"), Some(newer.clone()), "on the hub");
+    assert_eq!(rig.stored("a").await, newer, "in the store");
+
+    rig.shutdown().await;
+}
+
+/// Retries go straight to the gateway and don't restart the protection
+/// window: only a write does, and its push going out. With a hub that keeps
+/// failing, the write is reverted once the window from its push is up,
+/// while the retries are still going, and the retries after that send what
+/// the store now holds (the hub's value): the write was abandoned.
+#[tokio::test]
+async fn retries_do_not_extend_the_protection_window() {
+    let rig = Rig::new(
+        &["a"],
+        TestHub::new(OnSet::Fail, false),
+        Pulls::Periodic,
+        SyncConfig {
+            protection_window: Duration::from_millis(300),
+            max_retry_attempts: 100_000,
+            ..fast_retries()
+        },
+    )
+    .await;
+    let mut rx = rig.bus.subscribe();
+
+    rig.write("a", on()).await;
+    // If every retry restarted the window, it would only run out once the
+    // retries stop, long after this wait gives up.
+    wait_for_echo(&mut rx, "a", &off()).await;
+    // The retries go on, now with the store's value. (A retry that read its
+    // value just before the revert may still send `on` first.)
+    let at_revert = rig.hub.log().sets_started.len();
+    rig.hub
+        .wait("a retry of the store's value after the revert", |log| {
+            log.sets_started[at_revert..]
+                .iter()
+                .any(|(id, state)| id == "a" && *state == off())
+        })
+        .await;
+
+    rig.shutdown().await;
+}
+
+/// A push that keeps failing is given up after `max_retry_attempts`
+/// failures. Its retry entry used to stay in the queue, due at every tick,
+/// so it was retried forever.
+///
+/// `b` fails the same way after `a` gave up. Its second retry comes on a
+/// later retry tick than its first, and the tick of its first would also
+/// have retried a still-due `a`, so by then that retry is in the log.
+#[tokio::test]
+async fn a_failing_push_is_given_up_after_max_retry_attempts() {
+    let rig = Rig::new(
+        &["a", "b"],
+        TestHub::new(OnSet::Fail, false),
+        Pulls::OnDemand,
+        SyncConfig {
+            max_retry_attempts: 3,
+            ..fast_retries()
+        },
+    )
+    .await;
+
+    rig.write("a", on()).await;
+    rig.hub
+        .wait("a: the push and two retries", |log| {
+            log.sets_for("a").len() >= 3
+        })
+        .await;
+    rig.write("b", on()).await;
+    rig.hub
+        .wait("b: the push and two retries", |log| {
+            log.sets_for("b").len() >= 3
+        })
+        .await;
+    assert_eq!(
+        rig.hub.log().sets_for("a").len(),
+        3,
+        "a was retried after max_retry_attempts (3) failures"
+    );
+
+    rig.shutdown().await;
+}
