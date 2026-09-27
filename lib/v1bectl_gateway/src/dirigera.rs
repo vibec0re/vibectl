@@ -151,8 +151,9 @@ impl DirigeraGateway {
     /// 2. $HOME/.local/state/v1bectl/access.token file
     ///
     /// 🔁 The configured host is resolved against mDNS collision variants
-    /// (see [`Self::resolve_reachable_host`]) before the gateway is built, so a
-    /// hub that re-advertised itself as `gw2-xxxx-2.local` is still found.
+    /// (see `resolve_reachable_host`, private to this module) before the
+    /// gateway is built, so a hub that re-advertised itself as
+    /// `gw2-xxxx-2.local` is still found.
     pub async fn from_token_file(host: &str, timeout: Duration) -> Result<Self, GatewayError> {
         let access_token = Self::load_access_token().await?;
 
