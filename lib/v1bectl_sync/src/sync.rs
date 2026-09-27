@@ -25,16 +25,16 @@
 //! per `push_interval` tick (20 per second at the default 50 ms). Retries go
 //! through the buffer too, so that holds for them as well.
 
-use crate::events::*;
-use crate::gateway::*;
-use crate::store::*;
+use crate::events::EventBus;
+use crate::gateway::{Gateway, GatewayError};
+use crate::store::StateStore;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, RwLock};
 use tokio::time::interval;
 use tracing::{debug, error, info, warn};
-use v1bectl_state::*;
+use v1bectl_state::{DeviceEvent, DeviceId, DeviceStateValue, EventType, Timestamp};
 
 // 🔥 OPTIMISTIC STATE TRACKING!
 #[derive(Debug, Clone)]
@@ -292,6 +292,10 @@ impl SyncEngine {
         Ok(())
     }
 
+    #[expect(
+        clippy::unused_async,
+        reason = "public API; v1bectl_virtual and v1bectl_server await this call, both outside this PR's lane"
+    )]
     pub async fn stop(&self) {
         info!("Stopping sync engine");
         let _ = self.shutdown_tx.send(true);
@@ -346,7 +350,7 @@ impl SyncEngine {
         status.insert(
             device_id.clone(),
             SyncStatus::PendingSync {
-                queued_at: chrono::Utc::now().timestamp_millis() as u64,
+                queued_at: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             },
         );
     }
@@ -380,6 +384,7 @@ impl SyncEngine {
     }
 
     /// The configuration this engine runs with.
+    #[must_use]
     pub fn config(&self) -> &SyncConfig {
         &self.config
     }
@@ -681,7 +686,7 @@ impl SyncEngine {
         let mut pending = self.pending_confirmations.write().await;
         if let Some(confirmation) = pending.get_mut(device_id) {
             confirmation.sent_at = Instant::now();
-            if self.states_equal(&confirmation.expected_state, pushed) {
+            if Self::states_equal(&confirmation.expected_state, pushed) {
                 confirmation.pushed = true;
             }
             debug!(
@@ -736,7 +741,7 @@ impl SyncEngine {
             status.insert(
                 task.device_id.clone(),
                 SyncStatus::Syncing {
-                    started_at: chrono::Utc::now().timestamp_millis() as u64,
+                    started_at: chrono::Utc::now().timestamp_millis().cast_unsigned(),
                 },
             );
         }
@@ -785,7 +790,7 @@ impl SyncEngine {
                 status.insert(
                     task.device_id.clone(),
                     SyncStatus::InSync {
-                        last_synced: chrono::Utc::now().timestamp_millis() as u64,
+                        last_synced: chrono::Utc::now().timestamp_millis().cast_unsigned(),
                     },
                 );
 
@@ -810,7 +815,7 @@ impl SyncEngine {
                     task.device_id.clone(),
                     SyncStatus::Failed {
                         error: e.to_string(),
-                        failed_at: chrono::Utc::now().timestamp_millis() as u64,
+                        failed_at: chrono::Utc::now().timestamp_millis().cast_unsigned(),
                     },
                 );
 
@@ -833,11 +838,23 @@ impl SyncEngine {
                 let elapsed = confirmation.sent_at.elapsed();
                 let expected_state = confirmation.expected_state.clone(); // Clone for later use
 
+                // `remaining` below is `protection_window - elapsed`, computed only
+                // in the branch guarded by `elapsed < confirmation.protection_window`,
+                // so it never underflows; clippy can't see through the outer `if`. The
+                // early `return Ok(())`s in both inner arms make the outer/inner
+                // `else`s look redundant, but this protection-window branching went
+                // through several reviews (#31, #41) and is left as written rather
+                // than reshaped to satisfy a lint.
+                #[expect(
+                    clippy::redundant_else,
+                    clippy::unchecked_time_subtraction,
+                    reason = "protection-window branching reviewed in #31/#41; kept as written rather than reshaped for a lint"
+                )]
                 if elapsed < confirmation.protection_window {
                     // Still in protection window - check if this is our
                     // confirmation: our value, and its push has gone out.
                     // Before that, the hub showing it is a coincidence (#32).
-                    if confirmation.pushed && self.states_equal(&gateway_state, &expected_state) {
+                    if confirmation.pushed && Self::states_equal(&gateway_state, &expected_state) {
                         debug!(
                             "✅ SYNC_DEBUG: UI change confirmed for {} after {:?}",
                             device_id, elapsed
@@ -898,7 +915,11 @@ impl SyncEngine {
         match server_device {
             Some(server_device) => {
                 // Check for conflicts
-                if !self.states_equal(&server_device.state, &gateway_state) {
+                #[expect(
+                    clippy::if_not_else,
+                    reason = "negated guard reads clearer here than an inverted conflict/no-conflict branch order"
+                )]
+                if !Self::states_equal(&server_device.state, &gateway_state) {
                     debug!(
                         "🔍 SYNC_DEBUG: State mismatch for {} - resolving conflict",
                         device_id
@@ -917,6 +938,10 @@ impl SyncEngine {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one match arm per ConflictResolution variant, each a flat sequence of store/gateway calls; splitting the arms into their own functions would scatter reviewed conflict-resolution logic (#31, #41) rather than simplify it"
+    )]
     async fn resolve_conflict(
         &self,
         device_id: &DeviceId,
@@ -929,8 +954,7 @@ impl SyncEngine {
             ConflictResolution::ServerWins => {
                 debug!("Conflict resolution: Server wins for {}", device_id);
                 // Only push server state to gateway for writable device types
-                if self.is_device_writable(server_state)
-                    && !self.is_problematic_outlet(device_id).await
+                if Self::is_device_writable(server_state) && !Self::is_problematic_outlet(device_id)
                 {
                     self.gateway
                         .set_device_state(device_id, server_state.clone())
@@ -974,8 +998,8 @@ impl SyncEngine {
             }
             ConflictResolution::TimestampWins => {
                 // Get timestamps and decide
-                let server_timestamp = self.get_state_timestamp(server_state);
-                let gateway_timestamp = self.get_state_timestamp(gateway_state);
+                let server_timestamp = Self::get_state_timestamp(server_state);
+                let gateway_timestamp = Self::get_state_timestamp(gateway_state);
 
                 if server_timestamp >= gateway_timestamp {
                     debug!(
@@ -983,8 +1007,8 @@ impl SyncEngine {
                         device_id
                     );
                     // Only push server state to gateway for writable device types
-                    if self.is_device_writable(server_state)
-                        && !self.is_problematic_outlet(device_id).await
+                    if Self::is_device_writable(server_state)
+                        && !Self::is_problematic_outlet(device_id)
                     {
                         self.gateway
                             .set_device_state(device_id, server_state.clone())
@@ -1148,6 +1172,10 @@ impl SyncEngine {
     async fn requeue_retry(&self, retry: RetryEntry) {
         let device_id = &retry.task.device_id;
         let mut buffer = self.sync_buffer.write().await;
+        #[expect(
+            clippy::single_match_else,
+            reason = "kept as a match, not reshaped to if-let/else, while it holds the sync buffer lock across the latest_push_state() await (#32 review)"
+        )]
         match self.latest_push_state(&buffer, &retry).await {
             Some(state) => Self::buffer_push(
                 &mut buffer,
@@ -1225,7 +1253,11 @@ impl SyncEngine {
         for device in devices {
             match self.gateway.get_device_state(&device.device_id).await {
                 Ok(gateway_state) => {
-                    if !self.states_equal(&device.state, &gateway_state) {
+                    #[expect(
+                        clippy::if_not_else,
+                        reason = "negated guard reads clearer here than an inverted changed/unchanged branch order"
+                    )]
+                    if !Self::states_equal(&device.state, &gateway_state) {
                         debug!(
                             "🔍 SYNC_DEBUG: Pull detected change for {} - handling",
                             device.device_id
@@ -1320,7 +1352,7 @@ impl SyncEngine {
     async fn clear_confirmed(&self, device_id: &DeviceId, gateway_state: &DeviceStateValue) {
         let mut pending = self.pending_confirmations.write().await;
         let confirmed = pending.get(device_id).is_some_and(|confirmation| {
-            confirmation.pushed && self.states_equal(&confirmation.expected_state, gateway_state)
+            confirmation.pushed && Self::states_equal(&confirmation.expected_state, gateway_state)
         });
         if confirmed {
             pending.remove(device_id);
@@ -1331,7 +1363,7 @@ impl SyncEngine {
         }
     }
 
-    fn states_equal(&self, state1: &DeviceStateValue, state2: &DeviceStateValue) -> bool {
+    fn states_equal(state1: &DeviceStateValue, state2: &DeviceStateValue) -> bool {
         // 🔥 PROPER STATE COMPARISON - NO MORE DEBUG FORMAT! <3
         match (state1, state2) {
             (DeviceStateValue::Light(l1), DeviceStateValue::Light(l2)) => {
@@ -1361,28 +1393,33 @@ impl SyncEngine {
         }
     }
 
-    fn get_state_timestamp(&self, _state: &DeviceStateValue) -> u64 {
+    fn get_state_timestamp(_state: &DeviceStateValue) -> u64 {
         // TODO: Extract timestamp from state if available
         // For now, return current time
-        chrono::Utc::now().timestamp_millis() as u64
+        chrono::Utc::now().timestamp_millis().cast_unsigned()
     }
 
     /// Check if a device state is writable (can be pushed back to gateway)
-    fn is_device_writable(&self, state: &DeviceStateValue) -> bool {
+    fn is_device_writable(state: &DeviceStateValue) -> bool {
         match state {
-            DeviceStateValue::Light(_) => true,         // Lights are writable
-            DeviceStateValue::Switch(_) => true,        // Switches are writable
-            DeviceStateValue::Sensor(_) => false,       // Sensors are read-only
-            DeviceStateValue::Scene(_) => true,         // Scenes are writable
-            DeviceStateValue::Timer(_) => true,         // Timers are writable
-            DeviceStateValue::MotionSensor(_) => false, // Motion sensors are read-only
-            DeviceStateValue::Outlet(_) => true,        // Outlets are writable
-            DeviceStateValue::Empty => false,           // 🔥 Empty state is not writable! 💖
+            // Lights, switches, scenes, timers and outlets are writable.
+            DeviceStateValue::Light(_)
+            | DeviceStateValue::Switch(_)
+            | DeviceStateValue::Scene(_)
+            | DeviceStateValue::Timer(_)
+            | DeviceStateValue::Outlet(_) => true,
+            // Sensors and motion sensors are read-only; empty state is not writable.
+            DeviceStateValue::Sensor(_)
+            | DeviceStateValue::MotionSensor(_)
+            | DeviceStateValue::Empty => false,
         }
     }
 
     /// Check if this is a problematic outlet that causes HTTP 500 errors
-    async fn is_problematic_outlet(&self, device_id: &DeviceId) -> bool {
+    ///
+    /// No `.await` inside, and private (module-only) with no external
+    /// callers, so dropping `async` is a pure signature simplification.
+    fn is_problematic_outlet(device_id: &DeviceId) -> bool {
         // Known problematic outlet device IDs that cause HTTP 500 errors in Dirigera API
         // These should only be controlled via direct user commands, not sync engine
         matches!(
@@ -1405,23 +1442,34 @@ impl SyncEngine {
         let retry_queue = self.retry_queue.read().await;
         let sync_queue = self.sync_queue.read().await;
 
-        let mut stats = SyncStats {
-            pending_sync_tasks: sync_queue.len() as u32,
-            retry_queue_size: retry_queue.len() as u32,
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "queue length, always far below u32::MAX"
+        )]
+        let pending_sync_tasks = sync_queue.len() as u32;
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "queue length, always far below u32::MAX"
+        )]
+        let retry_queue_size = retry_queue.len() as u32;
+
+        let mut result = SyncStats {
+            pending_sync_tasks,
+            retry_queue_size,
             ..Default::default()
         };
 
         for sync_status in status.values() {
             match sync_status {
-                SyncStatus::InSync { .. } => stats.in_sync_devices += 1,
-                SyncStatus::PendingSync { .. } => stats.pending_sync_devices += 1,
-                SyncStatus::Syncing { .. } => stats.syncing_devices += 1,
-                SyncStatus::Failed { .. } => stats.failed_devices += 1,
-                SyncStatus::Conflict { .. } => stats.conflict_devices += 1,
+                SyncStatus::InSync { .. } => result.in_sync_devices += 1,
+                SyncStatus::PendingSync { .. } => result.pending_sync_devices += 1,
+                SyncStatus::Syncing { .. } => result.syncing_devices += 1,
+                SyncStatus::Failed { .. } => result.failed_devices += 1,
+                SyncStatus::Conflict { .. } => result.conflict_devices += 1,
             }
         }
 
-        stats
+        result
     }
 }
 

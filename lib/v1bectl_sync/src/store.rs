@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
-use v1bectl_state::*;
+use v1bectl_state::{
+    DeviceGroupInfo, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, DeviceType,
+};
 
 #[derive(Debug)]
 pub struct StateStore {
@@ -11,6 +13,7 @@ pub struct StateStore {
 }
 
 impl StateStore {
+    #[must_use]
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             devices: RwLock::new(HashMap::new()),
@@ -25,7 +28,7 @@ impl StateStore {
             device_id: device_id.clone(),
             device_info,
             state: initial_state,
-            last_updated: chrono::Utc::now().timestamp_millis() as u64,
+            last_updated: chrono::Utc::now().timestamp_millis().cast_unsigned(),
             last_synced_to_gateway: None,
             last_synced_from_gateway: None,
         };
@@ -75,7 +78,7 @@ impl StateStore {
         let mut devices = self.devices.write().await;
         if let Some(device) = devices.get_mut(device_id) {
             device.state = new_state;
-            device.last_updated = chrono::Utc::now().timestamp_millis() as u64;
+            device.last_updated = chrono::Utc::now().timestamp_millis().cast_unsigned();
             debug!("Updated device state: {}", device_id);
             Ok(())
         } else {

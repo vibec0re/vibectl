@@ -1,5 +1,5 @@
 //! 🧪 The shared rig for the sync engine's integration tests: a fake hub
-//! whose PATCHes can be held at a gate and whose traffic is logged, and a
+//! whose `PATCHes` can be held at a gate and whose traffic is logged, and a
 //! running engine around it.
 //!
 //! The tests order their steps on the hub's log, never on sleeps. Pulls come
@@ -88,7 +88,7 @@ pub struct HubLog {
     pub sets_started: Vec<(DeviceId, DeviceStateValue)>,
     /// `set_device_state` calls answered (applied, ignored or failed).
     pub sets_done: usize,
-    /// The PATCHes waiting at the gate now, by their index in
+    /// The `PATCHes` waiting at the gate now, by their index in
     /// `sets_started`.
     pub held: Vec<usize>,
 }
@@ -112,11 +112,11 @@ pub struct TestHub {
     /// reads as `Empty`.
     reported: Mutex<HashMap<DeviceId, DeviceStateValue>>,
     /// Read when a PATCH passes the gate, so a test can change it while
-    /// PATCHes are held.
+    /// `PATCHes` are held.
     on_set: Mutex<OnSet>,
-    /// PATCHes wait here for a permit. Closed means open: nothing waits.
+    /// `PATCHes` wait here for a permit. Closed means open: nothing waits.
     gate: Semaphore,
-    /// Held PATCHes let through out of order ([`TestHub::release_newest`]),
+    /// Held `PATCHes` let through out of order ([`TestHub::release_newest`]),
     /// by their index in `sets_started`.
     picked: watch::Sender<Vec<usize>>,
     log: watch::Sender<HubLog>,
@@ -147,27 +147,27 @@ impl TestHub {
         self.reported.lock().unwrap().get(id).cloned()
     }
 
-    /// What the hub does with the PATCHes that pass the gate from now on,
+    /// What the hub does with the `PATCHes` that pass the gate from now on,
     /// including the ones held at it now.
     pub fn set_on_set(&self, on_set: OnSet) {
         *self.on_set.lock().unwrap() = on_set;
     }
 
-    /// Let `n` held PATCHes through, in arrival order.
+    /// Let `n` held `PATCHes` through, in arrival order.
     pub fn release(&self, n: usize) {
         self.gate.add_permits(n);
     }
 
-    /// Let the most recent of the held PATCHes through, ahead of the older
+    /// Let the most recent of the held `PATCHes` through, ahead of the older
     /// ones: a hub may answer requests in any order. (Wait for it to be
-    /// answered before letting the others through: PATCHes let through
+    /// answered before letting the others through: `PATCHes` let through
     /// together are answered in whatever order the runtime runs them.)
     pub fn release_newest(&self) {
         let newest = *self.log().held.iter().max().expect("a PATCH at the gate");
         self.picked.send_modify(|picked| picked.push(newest));
     }
 
-    /// Stop holding PATCHes, including the ones waiting now.
+    /// Stop holding `PATCHes`, including the ones waiting now.
     pub fn open_gate(&self) {
         self.gate.close();
     }
@@ -301,7 +301,7 @@ impl Rig {
                 ..config
             },
             Pulls::OnDemand => SyncConfig {
-                pull_interval: Duration::from_secs(3600),
+                pull_interval: Duration::from_hours(1),
                 push_interval: Duration::from_millis(5),
                 ..config
             },
@@ -335,7 +335,7 @@ impl Rig {
 
     /// Makes `writes` so that one drain of the sync buffer takes them all,
     /// and resolves once that batch's first PATCH is held at the gate.
-    /// Returns its device; the batch's other PATCHes wait behind it, in the
+    /// Returns its device; the batch's other `PATCHes` wait behind it, in the
     /// drain's (random) order.
     ///
     /// Two writes in a row can otherwise land in different drains, if a

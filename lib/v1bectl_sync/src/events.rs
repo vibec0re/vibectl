@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
-use v1bectl_state::*;
+use v1bectl_state::DeviceEvent;
 
 /// Receive from a broadcast channel while tolerating [`broadcast::error::RecvError::Lagged`].
 ///
@@ -18,7 +18,6 @@ pub async fn recv_lossy<T: Clone>(rx: &mut broadcast::Receiver<T>, name: &str) -
             Ok(event) => return Some(event),
             Err(broadcast::error::RecvError::Lagged(n)) => {
                 warn!("⚠️ {name} subscriber lagged, skipped {n} events");
-                continue;
             }
             Err(broadcast::error::RecvError::Closed) => return None,
         }
@@ -32,6 +31,7 @@ pub struct EventBus {
 }
 
 impl EventBus {
+    #[must_use]
     pub fn new(max_history: usize) -> Self {
         let (sender, _) = broadcast::channel(1000);
         Self {
@@ -62,6 +62,7 @@ impl EventBus {
         }
     }
 
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<DeviceEvent> {
         self.sender.subscribe()
     }
@@ -72,7 +73,11 @@ impl EventBus {
         history.iter().rev().take(take_count).cloned().collect()
     }
 
-    pub async fn subscriber_count(&self) -> usize {
+    // No callers anywhere in the workspace await this (or call it at all),
+    // so dropping `async` is a pure signature simplification, not a
+    // behaviour change.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
     }
 }
@@ -81,6 +86,7 @@ impl EventBus {
 mod tests {
     use super::*;
     use std::time::SystemTime;
+    use v1bectl_state::EventType;
 
     fn test_event(n: u32) -> DeviceEvent {
         DeviceEvent {
