@@ -102,37 +102,74 @@ impl ButtonAction {
     }
 }
 
-/// Whether `event` is a press (`Some(true)`) or a release (`Some(false)`),
-/// in any shape that carries one. The main one is a state echo of a switch
-/// (`AttributeChanged{attribute: "state"}`, as the sync engine publishes it
-/// when the hub reports the switch has changed). The others are the shapes
-/// the controller has always read: a bare state object with `is_pressed`,
-/// an `isOn`/`buttonState` flag, and a `StateChanged` switch state.
-fn pressed(event: &DeviceEvent) -> Option<bool> {
-    match &event.event_type {
-        EventType::AttributeChanged {
-            attribute,
-            new_value,
-            ..
-        } if attribute == "state" => {
-            match serde_json::from_value::<DeviceStateValue>(new_value.clone()) {
-                Ok(DeviceStateValue::Switch(switch)) => Some(switch.is_pressed),
-                _ => new_value
-                    .get("is_pressed")
-                    .and_then(serde_json::Value::as_bool),
-            }
-        }
-        EventType::AttributeChanged {
-            attribute,
-            new_value,
-            ..
-        } if attribute == "isOn" || attribute == "buttonState" => new_value.as_bool(),
-        EventType::StateChanged {
-            new_state: Some(DeviceStateValue::Switch(switch)),
-            ..
-        } => Some(switch.is_pressed),
-        _ => None,
+/// The `is_pressed` flag in a switch state `value`: a state echo's
+/// `{"Switch": {...}}`, or a bare state object with `is_pressed`.
+fn is_pressed_in(value: &serde_json::Value) -> Option<bool> {
+    match serde_json::from_value::<DeviceStateValue>(value.clone()) {
+        Ok(DeviceStateValue::Switch(switch)) => Some(switch.is_pressed),
+        _ => value.get("is_pressed").and_then(serde_json::Value::as_bool),
     }
+}
+
+/// Whether a switch that went from `old` to `new` was pressed (`Some(true)`)
+/// or released (`Some(false)`). Only a change of `is_pressed` is either. A
+/// switch echo that keeps it is something else changing: a battery tick
+/// (85 → 84), or a pull confirming what the store has. The sync engine
+/// echoes those too, and treating one as a release ran the release action:
+/// with the shipped controller, every battery tick turned the lights off.
+///
+/// With no `old` (`None`: the echo had `Null` there, or something that
+/// isn't a switch) there's nothing to compare against, so only
+/// `is_pressed: true` counts, as a press. A switch at rest reports `false`,
+/// and so does every echo that isn't a press. Dirigera's mapping even
+/// defaults the flag to `false`. So a `false` with nothing before it can't
+/// be told from a battery tick, and firing on it would bring that bug back.
+/// A `true` can only be a press. At worst a release goes unrun. (The only
+/// echo that sends `Null` is the engine's optimistic one, and nothing
+/// writes a switch optimistically.)
+fn transition(old: Option<bool>, new: bool) -> Option<bool> {
+    match old {
+        Some(old) if old == new => None,
+        Some(_) => Some(new),
+        None => new.then_some(true),
+    }
+}
+
+/// Whether `event` is a press (`Some(true)`) or a release (`Some(false)`)
+/// of its switch, in any shape that carries one (see [`transition`]: only a
+/// change of `is_pressed` is either). The main one is a state echo of a
+/// switch (`AttributeChanged{attribute: "state"}`, as the sync engine
+/// publishes it when the hub reports the switch has changed), which has the
+/// state before in `old_value`. The others are the shapes the controller
+/// has always read: a bare state object with `is_pressed`, an
+/// `isOn`/`buttonState` flag, and a `StateChanged` switch state.
+fn pressed(event: &DeviceEvent) -> Option<bool> {
+    let (old, new) = match &event.event_type {
+        EventType::AttributeChanged {
+            attribute,
+            old_value,
+            new_value,
+        } if attribute == "state" => (is_pressed_in(old_value), is_pressed_in(new_value)?),
+        EventType::AttributeChanged {
+            attribute,
+            old_value,
+            new_value,
+        } if attribute == "isOn" || attribute == "buttonState" => {
+            (old_value.as_bool(), new_value.as_bool()?)
+        }
+        EventType::StateChanged {
+            old_state,
+            new_state: Some(DeviceStateValue::Switch(switch)),
+        } => {
+            let old = match old_state {
+                Some(DeviceStateValue::Switch(old)) => Some(old.is_pressed),
+                _ => None,
+            };
+            (old, switch.is_pressed)
+        }
+        _ => return None,
+    };
+    transition(old, new)
 }
 
 /// Button Controller: runs an action when its button is pressed, and
@@ -256,5 +293,182 @@ impl VirtualDevice for ButtonController {
             }
         }
         devices
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    fn switch(is_pressed: bool, battery_level: u8) -> Value {
+        serde_json::to_value(DeviceStateValue::Switch(SwitchState {
+            is_pressed,
+            last_pressed: None,
+            battery_level: Some(battery_level),
+        }))
+        .unwrap()
+    }
+
+    fn attribute(attribute: &str, old_value: Value, new_value: Value) -> DeviceEvent {
+        DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: "btn".to_string(),
+            event_type: EventType::AttributeChanged {
+                attribute: attribute.to_string(),
+                old_value,
+                new_value,
+            },
+        }
+    }
+
+    /// #34 review, finding 1: only a change of `is_pressed` is a press or a
+    /// release, in every shape `pressed` reads. Without an old value, only
+    /// `is_pressed: true` counts (see [`transition`]).
+    #[test]
+    fn only_an_is_pressed_transition_is_a_press_or_a_release() {
+        let switch_state = |is_pressed| {
+            DeviceStateValue::Switch(SwitchState {
+                is_pressed,
+                last_pressed: None,
+                battery_level: Some(85),
+            })
+        };
+        let state_changed = |old: Option<bool>, new: bool| DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: "btn".to_string(),
+            event_type: EventType::StateChanged {
+                old_state: old.map(switch_state),
+                new_state: Some(switch_state(new)),
+            },
+        };
+        let cases = [
+            // The sync engine's switch echo.
+            (
+                "press",
+                attribute("state", switch(false, 85), switch(true, 85)),
+                Some(true),
+            ),
+            (
+                "release",
+                attribute("state", switch(true, 85), switch(false, 85)),
+                Some(false),
+            ),
+            (
+                "battery tick, released",
+                attribute("state", switch(false, 85), switch(false, 84)),
+                None,
+            ),
+            (
+                "battery tick, held",
+                attribute("state", switch(true, 85), switch(true, 84)),
+                None,
+            ),
+            (
+                "confirmation, nothing moved",
+                attribute("state", switch(false, 85), switch(false, 85)),
+                None,
+            ),
+            (
+                "no old value, pressed",
+                attribute("state", Value::Null, switch(true, 85)),
+                Some(true),
+            ),
+            (
+                "no old value, released",
+                attribute("state", Value::Null, switch(false, 84)),
+                None,
+            ),
+            (
+                "old value not a switch, released",
+                attribute("state", json!({"Empty": null}), switch(false, 84)),
+                None,
+            ),
+            // The bare state object.
+            (
+                "bare press",
+                attribute(
+                    "state",
+                    json!({"is_pressed": false}),
+                    json!({"is_pressed": true}),
+                ),
+                Some(true),
+            ),
+            (
+                "bare release",
+                attribute(
+                    "state",
+                    json!({"is_pressed": true}),
+                    json!({"is_pressed": false}),
+                ),
+                Some(false),
+            ),
+            (
+                "bare, no old value, released",
+                attribute("state", Value::Null, json!({"is_pressed": false})),
+                None,
+            ),
+            // A flag attribute.
+            (
+                "isOn press",
+                attribute("isOn", json!(false), json!(true)),
+                Some(true),
+            ),
+            (
+                "buttonState release",
+                attribute("buttonState", json!(true), json!(false)),
+                Some(false),
+            ),
+            (
+                "isOn unchanged",
+                attribute("isOn", json!(false), json!(false)),
+                None,
+            ),
+            (
+                "isOn, no old value, released",
+                attribute("isOn", Value::Null, json!(false)),
+                None,
+            ),
+            // `StateChanged`.
+            (
+                "StateChanged press",
+                state_changed(Some(false), true),
+                Some(true),
+            ),
+            (
+                "StateChanged release",
+                state_changed(Some(true), false),
+                Some(false),
+            ),
+            (
+                "StateChanged unchanged",
+                state_changed(Some(false), false),
+                None,
+            ),
+            (
+                "StateChanged, no old state, pressed",
+                state_changed(None, true),
+                Some(true),
+            ),
+            (
+                "StateChanged, no old state, released",
+                state_changed(None, false),
+                None,
+            ),
+            // Not a switch at all.
+            (
+                "a light",
+                attribute("state", Value::Null, json!({"Light": {"is_on": true}})),
+                None,
+            ),
+            (
+                "another attribute",
+                attribute("battery", json!(85), json!(84)),
+                None,
+            ),
+        ];
+        for (case, event, want) in cases {
+            assert_eq!(pressed(&event), want, "{case}");
+        }
     }
 }

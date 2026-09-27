@@ -891,11 +891,57 @@ mod tests {
     }
 
     fn switch(is_pressed: bool) -> DeviceStateValue {
+        switch_at(is_pressed, 85)
+    }
+
+    fn switch_at(is_pressed: bool, battery_level: u8) -> DeviceStateValue {
         DeviceStateValue::Switch(SwitchState {
             is_pressed,
             last_pressed: None,
-            battery_level: Some(85),
+            battery_level: Some(battery_level),
         })
+    }
+
+    /// A released switch `button` in `store`.
+    async fn add_switch(store: &StateStore, button: &str) {
+        let info = DeviceInfo {
+            device_type: DeviceType::Switch,
+            capabilities: vec![Capability::OnOff],
+            ..light_info(button)
+        };
+        store.add_device(info, switch(false)).await;
+    }
+
+    /// A button controller `device_id` bound to `button`, that runs
+    /// `press_on` on a press and `press_off` on a release.
+    fn controller(
+        device_id: &str,
+        button: &str,
+        press_on: serde_json::Value,
+        press_off: serde_json::Value,
+        store: &Arc<StateStore>,
+        bus: &Arc<EventBus>,
+    ) -> ButtonController {
+        let config = VirtualDeviceConfig {
+            device_id: device_id.to_string(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: device_id.to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        let action = |value: serde_json::Value| value.as_array().cloned().expect("action");
+        ButtonController::new(
+            config,
+            button.to_string(),
+            action(press_on),
+            action(press_off),
+            None,
+            None,
+            store.clone(),
+            bus.clone(),
+        )
+        .expect("controller")
     }
 
     /// A released switch `btn` in the store, and a button controller `ctrl`
@@ -908,34 +954,11 @@ mod tests {
         press_on: serde_json::Value,
         press_off: serde_json::Value,
     ) {
-        let info = DeviceInfo {
-            device_type: DeviceType::Switch,
-            capabilities: vec![Capability::OnOff],
-            ..light_info("btn")
-        };
-        store.add_device(info, switch(false)).await;
-        let config = VirtualDeviceConfig {
-            device_id: "ctrl".to_string(),
-            device_type: VirtualDeviceType::ButtonController,
-            name: "ctrl".to_string(),
-            description: None,
-            enabled: true,
-            config: serde_json::json!({}),
-        };
-        let action = |value: serde_json::Value| value.as_array().cloned().expect("action");
-        let controller = ButtonController::new(
-            config,
-            "btn".to_string(),
-            action(press_on),
-            action(press_off),
-            None,
-            None,
-            store.clone(),
-            bus.clone(),
-        )
-        .expect("controller");
+        add_switch(store, "btn").await;
         manager
-            .add_virtual_device(Box::new(controller))
+            .add_virtual_device(Box::new(controller(
+                "ctrl", "btn", press_on, press_off, store, bus,
+            )))
             .await
             .expect("register");
     }
@@ -1442,6 +1465,59 @@ mod tests {
             stored(&store, "a").await,
             off(),
             "the release never reached a"
+        );
+    }
+
+    /// #34 review, finding 1: a switch echo that isn't a press or a release
+    /// runs no action. A battery tick (85 → 84, `is_pressed` still `false`)
+    /// ran the release action, so with the shipped controller every battery
+    /// tick of the remote turned its group off. The same `false` with no old
+    /// value isn't a release either. A real press and release still run
+    /// their actions after that.
+    #[tokio::test]
+    async fn battery_tick_of_the_button_leaves_the_group_alone() {
+        let (manager, store, bus) = started_group(Kind::Curves, [off(), off(), off()]).await;
+        let (press_on, press_off) = (
+            serde_json::json!(["on", "g"]),
+            serde_json::json!(["off", "g"]),
+        );
+        add_controller(&manager, &store, &bus, press_on, press_off).await;
+        let mut rx = bus.subscribe();
+        let on = light(true, 60);
+        manager
+            .set_virtual_device_state(&"g".to_string(), on.clone())
+            .await
+            .expect("write");
+        pump(&manager, &mut rx).await;
+
+        // The tick, as the sync engine's GatewayWins reports it: stored,
+        // and echoed with the state before. Then an echo of it with no
+        // state before.
+        let btn = "btn".to_string();
+        let tick = switch_at(false, 84);
+        store.update_device_state(&btn, tick.clone()).await.unwrap();
+        for (case, old) in [
+            ("a battery tick", Some(switch(false))),
+            ("no old value", None),
+        ] {
+            bus.publish(state_event(&btn, old.as_ref(), &tick)).await;
+            let events = pump(&manager, &mut rx).await;
+            assert_eq!(stored(&store, "g").await, on, "{case} moved the group");
+            for id in ["a", "b", "c"] {
+                assert_eq!(stored(&store, id).await, on, "{case} moved {id}");
+            }
+            assert_eq!(events.len(), 1, "{case} must be the only event: {events:?}");
+        }
+
+        press(&store, &bus, true).await;
+        pump(&manager, &mut rx).await;
+        assert_eq!(stored(&store, "g").await, on, "group after the press");
+        press(&store, &bus, false).await;
+        pump(&manager, &mut rx).await;
+        assert_eq!(
+            stored(&store, "g").await,
+            light(false, 60),
+            "the release must still turn the group off"
         );
     }
 
