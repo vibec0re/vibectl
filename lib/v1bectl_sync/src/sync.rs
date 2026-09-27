@@ -2,14 +2,16 @@
 //!
 //! - **Push.** A user write ([`SyncEngine::apply_optimistic_update`]) goes
 //!   into the store right away (with [`SyncConfig::optimistic_updates`]) and
-//!   into the sync buffer. The buffer worker drains the buffer every 50 ms
-//!   and sends each device's value to the gateway, one device at a time.
+//!   into the sync buffer. The buffer worker drains the buffer every
+//!   [`SyncConfig::push_interval`] and sends each device's value to the
+//!   gateway, one device at a time.
 //! - **Pull.** Every [`SyncConfig::pull_interval`] the pull worker reads
 //!   every device from the gateway and reconciles the store with it
 //!   ([`SyncConfig::conflict_resolution`]). A user write the hub hasn't
 //!   confirmed yet is shielded from that for [`SyncConfig::protection_window`].
 //! - **Retry.** A failed push is retried with exponential backoff
-//!   ([`SyncConfig::base_retry_delay`]).
+//!   ([`SyncConfig::base_retry_delay`], checked every
+//!   [`SyncConfig::retry_interval`]).
 //!
 //! # Throttling
 //!
@@ -17,8 +19,8 @@
 //! coalescing: the sync buffer keeps only the latest value per device, so
 //! however fast a client writes (a dragged slider, say), each drain sends at
 //! most one PATCH per device, and a device gets at most one buffered PATCH
-//! per buffer tick (20 per second at 50 ms). Retries of failed pushes come
-//! on top of that.
+//! per `push_interval` tick (20 per second at the default 50 ms). Retries of
+//! failed pushes come on top of that.
 
 use crate::events::*;
 use crate::gateway::*;
@@ -136,11 +138,21 @@ pub enum SyncStatus {
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
+    /// How often queued work goes out. The buffer worker drains the sync
+    /// buffer at this interval (at most one push per device per tick: the
+    /// engine's only gateway throttle, see the module docs), and the push
+    /// worker runs a batch of queued tasks.
     pub push_interval: Duration,
     pub pull_interval: Duration,
     pub max_retry_attempts: u32,
+    /// Wait before a failed push's first retry. Each further attempt doubles
+    /// it, up to `max_retry_delay`.
     pub base_retry_delay: Duration,
     pub max_retry_delay: Duration,
+    /// How often the retry worker looks for retries that are due. A retry
+    /// goes out at the first check after its backoff delay, so its actual
+    /// wait is rounded up to the next check.
+    pub retry_interval: Duration,
     pub batch_size: usize,
     pub conflict_resolution: ConflictResolution,
     // 🔥 NEW VIBEOPTIMIZATION SETTINGS!
@@ -168,6 +180,7 @@ impl Default for SyncConfig {
             max_retry_attempts: 5,
             base_retry_delay: Duration::from_millis(500),
             max_retry_delay: Duration::from_secs(30),
+            retry_interval: Duration::from_secs(1),
             batch_size: 10,
             conflict_resolution: ConflictResolution::GatewayWins, // 🔥 PHYSICAL SWITCHES WIN! <3
             // 🔥 VIBEOPTIMIZED DEFAULTS!
@@ -435,7 +448,7 @@ impl SyncEngine {
 
     // Retry worker: Handle failed sync operations
     async fn start_retry_worker(&self) -> anyhow::Result<()> {
-        let mut interval = interval(Duration::from_secs(1));
+        let mut interval = interval(self.config.retry_interval);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
@@ -457,11 +470,15 @@ impl SyncEngine {
 
     // 🔥 BUFFER WORKER - ULTRA LOW LATENCY MODE! FASTER RESPONSE! 💖
     async fn start_buffer_worker(&self) -> anyhow::Result<()> {
-        // Process buffer at 50ms intervals for INSTANT response! 🚀
-        let mut interval = interval(Duration::from_millis(50)); // 🔥 20x/sec check for MIN latency!
+        // 🚀 Drain the buffer every push_interval (50 ms by default: 20x/sec
+        // for MIN latency!). This tick is the per-device push throttle.
+        let mut interval = interval(self.config.push_interval);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
-        debug!("🔥 BUFFER WORKER STARTED - ULTRA LOW LATENCY MODE! 50ms intervals!");
+        debug!(
+            "🔥 BUFFER WORKER STARTED - ULTRA LOW LATENCY MODE! {:?} intervals!",
+            self.config.push_interval
+        );
 
         loop {
             tokio::select! {
