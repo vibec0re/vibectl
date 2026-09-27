@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::RwLock;
 use v1bectl_sync::{
-    recv_lossy, DeviceEvent, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, DeviceType,
-    EventBus, EventType, StateError, StateStore, SyncEngine,
+    recv_or_lag, DeviceEvent, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, DeviceType,
+    EventBus, EventType, Recv, StateError, StateStore, SyncEngine,
 };
 
 /// Virtual Device Manager - coordinates all virtual devices 🔥
@@ -391,7 +391,7 @@ impl VirtualDeviceManager {
     ///
     /// [`Self::start`] runs this for every event on the bus. Call it
     /// directly to drive tracking yourself instead (the tests do, to control
-    /// exactly when it catches up).
+    /// exactly when it catches up), and [`Self::resync`] after missing any.
     pub async fn handle_event(&self, event: &DeviceEvent) -> Result<(), VirtualDeviceError> {
         let tracked = self.track(event).await;
         self.react_to(event).await;
@@ -752,9 +752,11 @@ impl VirtualDeviceManager {
     }
 
     /// Start the manager: input tracking runs [`Self::handle_event`] for
-    /// every event on the bus, in a background task. It also logs every
-    /// dangling reference (see [`Self::dangling_references`]), and every
-    /// button more than one controller binds (see [`Self::shared_buttons`]).
+    /// every event on the bus, in a background task, and [`Self::resync`]
+    /// whenever it has fallen behind the bus and missed some. It also logs
+    /// every dangling reference (see [`Self::dangling_references`]), and
+    /// every button more than one controller binds (see
+    /// [`Self::shared_buttons`]).
     /// The server calls this once all virtual devices are loaded.
     pub async fn start(&self) -> Result<(), VirtualDeviceError> {
         let manager = Arc::new(self.clone());
@@ -776,19 +778,71 @@ impl VirtualDeviceManager {
         }
 
         tokio::spawn(async move {
-            // Falling behind the bus skips the events missed, it doesn't end
-            // tracking (#15). Inputs are judged as the store holds them, so
-            // the next event for a member catches its group up. A member
-            // that doesn't change again stays unreconciled until it does.
-            while let Some(event) = recv_lossy(&mut event_receiver, "virtual device tracking").await
-            {
-                if let Err(e) = manager.handle_event(&event).await {
-                    tracing::error!("Failed to handle state change for virtual devices: {}", e);
+            // Falling behind the bus doesn't end tracking, and doesn't leave
+            // the groups behind either (#15): the events it missed may have
+            // moved their members, so it catches every virtual device up
+            // from the store, then goes on with the events still buffered.
+            loop {
+                match recv_or_lag(&mut event_receiver, "virtual device tracking").await {
+                    Recv::Event(event) => {
+                        if let Err(e) = manager.handle_event(&event).await {
+                            tracing::error!(
+                                "Failed to handle state change for virtual devices: {}",
+                                e
+                            );
+                        }
+                    }
+                    Recv::Lagged(_) => manager.resync().await,
+                    Recv::Closed => break,
                 }
             }
         });
 
         Ok(())
+    }
+
+    /// Catch every virtual device up with its inputs as the store holds
+    /// them now. Input tracking does this when it has fallen behind the bus
+    /// (#15): the events it missed may have moved members, and without this
+    /// their groups would stay stale until those members changed again.
+    ///
+    /// Each input goes through [`Self::handle_device_state_change`], the
+    /// path an outside change of it takes. So a group that already accounts
+    /// for its members (see [`VirtualDevice::accounts_for`]) is left alone,
+    /// with the level it was set to, and one that doesn't is re-derived from
+    /// them. With no member lit it goes off and keeps its level (#16).
+    /// Re-deriving a group from members that haven't moved lands on the same
+    /// state, and an unchanged state isn't echoed. So a group whose state
+    /// changed is echoed once, however many of its members it has, and the
+    /// others not at all.
+    ///
+    /// Physical inputs go first, so a group of groups is derived from inner
+    /// groups that have caught up with their members. (Nested deeper, an
+    /// outer group catches up from an inner one's echo, like after any
+    /// change.) Only state is caught up: a press that was missed is gone,
+    /// and running its action now, late, could undo whatever happened since.
+    pub async fn resync(&self) {
+        let mut inputs: Vec<DeviceId> = {
+            let input_map = self.input_mappings.read().await;
+            input_map.keys().cloned().collect()
+        };
+        {
+            let devices = self.virtual_devices.read().await;
+            inputs.sort_by_cached_key(|id| (devices.contains_key(id), id.clone()));
+        }
+        tracing::info!(
+            "🔧 Catching virtual devices up with {} inputs after missing events",
+            inputs.len()
+        );
+
+        for input in inputs {
+            let Some(stored) = self.state_store.get_device(&input).await else {
+                continue;
+            };
+            if let Err(e) = self.handle_device_state_change(&input, &stored).await {
+                tracing::error!("Failed to catch virtual devices up with {}: {}", input, e);
+            }
+        }
     }
 }
 
@@ -821,8 +875,8 @@ mod tests {
     use tokio::sync::broadcast::{self, error::TryRecvError};
     use tokio::sync::watch;
     use v1bectl_sync::{
-        ButtonPressType, Capability, Gateway, GatewayError, GatewayHealth, LightState, SwitchState,
-        SyncConfig, SyncStatus,
+        recv_lossy, ButtonPressType, Capability, Gateway, GatewayError, GatewayHealth, LightState,
+        SwitchState, SyncConfig, SyncStatus,
     };
 
     fn light_info(device_id: &str) -> DeviceInfo {
@@ -2339,6 +2393,137 @@ mod tests {
         .await
         .expect("tracking died behind the bus: `h` was never re-derived");
         assert_eq!(echoes(&[h_echo], "h"), vec![on]);
+    }
+
+    /// `device_id` moved to `state` from outside (the hub app, a wall
+    /// switch), as the sync engine reports it: stored, and echoed.
+    async fn moved(store: &StateStore, bus: &EventBus, device_id: &str, state: DeviceStateValue) {
+        let id = device_id.to_string();
+        let old = stored(store, device_id).await;
+        store.update_device_state(&id, state.clone()).await.unwrap();
+        bus.publish(state_event(&id, Some(&old), &state)).await;
+    }
+
+    /// #15: once input tracking has fallen behind the bus, it catches every
+    /// group up from the store. Members move while it's held at the device
+    /// lock, and their echoes are lost behind 1500 more events (the bus
+    /// keeps 1000). Nothing still buffered after the lag is about them.
+    ///
+    /// `g` (curves) must follow `a` to `{on, 40}`, and `h` (linear) go off
+    /// with its level kept when `c` and `d` go off (#16), each echoed once
+    /// and no more. `k`'s members didn't move, and it accounts for them
+    /// (#22): re-deriving it anyway would be lossy (set to 50, its ranges
+    /// read back as 57), so it must keep 50 and not echo.
+    ///
+    /// The last event is a press of `btn`, whose controller turns `marker`
+    /// on. The catch-up runs no actions, so `marker`'s echo is tracking
+    /// getting past the lag, whether it caught up or not.
+    #[tokio::test]
+    async fn input_tracking_catches_the_groups_up_after_falling_behind() {
+        let store = StateStore::new();
+        for (id, state) in [
+            ("a", light(true, 60)),
+            ("b", light(true, 60)),
+            ("c", light(true, 60)),
+            ("d", light(true, 60)),
+            ("e", off()),
+            ("f", off()),
+            ("marker", off()),
+        ] {
+            store.add_device(light_info(id), state).await;
+        }
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let lossy = LightGroupLinear::new(
+            VirtualDeviceConfig {
+                device_id: "k".to_string(),
+                device_type: VirtualDeviceType::LightGroupLinear,
+                name: "k".to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({}),
+            },
+            HashMap::from([
+                ("e".to_string(), "e".to_string()),
+                ("f".to_string(), "f".to_string()),
+            ]),
+            HashMap::from([("e".to_string(), (80, 100)), ("f".to_string(), (0, 50))]),
+            store.clone(),
+        )
+        .expect("k");
+        for device in [
+            Box::new(group("g", &["a", "b"], &store)) as Box<dyn VirtualDevice>,
+            Box::new(linear_group("h", &["c", "d"], &store)),
+            Box::new(lossy),
+        ] {
+            manager.add_virtual_device(device).await.expect("register");
+        }
+        manager
+            .set_virtual_device_state(&"k".to_string(), light(true, 50))
+            .await
+            .expect("k to 50");
+        let (press_on, press_off) = (serde_json::json!(["on", "marker"]), serde_json::json!([]));
+        add_controller(&manager, &store, press_on, press_off).await;
+        assert_eq!(stored(&store, "g").await, light(true, 60), "g at start");
+        assert_eq!(stored(&store, "h").await, light(true, 60), "h at start");
+        assert_eq!(stored(&store, "k").await, light(true, 50), "k at start");
+        manager.start().await.expect("start");
+
+        let mut rx = {
+            // Tracking gets no further than its first event, an echo of `e`,
+            // before we let go. It may not even have been polled yet.
+            let _held = manager.virtual_devices.write().await;
+            let echo_of_e = state_event(&"e".to_string(), None, &stored(&store, "e").await);
+            bus.publish(echo_of_e.clone()).await;
+            moved(&store, &bus, "a", light(true, 20)).await;
+            moved(&store, &bus, "c", off()).await;
+            moved(&store, &bus, "d", off()).await;
+            for _ in 0..1500 {
+                bus.publish(echo_of_e.clone()).await;
+            }
+            press(&store, &bus, true).await;
+            // Tracking needs the lock to echo anything, so this sees it all.
+            bus.subscribe()
+        };
+
+        // The timeout only bounds a failure; `marker`'s echo ends the wait.
+        let events = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = Vec::new();
+            loop {
+                let event = rx.recv().await.expect("event bus");
+                let marker = event.device_id == "marker";
+                events.push(event);
+                if marker {
+                    return events;
+                }
+            }
+        })
+        .await
+        .expect("tracking never got past the lag: the press of btn never ran");
+
+        for (id, want, what) in [
+            ("g", light(true, 40), "g must follow a"),
+            ("h", light(false, 60), "h must go off and keep its level"),
+        ] {
+            assert_eq!(stored(&store, id).await, want, "{what}");
+            assert_eq!(echoes(&events, id), vec![want], "{what}, echoed once");
+        }
+        assert_eq!(
+            stored(&store, "k").await,
+            light(true, 50),
+            "k was re-derived"
+        );
+        assert!(echoes(&events, "k").is_empty(), "k was echoed");
+        for id in ["g", "h", "k"] {
+            assert_eq!(
+                manager
+                    .get_virtual_device_state(&id.to_string())
+                    .await
+                    .unwrap(),
+                stored(&store, id).await,
+                "{id}'s own state must match the store"
+            );
+        }
     }
 
     /// The dummy hub, with the sync engine's reads held at a gate and its

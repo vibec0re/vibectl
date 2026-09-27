@@ -11,20 +11,24 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use v1bectl_sync::{
-    recv_lossy, ButtonPressType, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus,
-    EventType, Gateway, LightState, OutletState, RgbColor, SceneState, StateStore, SyncEngine,
+    recv_or_lag, ButtonPressType, DeviceEvent, DeviceInfo, DeviceState, DeviceStateValue, EventBus,
+    EventType, Gateway, LightState, OutletState, Recv, RgbColor, SceneState, StateStore,
+    SyncEngine,
 };
 use v1bectl_virtual::{
     is_simulated, LightGroup, SceneController, VirtualDeviceConfig, VirtualDeviceManager,
     VirtualDeviceType,
 };
+
+/// Each connected WebSocket client's outbox, by subscriber id.
+type Subscribers = Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<Outbound>>>>;
 
 #[derive(Clone)]
 pub struct AxumServer {
@@ -33,8 +37,50 @@ pub struct AxumServer {
     event_bus: Arc<EventBus>,
     gateway: Arc<dyn Gateway>,
     virtual_device_manager: Arc<VirtualDeviceManager>,
-    subscribers: Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<DeviceEvent>>>>,
+    subscribers: Subscribers,
     sync_engine: Option<Arc<SyncEngine>>, // 🔥 OPTIONAL SYNC ENGINE FOR OPTIMISTIC UPDATES!
+}
+
+/// What goes out to a WebSocket client unasked, next to the answers to its
+/// requests.
+#[derive(Debug, Clone)]
+enum Outbound {
+    /// A bus event, sent as an `Event` frame.
+    Event(DeviceEvent),
+    /// Every device in the store, after the forwarder fell behind the bus
+    /// and the client missed events (#15). It goes out as a `DeviceList`
+    /// response nobody asked for (see [`spawn_event_forwarder`]).
+    Resync(Vec<DeviceState>),
+}
+
+impl Outbound {
+    /// The binary WebSocket frame the client gets for this, with a
+    /// correlation id of its own. A resync is a `DeviceList` `Response`,
+    /// the answer to `DiscoverDevices`: every client already takes one,
+    /// whenever it comes, as its new device list. None of them matches it
+    /// to a request it made (the CLI only waits for its own ids, and its
+    /// `subscribe` skips responses).
+    fn into_frame(self) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+        let (message_type, payload) = match self {
+            Self::Event(event) => (ApiMessageType::Event, cbor(&event)?),
+            Self::Resync(devices) => (
+                ApiMessageType::Response,
+                cbor(&ApiResponse::device_list(devices))?,
+            ),
+        };
+        cbor(&ApiMessage {
+            correlation_id: Uuid::new_v4().to_string(),
+            message_type,
+            payload,
+        })
+    }
+}
+
+/// `value` as CBOR.
+fn cbor(value: &impl Serialize) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
+    let mut bytes = Vec::new();
+    ciborium::into_writer(value, &mut bytes)?;
+    Ok(bytes)
 }
 
 // WebSocket API Messages - CBOR encoded! 🔥
@@ -146,6 +192,19 @@ enum ApiResponse {
     },
 }
 
+impl ApiResponse {
+    /// A `DeviceList` of `devices`: the answer to `DiscoverDevices` and
+    /// `ListDevices`, and a resync (see [`Outbound::Resync`]).
+    fn device_list(devices: Vec<DeviceState>) -> Self {
+        // A device count, always far below u32::MAX.
+        let total_count = u32::try_from(devices.len()).unwrap_or(u32::MAX);
+        Self::DeviceList {
+            devices,
+            total_count,
+        }
+    }
+}
+
 impl AxumServer {
     pub fn new(
         port: u16,
@@ -199,7 +258,11 @@ impl AxumServer {
             .map_err(|e| anyhow::anyhow!("Failed to start virtual device manager: {e}"))?;
 
         // 🔥 SUBSCRIBE TO EVENTBUS AND FORWARD TO WEBSOCKET CLIENTS! 💖
-        spawn_event_forwarder(&self.event_bus, Arc::clone(&self.subscribers));
+        spawn_event_forwarder(
+            self.event_bus.subscribe(),
+            Arc::clone(&self.state_store),
+            Arc::clone(&self.subscribers),
+        );
 
         let app = Router::new()
             // WebSocket ONLY - pure async real-time vibes!! 🔥
@@ -222,7 +285,7 @@ impl AxumServer {
         let mut failed_subscribers = Vec::new();
 
         for (subscriber_id, sender) in subscribers.iter() {
-            if sender.send(event.clone()).is_err() {
+            if sender.send(Outbound::Event(event.clone())).is_err() {
                 failed_subscribers.push(subscriber_id.clone());
             }
         }
@@ -250,18 +313,8 @@ impl AxumServer {
         match request {
             ApiRequest::DiscoverDevices => {
                 debug!("Handling device discovery request - WITH STATES! 🔥");
-                let all_device_states = self.state_store.list_devices().await;
-                // Device count, always far below u32::MAX.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "device count, always far below u32::MAX"
-                )]
-                let total = all_device_states.len() as u32;
-
-                ApiResponse::DeviceList {
-                    total_count: total,
-                    devices: all_device_states, // 🔥 Return FULL DeviceState with values!
-                }
+                // 🔥 Return FULL DeviceState with values!
+                ApiResponse::device_list(self.state_store.list_devices().await)
             }
             ApiRequest::ListDevices {
                 device_type,
@@ -296,16 +349,7 @@ impl AxumServer {
                     filtered_devices.retain(|d| d.device_info.reachable);
                 }
 
-                // Device count, always far below u32::MAX.
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "device count, always far below u32::MAX"
-                )]
-                let total_count = filtered_devices.len() as u32;
-                ApiResponse::DeviceList {
-                    total_count,
-                    devices: filtered_devices, // 🔥 Return FULL DeviceState!
-                }
+                ApiResponse::device_list(filtered_devices) // 🔥 Return FULL DeviceState!
             }
             ApiRequest::GetDevice { device_id } => {
                 match self.state_store.get_device(&device_id).await {
@@ -783,26 +827,42 @@ impl AxumServer {
     }
 }
 
-/// Forward every event on `event_bus` to each WebSocket subscriber, and drop
-/// the subscribers whose client has gone. Subscribes before it returns, so
-/// nothing published after this call is missed.
+/// Forward every event on `event_rx`, a subscription to the bus, to each
+/// WebSocket subscriber, and drop the subscribers whose client has gone.
+///
+/// When the forwarder falls behind the bus, the events it missed never
+/// reach the clients, and their devices would show stale state until they
+/// changed again (#15). So it then sends each client every device in the
+/// store (see [`Outbound::Resync`]), and goes on with the events still
+/// buffered. Some of those may be older than that snapshot, but each device
+/// still ends at its last event, which is what the store holds.
 fn spawn_event_forwarder(
-    event_bus: &EventBus,
-    subscribers: Arc<RwLock<HashMap<String, tokio::sync::mpsc::UnboundedSender<DeviceEvent>>>>,
+    mut event_rx: broadcast::Receiver<DeviceEvent>,
+    state_store: Arc<StateStore>,
+    subscribers: Subscribers,
 ) {
-    let mut event_rx = event_bus.subscribe();
     debug!("📢 API Server subscribed to EventBus - will forward events to WebSocket clients!");
 
     tokio::spawn(async move {
-        // Lagging behind the bus skips events instead of ending the
-        // forwarding for every client (#15).
-        while let Some(event) = recv_lossy(&mut event_rx, "WebSocket forwarder").await {
-            debug!("🔥 Forwarding event to WebSocket clients: {:?}", event);
+        loop {
+            let outbound = match recv_or_lag(&mut event_rx, "WebSocket forwarder").await {
+                Recv::Event(event) => {
+                    debug!("🔥 Forwarding event to WebSocket clients: {:?}", event);
+                    Outbound::Event(event)
+                }
+                Recv::Lagged(_) => {
+                    info!(
+                        "🔧 Resyncing every WebSocket client with the store after missing events"
+                    );
+                    Outbound::Resync(state_store.list_devices().await)
+                }
+                Recv::Closed => break,
+            };
             let subscribers_read = subscribers.read().await;
             let mut failed = Vec::new();
 
             for (id, tx) in subscribers_read.iter() {
-                if tx.send(event.clone()).is_err() {
+                if tx.send(outbound.clone()).is_err() {
                     failed.push(id.clone());
                 }
             }
@@ -854,26 +914,15 @@ async fn handle_websocket(socket: WebSocket, server: AxumServer) {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    // Handle events
-                    Some(event) = event_rx.recv() => {
-                        // Encode event as CBOR in ApiMessage wrapper
-                        let mut event_payload = Vec::new();
-                        if let Err(e) = ciborium::into_writer(&event, &mut event_payload) {
-                            error!("Failed to encode event as CBOR: {}", e);
-                            continue;
-                        }
-
-                        let api_message = ApiMessage {
-                            correlation_id: Uuid::new_v4().to_string(),
-                            message_type: ApiMessageType::Event,
-                            payload: event_payload,
+                    // Handle events (and resyncs)
+                    Some(outbound) = event_rx.recv() => {
+                        let message_bytes = match outbound.into_frame() {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                error!("Failed to encode a message for the client as CBOR: {}", e);
+                                continue;
+                            }
                         };
-
-                        let mut message_bytes = Vec::new();
-                        if let Err(e) = ciborium::into_writer(&api_message, &mut message_bytes) {
-                            error!("Failed to encode API message: {}", e);
-                            continue;
-                        }
 
                         if ws_sender.send(Message::Binary(message_bytes)).await.is_err() {
                             break;
@@ -1803,29 +1852,24 @@ mod tests {
     #[tokio::test]
     async fn event_forwarder_survives_falling_behind_the_bus() {
         let bus = EventBus::new(10);
-        let subscribers = Arc::new(RwLock::new(HashMap::new()));
+        let subscribers: Subscribers = Arc::new(RwLock::new(HashMap::new()));
         let (tx, mut client) = tokio::sync::mpsc::unbounded_channel();
         subscribers.write().await.insert("client".to_string(), tx);
-        spawn_event_forwarder(&bus, Arc::clone(&subscribers));
+        spawn_event_forwarder(bus.subscribe(), StateStore::new(), Arc::clone(&subscribers));
 
-        let event = |device_id: &str| DeviceEvent {
-            timestamp: std::time::SystemTime::now(),
-            device_id: device_id.to_string(),
-            event_type: EventType::DeviceRemoved,
-        };
         {
             // The forwarder blocks here at its first event.
             let _held = subscribers.write().await;
             for _ in 0..1500 {
-                bus.publish(event("flood")).await;
+                bus.publish(removed("flood")).await;
             }
         }
-        bus.publish(event("after")).await;
+        bus.publish(removed("after")).await;
 
         // The timeout only bounds a failure; the event ends the wait.
         tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(forwarded) = client.recv().await {
-                if forwarded.device_id == "after" {
+                if matches!(&forwarded, Outbound::Event(e) if e.device_id == "after") {
                     return;
                 }
             }
@@ -1833,6 +1877,155 @@ mod tests {
         })
         .await
         .expect("forwarding died behind the bus: `after` never reached the client");
+    }
+
+    /// A `DeviceRemoved` of `device_id`: an event no test here reads the
+    /// state of.
+    fn removed(device_id: &str) -> DeviceEvent {
+        DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: device_id.to_string(),
+            event_type: EventType::DeviceRemoved,
+        }
+    }
+
+    /// `devices`, sorted by id: the store lists them in no order.
+    fn by_id(mut devices: Vec<DeviceState>) -> Vec<DeviceState> {
+        devices.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+        devices
+    }
+
+    /// The devices in `resync`'s frame, decoded the way a client decodes a
+    /// response: with its own copy of the types (the widget's, the TUI's,
+    /// the web UI's), which by CBOR's external tagging only need the
+    /// variant's name.
+    fn decoded_by_a_client(resync: Outbound) -> Vec<DeviceState> {
+        #[derive(Deserialize, Debug)]
+        enum ClientResponse {
+            Pong,
+            DeviceList {
+                devices: Vec<DeviceState>,
+                total_count: u32,
+            },
+        }
+        let frame = resync.into_frame().expect("encode");
+        let message: ApiMessage = ciborium::from_reader(frame.as_slice()).expect("envelope");
+        assert!(
+            matches!(message.message_type, ApiMessageType::Response),
+            "a resync goes out as a response: {message:?}"
+        );
+        match ciborium::from_reader(message.payload.as_slice()).expect("a client's DeviceList") {
+            ClientResponse::DeviceList {
+                devices,
+                total_count,
+            } => {
+                assert_eq!(u32::try_from(devices.len()).ok(), Some(total_count));
+                devices
+            }
+            ClientResponse::Pong => panic!("a resync must be a DeviceList"),
+        }
+    }
+
+    /// #15: once the forwarder has fallen behind the bus, the client gets
+    /// the whole store, then the live events again. A 4-slot bus overflows
+    /// while the forwarder is held at the subscriber lock, and the kitchen
+    /// light moves meanwhile. Its echo is lost, so only the resync can tell
+    /// the client.
+    ///
+    /// The resync must come once, carry exactly what the store holds, and
+    /// go out as the unsolicited `DeviceList` response every client already
+    /// takes as its new device list.
+    #[tokio::test]
+    async fn event_forwarder_resyncs_the_clients_after_falling_behind() {
+        let home = home().await;
+        let (bus, rx) = broadcast::channel(4);
+        let subscribers: Subscribers = Arc::new(RwLock::new(HashMap::new()));
+        let (tx, mut client) = tokio::sync::mpsc::unbounded_channel();
+        subscribers.write().await.insert("client".to_string(), tx);
+        spawn_event_forwarder(rx, Arc::clone(&home.store), Arc::clone(&subscribers));
+
+        let kitchen = "light_kitchen".to_string();
+        let moved = DeviceStateValue::Light(LightState {
+            is_on: true,
+            brightness: Some(40),
+            color_temp: None,
+            rgb_color: None,
+        });
+        let before = home.store.get_device(&kitchen).await.unwrap().state;
+        assert_ne!(before, moved, "the kitchen light must move");
+        {
+            // The forwarder gets no further than its first event before we
+            // let go. It may not even have been polled yet.
+            let _held = subscribers.write().await;
+            bus.send(removed("first")).expect("forwarder subscribed");
+            home.store
+                .update_device_state(&kitchen, moved.clone())
+                .await
+                .unwrap();
+            let echo = EventType::AttributeChanged {
+                attribute: "state".to_string(),
+                old_value: serde_json::to_value(&before).unwrap(),
+                new_value: serde_json::to_value(&moved).unwrap(),
+            };
+            bus.send(DeviceEvent {
+                event_type: echo,
+                ..removed(&kitchen)
+            })
+            .expect("forwarder subscribed");
+            for _ in 0..16 {
+                bus.send(removed("flood")).expect("forwarder subscribed");
+            }
+        }
+        bus.send(removed("live")).expect("forwarder subscribed");
+
+        // The timeout only bounds a failure; `live` ends the wait.
+        let received = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut received = Vec::new();
+            while let Some(outbound) = client.recv().await {
+                let live = matches!(&outbound, Outbound::Event(e) if e.device_id == "live");
+                received.push(outbound);
+                if live {
+                    return received;
+                }
+            }
+            panic!("the client's channel closed");
+        })
+        .await
+        .expect("forwarding died behind the bus: `live` never reached the client");
+
+        let resyncs: Vec<&Outbound> = received
+            .iter()
+            .filter(|outbound| matches!(outbound, Outbound::Resync(_)))
+            .collect();
+        assert_eq!(resyncs.len(), 1, "one resync for the lag: {received:?}");
+        assert!(
+            !received
+                .iter()
+                .any(|o| matches!(o, Outbound::Event(e) if e.device_id == kitchen)),
+            "the kitchen echo should have been lost to the lag"
+        );
+        let resynced = by_id(decoded_by_a_client(resyncs[0].clone()));
+        assert_eq!(
+            resynced,
+            by_id(home.store.list_devices().await),
+            "the resync must be the store"
+        );
+        assert!(
+            resynced
+                .iter()
+                .any(|d| d.device_id == kitchen && d.state == moved),
+            "the resync must carry the kitchen light's move"
+        );
+
+        // And live events keep coming, with no more resyncs.
+        bus.send(removed("later")).expect("forwarder subscribed");
+        let later = tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("`later` never reached the client");
+        assert!(
+            matches!(&later, Some(Outbound::Event(e)) if e.device_id == "later"),
+            "{later:?}"
+        );
     }
 
     /// The same tracking, run the way the server runs it

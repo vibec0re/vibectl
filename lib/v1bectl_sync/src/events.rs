@@ -24,6 +24,34 @@ pub async fn recv_lossy<T: Clone>(rx: &mut broadcast::Receiver<T>, name: &str) -
     }
 }
 
+/// What [`recv_or_lag`] got from a broadcast channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Recv<T> {
+    /// The next event.
+    Event(T),
+    /// The subscriber fell behind the channel's capacity, and this many
+    /// events were dropped before it got to them. The next receive hands
+    /// back the oldest one still buffered.
+    Lagged(u64),
+    /// Every sender is gone, so no more events will come.
+    Closed,
+}
+
+/// [`recv_lossy`] for a subscriber that has to know when it missed events,
+/// so it can catch up on what they changed (#15). It logs the lag the same
+/// way, then returns it as [`Recv::Lagged`] instead of going on to the next
+/// event.
+pub async fn recv_or_lag<T: Clone>(rx: &mut broadcast::Receiver<T>, name: &str) -> Recv<T> {
+    match rx.recv().await {
+        Ok(event) => Recv::Event(event),
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            warn!("⚠️ {name} subscriber lagged, skipped {n} events");
+            Recv::Lagged(n)
+        }
+        Err(broadcast::error::RecvError::Closed) => Recv::Closed,
+    }
+}
+
 pub struct EventBus {
     sender: broadcast::Sender<DeviceEvent>,
     event_history: Arc<RwLock<VecDeque<DeviceEvent>>>,
@@ -137,5 +165,35 @@ mod tests {
             recv_lossy(&mut rx, "test subscriber").await.is_none(),
             "expected None once the sender is dropped (Closed)"
         );
+    }
+
+    /// `recv_or_lag` hands the lag back, once, with how many events were
+    /// dropped, and then goes on with the events still buffered (#15).
+    #[tokio::test]
+    async fn recv_or_lag_reports_the_lag_then_goes_on() {
+        let (tx, mut rx) = broadcast::channel(2);
+        for n in 0..5 {
+            tx.send(test_event(n)).expect("receiver still subscribed");
+        }
+
+        let device = |got: Recv<DeviceEvent>| match got {
+            Recv::Event(event) => event.device_id,
+            other => panic!("expected an event, got {other:?}"),
+        };
+        assert_eq!(
+            recv_or_lag(&mut rx, "test subscriber").await,
+            Recv::Lagged(3)
+        );
+        assert_eq!(
+            device(recv_or_lag(&mut rx, "test subscriber").await),
+            "device_3"
+        );
+        assert_eq!(
+            device(recv_or_lag(&mut rx, "test subscriber").await),
+            "device_4"
+        );
+
+        drop(tx);
+        assert_eq!(recv_or_lag(&mut rx, "test subscriber").await, Recv::Closed);
     }
 }
