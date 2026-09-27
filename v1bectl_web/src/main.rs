@@ -1,29 +1,12 @@
 // 🔥 VIBEC0RE WEBUI - CYBER EDITION! 💖
-
-use yew::prelude::*;
-
-mod components;
-mod cyber_app;
-mod screen_renderer;
-mod screens;
-mod websocket_reconnect;
-
-use cyber_app::CyberApp;
+//
+// The wasm entry point trunk builds (`index.html` has `data-bin="v1bectl_web"`).
+// All the code lives in the lib's module tree. `[lib]` is `cdylib`-only, and a
+// bin can't link a cdylib, so pull in `lib.rs` itself rather than re-declaring
+// the modules here. Once the lib also builds as an `rlib`, this becomes
+// `fn main() { v1bectl_web::run() }`.
+include!("lib.rs");
 
 fn main() {
-    // 🔥 PANIC HOOK FIRST - CATCH ALL PANICS! 💖
-    console_error_panic_hook::set_once();
-
-    // 🔥 IMMEDIATE CONSOLE OUTPUT - BEFORE ANYTHING ELSE! 💖
-    web_sys::console::log_1(&"🔥 VIBEC0RE WASM LOADED!".into());
-
-    // Initialize WASM logger with DEBUG level
-    wasm_logger::init(wasm_logger::Config::new(log::Level::Debug));
-
-    log::info!("🔥 VIBEC0RE CYBER APP STARTING! 💖");
-
-    // 🚀 LAUNCH THE APP! 🚀
-    yew::Renderer::<CyberApp>::new().render();
-
-    log::info!("🚀 Yew renderer started!");
+    run();
 }

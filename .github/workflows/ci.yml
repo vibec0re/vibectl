@@ -9,6 +9,12 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Read-only token for every job: the web job runs trunk, which fetches sass,
+# wasm-bindgen and wasm-opt from GitHub releases at build time without a
+# checksum, so nothing it executes should be able to write to the repo.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: fmt + clippy + test
@@ -27,8 +33,9 @@ jobs:
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
 
-      # The web crate needs an extra toolchain (wasm + trunk), so CI builds and
-      # tests only the native server/CLI/TUI + library crates.
+      # The web crate needs an extra toolchain (wasm + trunk), so this job
+      # builds and tests only the native server/CLI/TUI + library crates. The
+      # `web` job below covers v1bectl_web.
       - name: Format
         run: cargo fmt --all --check
 
@@ -42,3 +49,50 @@ jobs:
         run: cargo doc --workspace --exclude v1bectl_web --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
+
+  # 🔥 The web UI (Yew/WASM) gets its own job, and so its own rust-cache (the
+  # key is per job), leaving the native job's cache alone. 💖
+  web:
+    name: web (wasm clippy + test + trunk build)
+    runs-on: ubuntu-latest
+    env:
+      TRUNK_VERSION: "0.21.14" # keep in step with the flake's trunk
+      TRUNK_SHA256: "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy (wasm32)
+        run: cargo clippy -p v1bectl_web --target wasm32-unknown-unknown -- -D warnings
+
+      # The reconnect state machine and the screen parser are pure, so the lib
+      # tests run natively.
+      - name: Test
+        run: cargo test -p v1bectl_web --lib
+
+      # trunk fetches the exact sass / wasm-bindgen / wasm-opt versions pinned
+      # in v1bectl_web/Trunk.toml. wasm-bindgen has to match Cargo.lock, so
+      # this also catches the two drifting apart. On NixOS use
+      # `nix build .#web` (or `trunk build --release --offline` inside
+      # `nix develop`) instead: the downloaded tools don't run there.
+      - name: Install trunk
+        run: |
+          curl -fsSL -o trunk.tar.gz \
+            "https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}/trunk-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${TRUNK_SHA256}  trunk.tar.gz" | sha256sum -c -
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf trunk.tar.gz -C "$HOME/.local/bin" trunk
+          rm trunk.tar.gz
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Trunk build
+        working-directory: v1bectl_web
+        run: trunk build --release

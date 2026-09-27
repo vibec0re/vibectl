@@ -55,7 +55,7 @@ pub fn parse_screens(content: &str) -> Result<Vec<Screen>, String> {
     let mut screens = Vec::new();
     let mut chars = content.chars().peekable();
 
-    while let Some(c) = chars.peek() {
+    while chars.peek().is_some() {
         skip_whitespace_and_comments(&mut chars);
 
         if chars.peek().is_none() {
@@ -598,8 +598,8 @@ screen "test" {
                 show_humidity,
             } => {
                 assert!(matches!(device_ref, DeviceRef::ByName(n) if n == "Living Room Sensor"));
-                assert_eq!(*show_temp, true);
-                assert_eq!(*show_humidity, false);
+                assert!(*show_temp);
+                assert!(!*show_humidity);
             }
             _ => panic!("Expected Sensor element"),
         }
@@ -631,8 +631,8 @@ screen "test" {
             } => {
                 assert_eq!(name, "Accent");
                 assert!(matches!(device_ref, DeviceRef::ByName(n) if n == "My Light"));
-                assert_eq!(*show_switch, true);
-                assert_eq!(*show_slider, false);
+                assert!(*show_switch);
+                assert!(!*show_slider);
             }
             _ => panic!("Expected Light element"),
         }
@@ -764,8 +764,8 @@ screen "test" {
                 show_slider,
                 ..
             } => {
-                assert_eq!(*show_switch, true);
-                assert_eq!(*show_slider, true);
+                assert!(*show_switch);
+                assert!(*show_slider);
             }
             _ => panic!("Expected Light element"),
         }
@@ -792,8 +792,8 @@ screen "test" {
                 show_humidity,
                 ..
             } => {
-                assert_eq!(*show_temp, true);
-                assert_eq!(*show_humidity, true);
+                assert!(*show_temp);
+                assert!(*show_humidity);
             }
             _ => panic!("Expected Sensor element"),
         }

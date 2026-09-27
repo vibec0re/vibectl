@@ -18,9 +18,18 @@
 //   schedule a duplicate reconnect.
 // - One task owns each socket and drives its ping and watchdog timers, so the
 //   timers stop when the socket goes away. Superseding a connection closes its
-//   socket instead of leaking it.
+//   socket instead of leaking it: its task sees its fused "closer" fire and its
+//   outbound queue end (#29).
+// - Coming back to the page (#29): a plain tab switch pings an open socket
+//   first and reconnects only if nothing answers within `PROBE_TIMEOUT_MS`. A
+//   page restored from the back/forward cache, or a socket that has been
+//   silent for longer than the watchdog allows (an iOS resume, a sleeping
+//   laptop), reconnects straight away. A wake-up may pre-empt an attempt
+//   that has been connecting for `CONNECT_PREEMPT_MS`.
 
 use futures::channel::{mpsc, oneshot};
+use futures::future::Fuse;
+use futures::stream::SplitSink;
 use futures::{Future, FutureExt, SinkExt, StreamExt};
 use gloo_events::EventListener;
 use gloo_net::http::Request;
@@ -143,10 +152,8 @@ pub enum ApiResponse {
     },
 }
 
-// Re-export types from v1bectl_state
-pub use v1bectl_state::{
-    Capability, DeviceInfo, DeviceState, DeviceStateValue, DeviceType, EventType,
-};
+// Re-export the v1bectl_state types the UI uses
+pub use v1bectl_state::{DeviceInfo, DeviceState, DeviceStateValue};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionStatus {
@@ -176,6 +183,15 @@ const CONNECT_TIMEOUT_MS: u32 = 10_000;
 /// Reconnect backoff: 1 s, doubling per consecutive failure, capped at 30 s.
 const BACKOFF_BASE_MS: u32 = 1_000;
 const BACKOFF_MAX_MS: u32 = 30_000;
+/// A wake-up may pre-empt an attempt that has been connecting at least this
+/// long; it's probably stuck on a config fetch or an open, so don't make the
+/// user wait out `CONNECT_TIMEOUT_MS`. A younger attempt is left alone: it's
+/// the one the first load or a wake-up just started (iOS fires
+/// `visibilitychange` and `pageshow` back to back).
+const CONNECT_PREEMPT_MS: f64 = 2_000.0;
+/// Coming back to a tab with an open socket sends a PING first, and only
+/// reconnects if nothing arrives within this long.
+const PROBE_TIMEOUT_MS: u32 = 2_000;
 
 /// Delay before the next attempt after `failures` consecutive failed
 /// connections: 1 s, 2 s, 4 s, ... capped at 30 s. `0` counts as `1`, so there
@@ -188,14 +204,84 @@ fn backoff_delay_ms(failures: u32) -> u32 {
 }
 
 /// Is the socket dead? True once nothing has arrived for `WATCHDOG_TIMEOUT_MS`
-/// *and* a ping sent after the last inbound message has gone unanswered for
-/// `PONG_GRACE_MS`. All times are `Date.now()` milliseconds.
-fn watchdog_expired(now_ms: f64, last_inbound_ms: f64, last_ping_ms: Option<f64>) -> bool {
-    let unanswered_for = match last_ping_ms {
-        Some(sent) if sent > last_inbound_ms => now_ms - sent,
-        _ => return false,
+/// *and* a ping has gone unanswered for `PONG_GRACE_MS`. `unanswered_ping_ms`
+/// is when the latest ping that nothing has arrived after was sent (see
+/// `Liveness`). All times are `Date.now()` milliseconds.
+fn watchdog_expired(now_ms: f64, last_inbound_ms: f64, unanswered_ping_ms: Option<f64>) -> bool {
+    let Some(sent) = unanswered_ping_ms else {
+        return false;
     };
-    now_ms - last_inbound_ms >= WATCHDOG_TIMEOUT_MS && unanswered_for >= PONG_GRACE_MS
+    now_ms - last_inbound_ms >= WATCHDOG_TIMEOUT_MS && now_ms - sent >= PONG_GRACE_MS
+}
+
+/// Liveness of one open socket, fed with events in the order its task sees
+/// them. Whether anything has arrived since the last ping is tracked by that
+/// order, not by comparing `Date.now()` stamps, so a ping and a message in the
+/// same millisecond are never ambiguous. Pure, so it's unit-tested natively.
+#[derive(Debug, Clone, Copy)]
+struct Liveness {
+    last_inbound_ms: f64,
+    /// When the latest ping was sent, if nothing has arrived since.
+    unanswered_ping_ms: Option<f64>,
+    /// A tab-return probe is waiting for the server to answer.
+    probing: bool,
+}
+
+/// How a socket's task checks its socket when the tab comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProbeStep {
+    /// Send a ping, and reconnect unless something arrives within
+    /// `PROBE_TIMEOUT_MS`.
+    SendPing,
+    /// A probe is already waiting for its answer: leave it be.
+    AlreadyProbing,
+    /// Nothing has arrived for `WATCHDOG_TIMEOUT_MS`, so the page was frozen or
+    /// suspended (an iOS resume, a sleeping laptop). Don't wait on a pong that
+    /// probably won't come: reconnect now, as every tab return used to.
+    Reconnect,
+}
+
+impl Liveness {
+    fn new(now_ms: f64) -> Self {
+        Self {
+            last_inbound_ms: now_ms,
+            unanswered_ping_ms: None,
+            probing: false,
+        }
+    }
+
+    /// Something arrived: the server is alive, which answers any ping or probe.
+    fn on_inbound(&mut self, now_ms: f64) {
+        self.last_inbound_ms = now_ms;
+        self.unanswered_ping_ms = None;
+        self.probing = false;
+    }
+
+    fn on_ping_sent(&mut self, now_ms: f64) {
+        self.unanswered_ping_ms = Some(now_ms);
+    }
+
+    fn watchdog_expired(&self, now_ms: f64) -> bool {
+        watchdog_expired(now_ms, self.last_inbound_ms, self.unanswered_ping_ms)
+    }
+
+    /// The tab came back: how do we check the socket? `SendPing` marks the
+    /// probe as pending until something arrives.
+    fn begin_probe(&mut self, now_ms: f64) -> ProbeStep {
+        if self.probing {
+            return ProbeStep::AlreadyProbing;
+        }
+        if now_ms - self.last_inbound_ms >= WATCHDOG_TIMEOUT_MS {
+            return ProbeStep::Reconnect;
+        }
+        self.probing = true;
+        ProbeStep::SendPing
+    }
+
+    /// The probe's `PROBE_TIMEOUT_MS` is up: is it still unanswered?
+    fn probe_unanswered(&self) -> bool {
+        self.probing
+    }
 }
 
 /// Does a task started for connection `mine` still own the connection? Every
@@ -220,6 +306,28 @@ enum Phase {
     Stopped,
 }
 
+/// Why the page is looking at its connection again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// `visibilitychange` to visible: a desktop tab switch, or an iOS webapp
+    /// coming back to the front.
+    Visible,
+    /// `pageshow` with `persisted`: the page was restored from the
+    /// back/forward cache, so it was frozen along with its socket.
+    Restored,
+}
+
+/// What a wake-up should do about the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WakeAction {
+    /// Leave it be.
+    Nothing,
+    /// Ping the open socket first; its task reconnects if nothing answers.
+    Probe,
+    /// Tear down and reconnect now.
+    Reconnect,
+}
+
 /// Pure connection bookkeeping: generations, backoff, and phase. It doesn't
 /// touch the browser, so the rules are unit-tested natively.
 #[derive(Debug)]
@@ -227,6 +335,8 @@ struct Lifecycle {
     generation: u64,
     failures: u32,
     phase: Phase,
+    /// When the current attempt started (`Date.now()` ms).
+    attempt_started_ms: f64,
 }
 
 impl Lifecycle {
@@ -235,6 +345,7 @@ impl Lifecycle {
             generation: 0,
             failures: 0,
             phase: Phase::Idle,
+            attempt_started_ms: 0.0,
         }
     }
 
@@ -242,11 +353,12 @@ impl Lifecycle {
         is_current_generation(generation, self.generation)
     }
 
-    /// Start a new attempt. This makes every older generation stale. Returns the
-    /// new attempt's generation.
-    fn begin_attempt(&mut self) -> u64 {
+    /// Start a new attempt at `now_ms`. This makes every older generation
+    /// stale. Returns the new attempt's generation.
+    fn begin_attempt(&mut self, now_ms: f64) -> u64 {
         self.generation += 1;
         self.phase = Phase::Connecting;
+        self.attempt_started_ms = now_ms;
         self.generation
     }
 
@@ -288,16 +400,25 @@ impl Lifecycle {
         self.is_current(generation) && self.phase == Phase::Backoff
     }
 
-    /// The app came back to the foreground: tear down and reconnect now? Not
-    /// while an attempt is still connecting (iOS fires visibilitychange and
-    /// pageshow back to back, and pageshow also fires on first load), and never
-    /// after teardown. If yes, the backoff starts over.
-    fn request_forced_reconnect(&mut self) -> bool {
+    /// The page came back to the foreground at `now_ms`. What now?
+    /// - Torn down: nothing, ever.
+    /// - Connecting for less than `CONNECT_PREEMPT_MS`: nothing (see there).
+    ///   Connecting for longer: pre-empt it with a fresh attempt.
+    /// - Open: a tab switch probes the socket (ping first). A page restored
+    ///   from the back/forward cache was frozen, so it reconnects.
+    /// - Backing off: retry now.
+    ///
+    /// A reconnect starts the backoff over: someone is looking, so try fast.
+    fn on_wake(&mut self, wake: Wake, now_ms: f64) -> WakeAction {
         match self.phase {
-            Phase::Connecting | Phase::Stopped => false,
-            Phase::Idle | Phase::Open | Phase::Backoff => {
+            Phase::Stopped => WakeAction::Nothing,
+            Phase::Connecting if now_ms - self.attempt_started_ms < CONNECT_PREEMPT_MS => {
+                WakeAction::Nothing
+            }
+            Phase::Open if wake == Wake::Visible => WakeAction::Probe,
+            Phase::Idle | Phase::Connecting | Phase::Open | Phase::Backoff => {
                 self.failures = 0;
-                true
+                WakeAction::Reconnect
             }
         }
     }
@@ -309,13 +430,34 @@ impl Lifecycle {
     }
 }
 
+/// The receiving end of an attempt's closer. It must be fused. A bare
+/// `oneshot::Receiver` reports `is_terminated()` as soon as its sender is
+/// dropped without sending, and `select!` skips terminated branches, so the
+/// drop that supersedes an attempt would never wake that branch (#29). A
+/// `Fuse` only terminates after it has returned `Ready`, so the drop is seen.
+type Closer = Fuse<oneshot::Receiver<()>>;
+
+fn closer_channel() -> (oneshot::Sender<()>, Closer) {
+    let (tx, rx) = oneshot::channel();
+    (tx, rx.fuse())
+}
+
+/// What the hook hands to the task that owns the open socket.
+#[derive(Debug, PartialEq)]
+enum Outbound {
+    /// A CBOR frame to send.
+    Frame(Vec<u8>),
+    /// The tab came back: check that the server still answers.
+    Probe,
+}
+
 /// All connection bookkeeping, in one `use_mut_ref` cell that is never
 /// replaced, so every reader sees the live value.
 struct WsState {
     lifecycle: Lifecycle,
     /// Outbound queue of the open socket; `None` unless connected.
-    sender: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    /// Dropping this tells the current socket's task to close its socket and
+    sender: Option<mpsc::UnboundedSender<Outbound>>,
+    /// Dropping this tells the current attempt's task to close its socket and
     /// exit without reconnecting.
     closer: Option<oneshot::Sender<()>>,
 }
@@ -329,7 +471,47 @@ impl WsState {
         }
     }
 
-    /// Let go of the current socket: its task sees the closer drop and closes it.
+    /// Start a new attempt at `now_ms`, superseding the current one: let go of
+    /// its socket, then return the new generation, the status to show, and
+    /// the new attempt's closer.
+    fn begin_attempt(&mut self, now_ms: f64) -> (u64, ConnectionStatus, Closer) {
+        self.release_socket();
+        let generation = self.lifecycle.begin_attempt(now_ms);
+        let (closer_tx, closer) = closer_channel();
+        self.closer = Some(closer_tx);
+        (generation, self.lifecycle.attempt_status(), closer)
+    }
+
+    /// The socket of `generation` opened: from now on everything queued goes
+    /// to `sender`. Returns `false` (changing nothing) if it's stale.
+    fn on_open(&mut self, generation: u64, sender: mpsc::UnboundedSender<Outbound>) -> bool {
+        if !self.lifecycle.on_open(generation) {
+            return false;
+        }
+        self.sender = Some(sender);
+        true
+    }
+
+    /// Hand `out` to the open socket's task. `false` if there's no open socket
+    /// (or its task is gone).
+    fn queue(&self, out: Outbound) -> bool {
+        self.sender
+            .as_ref()
+            .is_some_and(|sender| sender.unbounded_send(out).is_ok())
+    }
+
+    /// The page came back: decide what to do (see `Lifecycle::on_wake`) and
+    /// hand a probe to the open socket's task. With no task to take it,
+    /// reconnect instead.
+    fn on_wake(&mut self, wake: Wake, now_ms: f64) -> WakeAction {
+        match self.lifecycle.on_wake(wake, now_ms) {
+            WakeAction::Probe if !self.queue(Outbound::Probe) => WakeAction::Reconnect,
+            action => action,
+        }
+    }
+
+    /// Let go of the current socket. Its task sees its closer fire and its
+    /// outbound queue end, closes the socket, and exits.
     fn release_socket(&mut self) {
         self.sender = None;
         self.closer = None;
@@ -375,14 +557,7 @@ fn encode_request(request: &ApiRequest) -> Result<Vec<u8>, String> {
 /// 🚀 Start a new connection attempt, superseding (and closing) the current
 /// socket, if any. Every reconnect path ends up here.
 fn connect(ctx: &Ctx) {
-    let (generation, status, closer) = {
-        let mut state = ctx.state.borrow_mut();
-        state.release_socket();
-        let generation = state.lifecycle.begin_attempt();
-        let (closer_tx, closer_rx) = oneshot::channel();
-        state.closer = Some(closer_tx);
-        (generation, state.lifecycle.attempt_status(), closer_rx)
-    };
+    let (generation, status, closer) = ctx.state.borrow_mut().begin_attempt(now_ms());
 
     match &status {
         ConnectionStatus::Reconnecting(n) => {
@@ -432,17 +607,29 @@ fn connection_lost(ctx: &Ctx, generation: u64, status: ConnectionStatus) {
     });
 }
 
-/// 👁️ The app came back to the foreground; iOS webapps in particular can come
-/// back holding a dead socket that still looks open. Close it and reconnect
-/// now, unless an attempt is already connecting.
-fn force_reconnect(ctx: &Ctx, why: &str) {
-    let go = ctx.state.borrow_mut().lifecycle.request_forced_reconnect();
-    if go {
-        log::info!("{} - forcing reconnect!", why);
-        connect(ctx);
-    } else {
-        log::info!("{} - already connecting, leaving it be", why);
+/// 👁️ The app came back to the foreground. It may be holding a dead socket
+/// that still looks open (iOS webapps especially), or a connect that hung
+/// while it was away. See `Lifecycle::on_wake` for what happens when.
+fn wake_up(ctx: &Ctx, wake: Wake, why: &str) {
+    let action = ctx.state.borrow_mut().on_wake(wake, now_ms());
+    match action {
+        WakeAction::Nothing => log::info!("{} - already connecting, leaving it be", why),
+        WakeAction::Probe => log::info!("{} - pinging before deciding to reconnect 🏓", why),
+        WakeAction::Reconnect => {
+            log::info!("{} - forcing reconnect!", why);
+            connect(ctx);
+        }
     }
+}
+
+/// Is this `pageshow` a restore from the back/forward cache
+/// (`PageTransitionEvent.persisted`)? Read by reflection because web-sys's
+/// `PageTransitionEvent` binding isn't enabled for this crate.
+fn page_restored(event: &web_sys::Event) -> bool {
+    web_sys::js_sys::Reflect::get(event, &"persisted".into())
+        .ok()
+        .and_then(|persisted| persisted.as_bool())
+        .unwrap_or(false)
 }
 
 /// Hook teardown: close the socket and make every pending task and timer stale.
@@ -460,14 +647,15 @@ enum Race<T> {
     Superseded,
 }
 
-/// Run `fut` until it finishes, `CONNECT_TIMEOUT_MS` passes, or the attempt is
-/// superseded (its closer dropped).
-async fn race_attempt<T>(
+/// Run `fut` until it finishes, `timeout` fires, or the attempt is superseded
+/// (its closer's sender dropped). A supersede wins over everything else.
+async fn race<T>(
     fut: impl Future<Output = T>,
-    closer: &mut oneshot::Receiver<()>,
+    timeout: impl Future<Output = ()>,
+    closer: &mut Closer,
 ) -> Race<T> {
     let fut = fut.fuse();
-    let timeout = TimeoutFuture::new(CONNECT_TIMEOUT_MS).fuse();
+    let timeout = timeout.fuse();
     futures::pin_mut!(fut, timeout);
     futures::select_biased! {
         _ = &mut *closer => Race::Superseded,
@@ -476,10 +664,15 @@ async fn race_attempt<T>(
     }
 }
 
+/// `race` against `CONNECT_TIMEOUT_MS`.
+async fn race_attempt<T>(fut: impl Future<Output = T>, closer: &mut Closer) -> Race<T> {
+    race(fut, TimeoutFuture::new(CONNECT_TIMEOUT_MS), closer).await
+}
+
 /// One connection attempt: load the config, open the socket, then pump it
 /// until it dies or is superseded. The task owns the socket and its timers,
 /// so they all go away together.
-async fn run_connection(ctx: Ctx, generation: u64, mut closer: oneshot::Receiver<()>) {
+async fn run_connection(ctx: Ctx, generation: u64, mut closer: Closer) {
     let ws_url = match race_attempt(load_config(), &mut closer).await {
         Race::Superseded => return,
         Race::Done(Some(url)) => url,
@@ -532,13 +725,9 @@ async fn run_connection(ctx: Ctx, generation: u64, mut closer: oneshot::Receiver
         }
     }
 
-    let (tx, rx) = mpsc::unbounded::<Vec<u8>>();
-    {
-        let mut state = ctx.state.borrow_mut();
-        if !state.lifecycle.on_open(generation) {
-            return;
-        }
-        state.sender = Some(tx);
+    let (tx, rx) = mpsc::unbounded::<Outbound>();
+    if !ctx.state.borrow_mut().on_open(generation, tx) {
+        return;
     }
     log::info!("✅ WebSocket connection #{} opened!", generation);
     ctx.status.set(ConnectionStatus::Connected);
@@ -548,6 +737,13 @@ async fn run_connection(ctx: Ctx, generation: u64, mut closer: oneshot::Receiver
             log::info!("🔌 Connection #{} superseded - closed it", generation)
         }
         PumpEnd::Lost => connection_lost(&ctx, generation, ConnectionStatus::Disconnected),
+        // Someone is looking at the page, and the backoff was reset when this
+        // socket opened: reconnect right away.
+        PumpEnd::Unresponsive => {
+            if ctx.is_current(generation) {
+                connect(&ctx);
+            }
+        }
     }
 }
 
@@ -555,34 +751,53 @@ async fn run_connection(ctx: Ctx, generation: u64, mut closer: oneshot::Receiver
 enum PumpEnd {
     /// A newer attempt (or teardown) took over: exit quietly.
     Superseded,
-    /// The socket died: reconnect.
+    /// The socket died: reconnect with backoff.
     Lost,
+    /// A tab-return probe found the socket unresponsive: reconnect now.
+    Unresponsive,
+}
+
+/// Send one ping and note it in `liveness`. A ping that can't be encoded
+/// (it's a unit variant, so it can't really happen) is logged and skipped.
+async fn send_ping(
+    write: &mut SplitSink<WebSocket, Message>,
+    liveness: &mut Liveness,
+) -> Result<(), WebSocketError> {
+    match encode_request(&ApiRequest::Ping) {
+        Ok(data) => {
+            write.send(Message::Bytes(data)).await?;
+            liveness.on_ping_sent(now_ms());
+        }
+        Err(e) => log::error!("❌ Failed to encode PING: {}", e),
+    }
+    Ok(())
 }
 
 /// Pump one open socket: inbound messages to the UI, the outbound queue to the
-/// server, keepalive pings, and the watchdog. Returns when the socket dies or
-/// a newer connection takes over. Either way the socket is closed on the way
-/// out, and the ping and watchdog timers are dropped with this frame.
+/// server, keepalive pings, tab-return probes, and the watchdog. Returns when
+/// the socket dies, stops answering, or a newer connection takes over. Every
+/// way out closes the socket, and the timers are dropped with this frame.
 async fn pump(
     ctx: &Ctx,
     generation: u64,
     ws: WebSocket,
-    mut outbound: mpsc::UnboundedReceiver<Vec<u8>>,
-    closer: &mut oneshot::Receiver<()>,
+    mut outbound: mpsc::UnboundedReceiver<Outbound>,
+    closer: &mut Closer,
 ) -> PumpEnd {
     let (mut write, read) = ws.split();
     let mut read = read.fuse();
     let mut ping_timer = IntervalStream::new(PING_INTERVAL_MS).fuse();
     let mut watchdog_timer = IntervalStream::new(WATCHDOG_CHECK_MS).fuse();
-    let mut last_inbound_ms = now_ms();
-    let mut last_ping_ms: Option<f64> = None;
+    // Armed while a tab-return probe waits for its answer.
+    let mut probe_timer: Fuse<TimeoutFuture> = Fuse::terminated();
+    let mut liveness = Liveness::new(now_ms());
 
     let end = loop {
         futures::select_biased! {
             _ = &mut *closer => break PumpEnd::Superseded,
             msg = read.next() => match msg {
                 Some(Ok(msg)) => {
-                    last_inbound_ms = now_ms();
+                    liveness.on_inbound(now_ms());
                     if !ctx.is_current(generation) {
                         break PumpEnd::Superseded;
                     }
@@ -607,33 +822,59 @@ async fn pump(
                     break PumpEnd::Lost;
                 }
             },
-            data = outbound.next() => match data {
-                Some(data) => {
+            out = outbound.next() => match out {
+                Some(Outbound::Frame(data)) => {
                     if let Err(e) = write.send(Message::Bytes(data)).await {
                         log::error!("❌ Failed to send: {:?}", e);
                         break PumpEnd::Lost;
                     }
                 }
+                Some(Outbound::Probe) => match liveness.begin_probe(now_ms()) {
+                    ProbeStep::SendPing => {
+                        log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
+                        if let Err(e) = send_ping(&mut write, &mut liveness).await {
+                            log::error!("❌ Failed to send PING: {:?}", e);
+                            break PumpEnd::Lost;
+                        }
+                        probe_timer = TimeoutFuture::new(PROBE_TIMEOUT_MS).fuse();
+                    }
+                    ProbeStep::AlreadyProbing => {
+                        log::debug!("🏓 Already waiting for an answer to the last probe");
+                    }
+                    ProbeStep::Reconnect => {
+                        log::info!(
+                            "💔 Nothing from the server for {:.0}s - not waiting for a PONG, reconnecting",
+                            (now_ms() - liveness.last_inbound_ms) / 1000.0
+                        );
+                        break PumpEnd::Unresponsive;
+                    }
+                },
                 // Our sender was dropped: a newer connection replaced us.
                 None => break PumpEnd::Superseded,
             },
-            _ = ping_timer.next() => match encode_request(&ApiRequest::Ping) {
-                Ok(data) => {
-                    log::debug!("🏓 Sending PING to keep connection alive!");
-                    if let Err(e) = write.send(Message::Bytes(data)).await {
-                        log::error!("❌ Failed to send PING: {:?}", e);
-                        break PumpEnd::Lost;
-                    }
-                    last_ping_ms = Some(now_ms());
+            _ = probe_timer => {
+                if liveness.probe_unanswered() {
+                    log::warn!(
+                        "💔 No answer to the tab-return PING within {}ms - reconnecting",
+                        PROBE_TIMEOUT_MS
+                    );
+                    break PumpEnd::Unresponsive;
                 }
-                Err(e) => log::error!("❌ Failed to encode PING: {}", e),
+                log::debug!("💚 Server answered the tab-return PING - keeping the socket");
+            },
+            _ = ping_timer.next() => {
+                log::debug!("🏓 Sending PING to keep connection alive!");
+                if let Err(e) = send_ping(&mut write, &mut liveness).await {
+                    log::error!("❌ Failed to send PING: {:?}", e);
+                    break PumpEnd::Lost;
+                }
             },
             _ = watchdog_timer.next() => {
                 let now = now_ms();
-                if watchdog_expired(now, last_inbound_ms, last_ping_ms) {
+                if liveness.watchdog_expired(now) {
                     log::warn!(
                         "💔 Nothing from the server for {:.0}s and the last PING went unanswered - dropping the socket",
-                        (now - last_inbound_ms) / 1000.0
+                        (now - liveness.last_inbound_ms) / 1000.0
                     );
                     break PumpEnd::Lost;
                 }
@@ -725,7 +966,7 @@ pub fn use_websocket() -> UseWebSocketHandle {
         });
     }
 
-    // 🔥 iOS WAKE DETECTION - FORCE RECONNECT! 💖
+    // 🔥 iOS WAKE DETECTION - CHECK THE CONNECTION ON RETURN! 💖
     // iOS webapps need both visibilitychange AND pageshow
     use_effect_with((), move |_| {
         let window = web_sys::window().expect("window");
@@ -736,14 +977,21 @@ pub fn use_websocket() -> UseWebSocketHandle {
             let document = document.clone();
             move |_| {
                 if document.visibility_state() == web_sys::VisibilityState::Visible {
-                    force_reconnect(&ctx, "👁️ visibilitychange: visible");
+                    wake_up(&ctx, Wake::Visible, "👁️ visibilitychange: visible");
                 }
             }
         });
 
         // 🔥 iOS PAGESHOW - MORE RELIABLE FOR WEBAPPS! 💖
-        let pageshow_listener = EventListener::new(&window, "pageshow", move |_| {
-            force_reconnect(&ctx, "📱 pageshow");
+        // A restore from the back/forward cache means the page (and its
+        // socket) was frozen: reconnect. Any other pageshow is the first
+        // load's, whose connect is already running.
+        let pageshow_listener = EventListener::new(&window, "pageshow", move |event| {
+            if page_restored(event) {
+                wake_up(&ctx, Wake::Restored, "📱 pageshow: restored");
+            } else {
+                log::debug!("📱 pageshow: first load - the initial connect is already running");
+            }
         });
 
         move || {
@@ -770,11 +1018,7 @@ pub fn use_websocket() -> UseWebSocketHandle {
                 log::info!("📤 Sending request: {:?}", request);
 
                 // Send via channel
-                if let Some(sender) = &state.borrow().sender {
-                    if let Err(e) = sender.unbounded_send(data) {
-                        log::error!("❌ Failed to queue message: {:?}", e);
-                    }
-                } else {
+                if !state.borrow().queue(Outbound::Frame(data)) {
                     log::warn!("⚠️ WebSocket not connected, can't send request");
                 }
             });
@@ -800,6 +1044,7 @@ pub struct UseWebSocketHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::future::{pending, ready, FusedFuture};
 
     const S: f64 = 1_000.0;
 
@@ -824,8 +1069,12 @@ mod tests {
     fn watchdog_is_quiet_on_a_healthy_socket() {
         // Just opened, nothing sent yet.
         assert!(!watchdog_expired(0.0, 0.0, None));
+        assert!(!Liveness::new(0.0).watchdog_expired(600.0 * S));
         // Ping at 30 s answered right away; 60 s later all is well.
-        assert!(!watchdog_expired(90.0 * S, 30.1 * S, Some(30.0 * S)));
+        let mut live = Liveness::new(0.0);
+        live.on_ping_sent(30.0 * S);
+        live.on_inbound(30.1 * S);
+        assert!(!live.watchdog_expired(90.0 * S));
     }
 
     #[test]
@@ -835,6 +1084,10 @@ mod tests {
         assert!(!watchdog_expired(64.9 * S, 0.0, Some(60.0 * S)));
         assert!(watchdog_expired(65.0 * S, 0.0, Some(60.0 * S)));
         assert!(watchdog_expired(600.0 * S, 0.0, Some(60.0 * S)));
+        // Same ladder from a message at 100 s: an unanswered ping past its
+        // grace isn't enough while the server was heard from < 65 s ago.
+        assert!(!watchdog_expired(164.9 * S, 100.0 * S, Some(130.0 * S)));
+        assert!(watchdog_expired(165.0 * S, 100.0 * S, Some(130.0 * S)));
     }
 
     #[test]
@@ -849,14 +1102,91 @@ mod tests {
     fn watchdog_needs_an_unanswered_ping_not_just_silence() {
         // Throttled background tab: timers fire late, so we're 70 s past the
         // last pong without having been allowed to ping again. Not dead.
-        assert!(!watchdog_expired(100.0 * S, 30.1 * S, Some(30.0 * S)));
+        let mut live = Liveness::new(0.0);
+        live.on_ping_sent(30.0 * S);
+        live.on_inbound(30.1 * S);
+        assert!(!live.watchdog_expired(100.0 * S));
         // Never pinged at all.
         assert!(!watchdog_expired(100.0 * S, 0.0, None));
+        // Once a ping goes out and stays unanswered, it is.
+        live.on_ping_sent(100.0 * S);
+        assert!(!live.watchdog_expired(104.9 * S));
+        assert!(live.watchdog_expired(105.0 * S));
     }
 
     #[test]
     fn watchdog_survives_the_clock_going_backwards() {
         assert!(!watchdog_expired(10.0 * S, 100.0 * S, Some(101.0 * S)));
+    }
+
+    #[test]
+    fn watchdog_orders_a_ping_and_a_message_in_the_same_millisecond() {
+        // #29, the `>` vs `>=` mutant: the old check compared stamps
+        // (`sent > last_inbound`), so a ping and a message stamped with the
+        // same millisecond were ambiguous. Liveness goes by event order.
+        let t = 1_000.0 * S;
+        let later = t + WATCHDOG_TIMEOUT_MS;
+        // Message, then ping: the message can't be that ping's answer.
+        let mut live = Liveness::new(0.0);
+        live.on_inbound(t);
+        live.on_ping_sent(t);
+        assert!(live.watchdog_expired(later));
+        // Ping, then message: answered.
+        let mut live = Liveness::new(0.0);
+        live.on_ping_sent(t);
+        live.on_inbound(t);
+        assert!(!live.watchdog_expired(later));
+    }
+
+    #[test]
+    fn tab_return_probe_pings_first_and_any_answer_keeps_the_socket() {
+        let mut live = Liveness::new(0.0);
+        live.on_inbound(10.0 * S);
+        assert_eq!(live.begin_probe(20.0 * S), ProbeStep::SendPing);
+        live.on_ping_sent(20.0 * S);
+        assert!(live.probe_unanswered());
+        // The pong (or any other message) beats the probe timer.
+        live.on_inbound(20.05 * S);
+        assert!(!live.probe_unanswered());
+        // The next tab switch probes afresh.
+        assert_eq!(live.begin_probe(40.0 * S), ProbeStep::SendPing);
+    }
+
+    #[test]
+    fn tab_return_probe_without_an_answer_reconnects() {
+        let mut live = Liveness::new(0.0);
+        assert_eq!(live.begin_probe(5.0 * S), ProbeStep::SendPing);
+        live.on_ping_sent(5.0 * S);
+        // The probe timer fires and nothing has arrived.
+        assert!(live.probe_unanswered());
+    }
+
+    #[test]
+    fn tab_return_probe_is_not_restarted_while_it_waits() {
+        // visibilitychange twice in a row: one ping, one deadline.
+        let mut live = Liveness::new(0.0);
+        assert!(!live.probe_unanswered());
+        assert_eq!(live.begin_probe(1.0 * S), ProbeStep::SendPing);
+        assert_eq!(live.begin_probe(1.5 * S), ProbeStep::AlreadyProbing);
+        assert!(live.probe_unanswered());
+    }
+
+    #[test]
+    fn tab_return_after_a_long_silence_reconnects_without_waiting() {
+        // The page was frozen (iOS resume, laptop lid): don't wait on a pong
+        // that probably won't come.
+        let mut live = Liveness::new(0.0);
+        live.on_inbound(100.0 * S);
+        let mut just_in_time = live;
+        assert_eq!(
+            just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0),
+            ProbeStep::SendPing
+        );
+        assert_eq!(
+            live.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS),
+            ProbeStep::Reconnect
+        );
+        assert!(!live.probe_unanswered());
     }
 
     #[test]
@@ -869,21 +1199,21 @@ mod tests {
     #[test]
     fn failures_back_off_and_an_open_resets_them() {
         let mut lc = Lifecycle::new();
-        let g1 = lc.begin_attempt();
+        let g1 = lc.begin_attempt(0.0);
         assert_eq!(lc.attempt_status(), ConnectionStatus::Connecting);
         assert_eq!(lc.on_closed(g1), Some(1_000));
         assert!(lc.should_retry(g1));
 
-        let g2 = lc.begin_attempt();
+        let g2 = lc.begin_attempt(1.0 * S);
         assert_eq!(lc.attempt_status(), ConnectionStatus::Reconnecting(1));
         assert_eq!(lc.on_closed(g2), Some(2_000));
 
-        let g3 = lc.begin_attempt();
+        let g3 = lc.begin_attempt(3.0 * S);
         assert_eq!(lc.attempt_status(), ConnectionStatus::Reconnecting(2));
         assert_eq!(lc.on_closed(g3), Some(4_000));
 
         // Server is back.
-        let g4 = lc.begin_attempt();
+        let g4 = lc.begin_attempt(7.0 * S);
         assert!(lc.on_open(g4));
         assert_eq!(lc.phase, Phase::Open);
         // The next drop starts the ladder over at 1 s.
@@ -896,7 +1226,7 @@ mod tests {
         // Every close of the current connection must lead to a retry that
         // actually fires, however many attempts fail, until one opens.
         let mut lc = Lifecycle::new();
-        let mut g = lc.begin_attempt();
+        let mut g = lc.begin_attempt(0.0);
         assert!(lc.on_open(g));
         for attempt in 1..=10 {
             assert!(
@@ -907,7 +1237,7 @@ mod tests {
                 lc.should_retry(g),
                 "attempt {attempt}: retry timer would not fire"
             );
-            g = lc.begin_attempt();
+            g = lc.begin_attempt(f64::from(attempt) * 30.0 * S);
             assert_eq!(lc.attempt_status(), ConnectionStatus::Reconnecting(attempt));
         }
         assert!(lc.on_open(g));
@@ -921,10 +1251,10 @@ mod tests {
         // loop is still winding down. When 1 finally ends it must not schedule
         // a reconnect or touch the backoff, and 2 stays open.
         let mut lc = Lifecycle::new();
-        let old = lc.begin_attempt();
+        let old = lc.begin_attempt(0.0);
         assert!(lc.on_open(old));
-        assert!(lc.request_forced_reconnect());
-        let new = lc.begin_attempt();
+        assert_eq!(lc.on_wake(Wake::Restored, 60.0 * S), WakeAction::Reconnect);
+        let new = lc.begin_attempt(60.0 * S);
         assert!(lc.on_open(new));
 
         assert_eq!(lc.on_closed(old), None);
@@ -937,8 +1267,8 @@ mod tests {
     #[test]
     fn stale_socket_opening_late_does_not_claim_the_connection() {
         let mut lc = Lifecycle::new();
-        let old = lc.begin_attempt();
-        let new = lc.begin_attempt();
+        let old = lc.begin_attempt(0.0);
+        let new = lc.begin_attempt(0.0);
         assert!(!lc.on_open(old));
         assert_eq!(lc.phase, Phase::Connecting);
         assert!(lc.on_open(new));
@@ -947,11 +1277,11 @@ mod tests {
     #[test]
     fn backoff_timer_is_dropped_once_something_newer_started() {
         let mut lc = Lifecycle::new();
-        let g1 = lc.begin_attempt();
+        let g1 = lc.begin_attempt(0.0);
         assert!(lc.on_closed(g1).is_some());
         // The user comes back before the timer fires.
-        assert!(lc.request_forced_reconnect());
-        let g2 = lc.begin_attempt();
+        assert_eq!(lc.on_wake(Wake::Visible, 0.5 * S), WakeAction::Reconnect);
+        let g2 = lc.begin_attempt(0.5 * S);
         assert!(!lc.should_retry(g1));
         // Even once g2 is in backoff itself, g1's old timer stays dead.
         assert!(lc.on_closed(g2).is_some());
@@ -962,32 +1292,95 @@ mod tests {
     #[test]
     fn retry_only_fires_from_backoff() {
         let mut lc = Lifecycle::new();
-        let g = lc.begin_attempt();
+        let g = lc.begin_attempt(0.0);
         assert!(!lc.should_retry(g)); // still connecting
         assert!(lc.on_open(g));
         assert!(!lc.should_retry(g)); // open
     }
 
     #[test]
-    fn forced_reconnect_waits_for_an_attempt_in_flight() {
+    fn wake_leaves_a_young_attempt_alone() {
         let mut lc = Lifecycle::new();
-        let g = lc.begin_attempt();
-        // visibilitychange + pageshow back to back while connecting.
-        assert!(!lc.request_forced_reconnect());
+        let started = 10.0 * S;
+        let g = lc.begin_attempt(started);
+        // The first load's pageshow, or visibilitychange + pageshow back to
+        // back: the attempt one of them just started stays.
+        assert_eq!(lc.on_wake(Wake::Visible, started), WakeAction::Nothing);
+        assert_eq!(
+            lc.on_wake(Wake::Restored, started + CONNECT_PREEMPT_MS - 1.0),
+            WakeAction::Nothing
+        );
+        assert_eq!(lc.phase, Phase::Connecting);
         assert!(lc.on_open(g));
-        assert!(lc.request_forced_reconnect());
     }
 
     #[test]
-    fn forced_reconnect_restarts_the_backoff() {
+    fn wake_preempts_an_attempt_stuck_connecting() {
+        // #29: after an iOS resume a hung config fetch or open used to hold
+        // things for up to 2 x CONNECT_TIMEOUT_MS.
+        let mut lc = Lifecycle::new();
+        for _ in 0..3 {
+            let g = lc.begin_attempt(0.0);
+            lc.on_closed(g);
+        }
+        let hung = lc.begin_attempt(10.0 * S);
+        let now = 10.0 * S + CONNECT_PREEMPT_MS;
+        assert_eq!(lc.on_wake(Wake::Visible, now), WakeAction::Reconnect);
+        // A fresh attempt with a fresh backoff.
+        let next = lc.begin_attempt(now);
+        assert_eq!(lc.attempt_status(), ConnectionStatus::Connecting);
+        // The hung attempt is stale now: a late open or failure does nothing.
+        assert!(!lc.on_open(hung));
+        assert_eq!(lc.on_closed(hung), None);
+        // The new attempt is young, so an immediate second wake leaves it be.
+        assert_eq!(lc.on_wake(Wake::Restored, now + 1.0), WakeAction::Nothing);
+        assert!(lc.on_open(next));
+    }
+
+    #[test]
+    fn wake_on_an_open_socket_probes_a_tab_switch_but_reconnects_a_restore() {
+        let mut lc = Lifecycle::new();
+        let g = lc.begin_attempt(0.0);
+        assert!(lc.on_open(g));
+        // Desktop tab switch: ping first, the socket stays current meanwhile.
+        assert_eq!(lc.on_wake(Wake::Visible, 60.0 * S), WakeAction::Probe);
+        assert_eq!(lc.phase, Phase::Open);
+        assert!(lc.is_current(g));
+        // Restored from the back/forward cache: frozen, reconnect.
+        assert_eq!(lc.on_wake(Wake::Restored, 60.0 * S), WakeAction::Reconnect);
+    }
+
+    #[test]
+    fn ios_wake_pair_reconnects_once_in_either_order() {
+        for pair in [
+            [Wake::Visible, Wake::Restored],
+            [Wake::Restored, Wake::Visible],
+        ] {
+            let mut lc = Lifecycle::new();
+            let g = lc.begin_attempt(0.0);
+            assert!(lc.on_open(g));
+            let t = 600.0 * S;
+            let mut reconnects = 0;
+            for wake in pair {
+                if lc.on_wake(wake, t) == WakeAction::Reconnect {
+                    reconnects += 1;
+                    lc.begin_attempt(t);
+                }
+            }
+            assert_eq!(reconnects, 1, "{pair:?}");
+        }
+    }
+
+    #[test]
+    fn wake_in_backoff_retries_now_and_restarts_the_backoff() {
         let mut lc = Lifecycle::new();
         for _ in 0..4 {
-            let g = lc.begin_attempt();
+            let g = lc.begin_attempt(0.0);
             lc.on_closed(g);
         }
         assert_eq!(lc.failures, 4);
-        assert!(lc.request_forced_reconnect());
-        let g = lc.begin_attempt();
+        assert_eq!(lc.on_wake(Wake::Visible, 0.0), WakeAction::Reconnect);
+        let g = lc.begin_attempt(0.0);
         assert_eq!(lc.attempt_status(), ConnectionStatus::Connecting);
         assert_eq!(lc.on_closed(g), Some(1_000));
     }
@@ -995,13 +1388,129 @@ mod tests {
     #[test]
     fn stop_makes_everything_stale_for_good() {
         let mut lc = Lifecycle::new();
-        let g = lc.begin_attempt();
+        let earlier = lc.begin_attempt(0.0);
+        let g = lc.begin_attempt(0.0);
         assert!(lc.on_closed(g).is_some());
         lc.stop();
+        // No generation ever handed out is current again.
+        assert!(!lc.is_current(earlier));
+        assert!(!lc.is_current(g));
         assert!(!lc.should_retry(g));
         assert!(!lc.on_open(g));
         assert_eq!(lc.on_closed(g), None);
-        assert!(!lc.request_forced_reconnect());
+        assert_eq!(lc.on_wake(Wake::Visible, 0.0), WakeAction::Nothing);
+        assert_eq!(lc.on_wake(Wake::Restored, 3_600.0 * S), WakeAction::Nothing);
+    }
+
+    #[test]
+    fn a_new_attempt_supersedes_the_old_socket_and_its_open_replaces_the_sender() {
+        // #29, the "connect() keeps the old sender" mutant: a new attempt that
+        // kept connection 1's sender and closer would leave connection 1
+        // alive next to connection 2, still taking requests.
+        let mut state = WsState::new();
+        let (g1, _, closer1) = state.begin_attempt(0.0);
+        let (tx1, mut rx1) = mpsc::unbounded();
+        assert!(state.on_open(g1, tx1));
+        assert!(state.queue(Outbound::Frame(vec![1])));
+        assert_eq!(
+            rx1.next().now_or_never(),
+            Some(Some(Outbound::Frame(vec![1])))
+        );
+
+        let (g2, _, _closer2) = state.begin_attempt(60.0 * S);
+        // Connection 1's task sees both signals: its closer fires and its
+        // queue ends.
+        assert!(closer1.now_or_never().is_some());
+        assert_eq!(rx1.next().now_or_never(), Some(None));
+        // Nothing can be queued while connection 2 connects,
+        assert!(!state.queue(Outbound::Frame(vec![2])));
+        // a late open of connection 1 can't claim the queue back,
+        let (stale_tx, _stale_rx) = mpsc::unbounded();
+        assert!(!state.on_open(g1, stale_tx));
+        assert!(!state.queue(Outbound::Frame(vec![2])));
+        // and once connection 2 opens, requests go to it.
+        let (tx2, mut rx2) = mpsc::unbounded();
+        assert!(state.on_open(g2, tx2));
+        assert!(state.queue(Outbound::Frame(vec![3])));
+        assert_eq!(
+            rx2.next().now_or_never(),
+            Some(Some(Outbound::Frame(vec![3])))
+        );
+    }
+
+    #[test]
+    fn a_tab_switch_probes_the_open_socket_or_reconnects_without_one() {
+        let mut state = WsState::new();
+        let (g, _, _closer) = state.begin_attempt(0.0);
+        let (tx, mut rx) = mpsc::unbounded();
+        assert!(state.on_open(g, tx));
+        assert_eq!(state.on_wake(Wake::Visible, 60.0 * S), WakeAction::Probe);
+        assert_eq!(rx.next().now_or_never(), Some(Some(Outbound::Probe)));
+        // The socket's task is gone but hasn't reported yet: nobody would
+        // answer a probe, so reconnect instead.
+        drop(rx);
+        assert_eq!(
+            state.on_wake(Wake::Visible, 61.0 * S),
+            WakeAction::Reconnect
+        );
+    }
+
+    #[test]
+    fn a_raw_oneshot_receiver_is_terminated_as_soon_as_its_sender_drops() {
+        // Why `Closer` is fused (#29): `select!` skips terminated branches,
+        // and a bare receiver counts as terminated the moment its sender is
+        // dropped, before anyone has seen the drop.
+        let (tx, rx) = oneshot::channel::<()>();
+        assert!(!rx.is_terminated());
+        drop(tx);
+        assert!(rx.is_terminated());
+        // A `Closer` stays live until it has actually reported the drop.
+        let (tx, mut closer) = closer_channel();
+        drop(tx);
+        assert!(!closer.is_terminated());
+        assert!((&mut closer).now_or_never().is_some());
+        assert!(closer.is_terminated());
+    }
+
+    #[test]
+    fn dropping_the_closer_supersedes_an_attempt_in_flight() {
+        // #29: this is how `release_socket()` supersedes an attempt that's
+        // still fetching its config or opening its socket. With a bare
+        // receiver, the closer's branch is skipped and the attempt carries on
+        // until its own timeout.
+        let (closer_tx, mut closer) = closer_channel();
+        let mut attempt = Box::pin(race(pending::<()>(), pending::<()>(), &mut closer));
+        assert!(attempt.as_mut().now_or_never().is_none());
+        drop(closer_tx);
+        assert!(matches!(
+            attempt.as_mut().now_or_never(),
+            Some(Race::Superseded)
+        ));
+    }
+
+    #[test]
+    fn a_closer_dropped_before_the_race_still_supersedes_it() {
+        // Superseded between two steps (config fetched, socket not yet
+        // opened): the next step must still see it.
+        let (closer_tx, mut closer) = closer_channel();
+        drop(closer_tx);
+        let step = race(pending::<()>(), pending::<()>(), &mut closer).now_or_never();
+        assert!(matches!(step, Some(Race::Superseded)));
+    }
+
+    #[test]
+    fn race_reports_the_result_or_the_timeout_and_a_supersede_wins() {
+        let (_closer_tx, mut closer) = closer_channel();
+        let done = race(ready(7), pending::<()>(), &mut closer).now_or_never();
+        assert!(matches!(done, Some(Race::Done(7))));
+        let timed_out = race(pending::<u8>(), ready(()), &mut closer).now_or_never();
+        assert!(matches!(timed_out, Some(Race::TimedOut)));
+        // Everything ready at once: the supersede wins, so a superseded
+        // attempt never goes on to touch shared state.
+        let (closer_tx, mut closer) = closer_channel();
+        drop(closer_tx);
+        let all = race(ready(7), ready(()), &mut closer).now_or_never();
+        assert!(matches!(all, Some(Race::Superseded)));
     }
 
     #[test]
