@@ -83,7 +83,7 @@ enum Commands {
 enum Press {
     /// A click: `press_on`, then `press_off`
     Single,
-    /// Two clicks
+    /// A double click: `press_double` (or two clicks, if there's none)
     Double,
     /// A press still held: `press_on_long` (or `press_on`)
     Long,

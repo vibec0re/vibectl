@@ -11,13 +11,30 @@ name = "Bedroom Lights Controller"
 # Bind a button to one controller only, or one press runs two actions.
 button = "switch_hallway"
 
-# Each action is [command, target, amount]. The commands are on, off, inc,
-# dec and set; inc/dec take a step (default 10), set takes a level (default
-# 50). The target is a light or a light group. `on` restores the group's last
-# level.
-press_on = ["on", "virtual_bedroom_lights"]
-press_off = ["off", "virtual_bedroom_lights"]
+# Each action is [command, target, amount]. The commands are toggle, on, off,
+# inc, dec and set; inc/dec take a step (default 10), set takes a level
+# (default 50). The target is a light or a light group. `on` restores the
+# group's last level, and `off` keeps it for the next `on`. `toggle` is `off`
+# when the target is lit and `on` when it isn't.
+#
+# What runs for each gesture (`v1bectl_cli button switch_hallway --press
+# single|double|long` makes one on the dummy):
+# - a click: press_on as the button goes down, then press_off as it comes
+#   back up;
+# - a double click: press_double, or two clicks if there's none;
+# - a long press: press_on_long (press_on if there's none), while the button
+#   is still held. press_off_long is accepted, but nothing runs it yet: no
+#   hub reports the end of a long press.
+#
+# A click toggles the lights. press_off is left out: a toggle has nothing to
+# do on the way back up. (`on` on press_on with `off` on press_off would be
+# hold-to-light instead: lit only while the button is down, so a click turns
+# them on and straight back off.)
+press_on = ["toggle", "virtual_bedroom_lights"]
 
-# Long presses are accepted, but not detected yet.
+# A double click goes straight to full brightness, from off or from any
+# level. Without it, a double click would be two toggles, which cancel out.
+press_double = ["set", "virtual_bedroom_lights", 100]
+
+# A long press turns them up a step (and on, if they were off).
 press_on_long = ["inc", "virtual_bedroom_lights", 10]
-press_off_long = ["dec", "virtual_bedroom_lights", 10]

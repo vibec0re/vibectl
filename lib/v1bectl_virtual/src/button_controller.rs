@@ -11,11 +11,12 @@ use v1bectl_sync::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonCommand {
-    Inc, // Increment brightness
-    Dec, // Decrement brightness
-    Set, // Set specific value
-    On,  // Turn on
-    Off, // Turn off
+    Inc,    // Increment brightness
+    Dec,    // Decrement brightness
+    Set,    // Set specific value
+    On,     // Turn on
+    Off,    // Turn off
+    Toggle, // Off if lit, else on (#35)
 }
 
 impl ButtonCommand {
@@ -26,6 +27,7 @@ impl ButtonCommand {
             "set" => Some(Self::Set),
             "on" => Some(Self::On),
             "off" => Some(Self::Off),
+            "toggle" => Some(Self::Toggle),
             _ => None,
         }
     }
@@ -71,6 +73,17 @@ impl ButtonAction {
     }
 
     /// The state this action moves a light at `light` to.
+    ///
+    /// `on` keeps the light's level, and lights it at 100 if it has none
+    /// (0 or unknown). `off` keeps the level too, so the next `on` restores
+    /// it (#34). `toggle` is `off` for a lit light and `on` for any other.
+    /// Lit means on at a level above 0: a light that's on at 0 shows
+    /// nothing, so a toggle lights it instead of switching it off (the same
+    /// rule a group reads its members by, #34).
+    ///
+    /// It's pure: the manager hands it the target's state and writes the
+    /// result back under one hold of its lock, so two toggles in a row each
+    /// start from what the other left.
     #[must_use]
     pub fn apply(&self, mut light: LightState) -> LightState {
         match self.command {
@@ -93,17 +106,25 @@ impl ButtonAction {
                 light.brightness = Some(brightness);
                 light.is_on = brightness > 0;
             }
-            ButtonCommand::On => {
-                light.is_on = true;
-                if light.brightness.unwrap_or(0) == 0 {
-                    light.brightness = Some(100);
+            ButtonCommand::On => turn_on(&mut light),
+            ButtonCommand::Off => light.is_on = false,
+            ButtonCommand::Toggle => {
+                if light.is_on && light.brightness != Some(0) {
+                    light.is_on = false;
+                } else {
+                    turn_on(&mut light);
                 }
-            }
-            ButtonCommand::Off => {
-                light.is_on = false;
             }
         }
         light
+    }
+}
+
+/// `on`: lit, at its level, or at 100 if it has none.
+fn turn_on(light: &mut LightState) {
+    light.is_on = true;
+    if light.brightness.unwrap_or(0) == 0 {
+        light.brightness = Some(100);
     }
 }
 
@@ -179,12 +200,13 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
 
 /// Button Controller: runs its actions when its button is pressed.
 ///
-/// It has an action for each edge of a press, and one for a long press:
-/// `press_on` runs when the button goes down (a press), `press_off` when it
-/// comes back up (a release), and `press_on_long`, in place of `press_on`,
-/// for a press the hub reports as held (a long press). `press_off_long` is
-/// accepted and checked, but nothing runs it yet: no event source reports
-/// the end of a long press. A missing or empty action does nothing.
+/// It has an action for each edge of a press, and one for each gesture a
+/// hub can recognise: `press_on` runs when the button goes down (a press),
+/// `press_off` when it comes back up (a release), `press_double` for a
+/// double press, and `press_on_long`, in place of `press_on`, for a press
+/// the hub reports as held (a long press). `press_off_long` is accepted and
+/// checked, but nothing runs it yet: no event source reports the end of a
+/// long press. A missing or empty action does nothing.
 ///
 /// A press reaches it in one of two shapes, and each maps onto those
 /// actions like this (#35):
@@ -195,7 +217,7 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
 /// | switch echo, `is_pressed` `true` → `false` | the button came up | `press_off` |
 /// | switch echo that keeps `is_pressed` (a battery tick) | nothing | nothing |
 /// | `ButtonPressed { SinglePress }` | a click: down, then up | `press_on`, `press_off` |
-/// | `ButtonPressed { DoublePress }` | two clicks | `press_on`, `press_off`, `press_on`, `press_off` |
+/// | `ButtonPressed { DoublePress }` | a double click | `press_double` (if there's none: `press_on`, `press_off`, `press_on`, `press_off`) |
 /// | `ButtonPressed { LongPress }` | a press, still held | `press_on_long` (`press_on` if there's none) |
 ///
 /// The switch echo is the sync engine's `{"Switch": …}` state echo, and
@@ -208,23 +230,28 @@ fn pressed(event: &DeviceEvent) -> Option<bool> {
 ///   once the button is back up. It can't tell a click from a long press
 ///   before the release, or from a double press before the double-click
 ///   time is up. So a click has both edges, and runs both actions.
-/// - **A `DoublePress` is two clicks.** The hub folds them into one event,
-///   and a controller has no action of its own for that, so it runs what
-///   two clicks run. That's also what it would have run had the hub
-///   reported two `SinglePress`es, so the result doesn't hang on the hub's
-///   double-click timing. Ignoring it would drop two real presses.
+/// - **A `DoublePress` runs its own action.** The hub folds the two clicks
+///   into one event, so a controller can give it a meaning of its own.
+///   Without a `press_double`, it runs what two clicks run: that's what it
+///   would have run had the hub reported two `SinglePress`es, and ignoring
+///   it would drop two real presses. With a `toggle` click, that's two
+///   toggles, which cancel out: give a toggling controller a
+///   `press_double`.
 /// - **A `LongPress` is a press that's still held.** A hub reports it while
 ///   the button is still down, once it has been held long enough, and
 ///   never reports the release. So only the press edge runs, with the long
-///   action. Running a release action would make one up. With the shipped
-///   binding (`inc` on the long press, `dec` on its release) it would also
-///   undo the long press.
+///   action. Running a release action would make one up, and with an
+///   `inc` on the long press and a `dec` on its release it would also undo
+///   the long press.
 ///
 /// The event's `button_id` (which of the remote's buttons; `main` when the
 /// hub doesn't say) isn't matched: a controller binds a whole device.
 ///
-/// A pair like the shipped `on`/`off` is hold-to-light: the lights are on
-/// while the button is down. So a click turns them on and off again.
+/// What a click does is up to the actions. `toggle` on `press_on`, with no
+/// `press_off`, flips the lights with each click, as the shipped
+/// `button_ctrl.toml` does. A pair like `on` on `press_on` and `off` on
+/// `press_off` is hold-to-light instead: the lights are on while the
+/// button is down, so a click turns them on and off again.
 ///
 /// **One press fires once.** A remote can report one press both ways: as a
 /// `ButtonPressed` over the hub's event stream, and as an `is_pressed`
@@ -254,6 +281,7 @@ pub struct ButtonController {
     press_off_action: Option<ButtonAction>,
     press_on_long_action: Option<ButtonAction>,
     press_off_long_action: Option<ButtonAction>,
+    press_double_action: Option<ButtonAction>,
     /// Set once its button has reported a gesture (`ButtonPressed`). From
     /// then on, only those run anything, and its switch echoes don't (see
     /// the type's docs: one press fires once).
@@ -262,10 +290,11 @@ pub struct ButtonController {
 
 impl ButtonController {
     /// A controller for `button_id` that runs `press_on` on a press,
-    /// `press_off` on a release, and `press_on_long` on a long press (see
-    /// the type's docs for what runs when). Each is `[command, target,
-    /// amount]` (see [`ButtonAction::parse`]); a missing or empty one does
-    /// nothing, and a malformed one fails here, the long ones too.
+    /// `press_off` on a release, `press_on_long` on a long press and
+    /// `press_double` on a double press (see the type's docs for what runs
+    /// when). Each is `[command, target, amount]` (see
+    /// [`ButtonAction::parse`]); a missing or empty one does nothing, and a
+    /// malformed one fails here, the long and double ones too.
     ///
     /// It takes no store or event bus: the manager delivers its button's
     /// events and makes the writes (#16).
@@ -276,6 +305,7 @@ impl ButtonController {
         press_off: &[serde_json::Value],
         press_on_long: Option<&[serde_json::Value]>,
         press_off_long: Option<&[serde_json::Value]>,
+        press_double: Option<&[serde_json::Value]>,
     ) -> Result<Self, VirtualDeviceError> {
         let parse = |action: &[serde_json::Value]| {
             if action.is_empty() {
@@ -292,6 +322,7 @@ impl ButtonController {
             press_off_action: parse(press_off)?,
             press_on_long_action: parse(press_on_long.unwrap_or_default())?,
             press_off_long_action: parse(press_off_long.unwrap_or_default())?,
+            press_double_action: parse(press_double.unwrap_or_default())?,
             reports_gestures: AtomicBool::new(false),
         })
     }
@@ -312,7 +343,10 @@ impl ButtonController {
         let click = [self.edge(true), self.edge(false)];
         match press_type {
             ButtonPressType::SinglePress => click.into_iter().flatten().collect(),
-            ButtonPressType::DoublePress => click.into_iter().chain(click).flatten().collect(),
+            ButtonPressType::DoublePress => match &self.press_double_action {
+                Some(double) => vec![double],
+                None => click.into_iter().chain(click).flatten().collect(),
+            },
             ButtonPressType::LongPress => self
                 .press_on_long_action
                 .as_ref()
@@ -390,6 +424,7 @@ impl VirtualDevice for ButtonController {
             &self.press_off_action,
             &self.press_on_long_action,
             &self.press_off_long_action,
+            &self.press_double_action,
         ]
         .into_iter()
         .flatten()
@@ -581,5 +616,95 @@ mod tests {
         for (case, event, want) in cases {
             assert_eq!(pressed(&event), want, "{case}");
         }
+    }
+
+    fn light(is_on: bool, brightness: Option<u8>) -> LightState {
+        LightState {
+            is_on,
+            brightness,
+            color_temp: Some(2700),
+            rgb_color: Some(v1bectl_sync::RgbColor {
+                r: 255,
+                g: 128,
+                b: 0,
+            }),
+        }
+    }
+
+    fn action(value: &Value) -> ButtonAction {
+        ButtonAction::parse(value.as_array().expect("action")).expect("parse")
+    }
+
+    /// #35 review, finding 1: `toggle` switches a lit light off and any
+    /// other on, and keeps everything else. Off keeps the level, so the
+    /// next toggle lights it there (#34); one with no level comes on at
+    /// 100. A light that's on at 0 isn't lit, so a toggle lights it.
+    #[test]
+    fn toggle_switches_a_lit_light_off_and_any_other_on_at_its_level() {
+        let toggle = action(&json!(["TOGGLE", "g"]));
+        assert_eq!(
+            (toggle.command, toggle.target.as_str(), toggle.amount),
+            (ButtonCommand::Toggle, "g", None),
+            "parsed, in any case"
+        );
+        for (case, from, want) in [
+            ("on", light(true, Some(75)), light(false, Some(75))),
+            (
+                "off at its level",
+                light(false, Some(75)),
+                light(true, Some(75)),
+            ),
+            ("off, no level", light(false, None), light(true, Some(100))),
+            ("off at 0", light(false, Some(0)), light(true, Some(100))),
+            (
+                "on at 0: unlit",
+                light(true, Some(0)),
+                light(true, Some(100)),
+            ),
+            ("on, no level", light(true, None), light(false, None)),
+        ] {
+            assert_eq!(toggle.apply(from), want, "toggle from {case}");
+        }
+    }
+
+    /// #35 review, finding 1: two toggles give the state they started from,
+    /// on or off, level and colour included.
+    #[test]
+    fn two_toggles_give_back_the_state_they_started_from() {
+        let toggle = action(&json!(["toggle", "g"]));
+        for from in [light(true, Some(75)), light(false, Some(40))] {
+            let once = toggle.apply(from.clone());
+            assert_ne!(once.is_on, from.is_on, "one toggle of {from:?}");
+            assert_eq!(toggle.apply(once), from, "two toggles of {from:?}");
+        }
+    }
+
+    /// #35: `press_double` is parsed when the controller is made, like the
+    /// others, so a malformed one fails `new`.
+    #[test]
+    fn a_malformed_double_action_fails_new() {
+        let config = VirtualDeviceConfig {
+            device_id: "ctrl".to_string(),
+            device_type: VirtualDeviceType::ButtonController,
+            name: "ctrl".to_string(),
+            description: None,
+            enabled: true,
+            config: json!({}),
+        };
+        let press_on = [json!("toggle"), json!("a")];
+        let double = [json!("flip"), json!("a")];
+        let made = ButtonController::new(
+            config,
+            "btn".to_string(),
+            &press_on,
+            &[],
+            None,
+            None,
+            Some(&double),
+        );
+        assert!(
+            matches!(made, Err(VirtualDeviceError::Config(ref e)) if e.contains("flip")),
+            "made a controller with a double action it can't run"
+        );
     }
 }

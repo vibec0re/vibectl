@@ -63,13 +63,19 @@ impl Default for LightGroupLinearSettings {
 pub struct ButtonControllerConfig {
     pub device_id: String,
     pub name: String,
-    pub button: String,                    // Button device ID to listen to
-    pub press_on: Vec<serde_json::Value>,  // [cmd, device_id, ...params]
-    pub press_off: Vec<serde_json::Value>, // [cmd, device_id, ...params]
+    pub button: String,                   // Button device ID to listen to
+    pub press_on: Vec<serde_json::Value>, // [cmd, device_id, ...params]
+    /// The release, `[cmd, device_id, ...params]`: absent or `[]` for none,
+    /// as a `toggle` click has (#35).
+    #[serde(default)]
+    pub press_off: Vec<serde_json::Value>,
     #[serde(default)]
     pub press_on_long: Option<Vec<serde_json::Value>>, // Optional long press
     #[serde(default)]
     pub press_off_long: Option<Vec<serde_json::Value>>, // Optional long press off
+    /// A double press (#35). Without one, it runs two clicks.
+    #[serde(default)]
+    pub press_double: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -209,4 +215,46 @@ fn load_virtual_device_from_file(path: &Path) -> anyhow::Result<VirtualDeviceTom
     let content = fs::read_to_string(path)?;
     let config: VirtualDeviceTomlConfig = toml::from_str(&content)?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn controller(actions: &str) -> ButtonControllerConfig {
+        let toml = format!(
+            "type = \"button_controller\"\ndevice_id = \"ctrl\"\nname = \"Ctrl\"\nbutton = \"btn\"\n{actions}"
+        );
+        match toml::from_str(&toml) {
+            Ok(VirtualDeviceTomlConfig::ButtonController(c)) => c,
+            other => panic!("not a button controller: {other:?}\n{toml}"),
+        }
+    }
+
+    /// #35 review, finding 1: a controller that toggles has nothing to do
+    /// on a release, so `press_off` may be left out or empty. `press_double`
+    /// is optional too.
+    #[test]
+    fn press_off_and_press_double_may_be_absent_or_empty() {
+        let toggle = vec![serde_json::json!("toggle"), serde_json::json!("g")];
+        for (case, actions) in [
+            ("absent", "press_on = [\"toggle\", \"g\"]"),
+            ("empty", "press_on = [\"toggle\", \"g\"]\npress_off = []"),
+        ] {
+            let c = controller(actions);
+            assert_eq!(c.press_on, toggle, "{case}");
+            assert!(c.press_off.is_empty(), "{case}: {:?}", c.press_off);
+            assert_eq!(c.press_double, None, "{case}");
+        }
+
+        let c = controller("press_on = [\"toggle\", \"g\"]\npress_double = [\"set\", \"g\", 100]");
+        assert_eq!(
+            c.press_double,
+            Some(vec![
+                serde_json::json!("set"),
+                serde_json::json!("g"),
+                serde_json::json!(100)
+            ])
+        );
+    }
 }

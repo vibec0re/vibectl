@@ -116,8 +116,13 @@ async fn shipped_virtual_devices_only_reference_dummy_devices() {
                 }
                 let actions = [Some(&c.press_on), Some(&c.press_off)]
                     .into_iter()
-                    .chain([c.press_on_long.as_ref(), c.press_off_long.as_ref()])
-                    .flatten();
+                    .chain([
+                        c.press_on_long.as_ref(),
+                        c.press_off_long.as_ref(),
+                        c.press_double.as_ref(),
+                    ])
+                    .flatten()
+                    .filter(|action| !action.is_empty());
                 for action in actions {
                     let Some(target) = action.get(1).and_then(|v| v.as_str()) else {
                         dangling.push(format!("{id}: action without a target: {action:?}"));
@@ -267,6 +272,7 @@ async fn shipped_home() -> ShippedHome {
             &c.press_off,
             c.press_on_long.as_deref(),
             c.press_off_long.as_deref(),
+            c.press_double.as_deref(),
         )
         .unwrap_or_else(|e| panic!("{}: {e}", c.device_id));
         manager
@@ -347,22 +353,29 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
             .group_members
             .get(target)
             .unwrap_or_else(|| panic!("{}: {target} isn't a shipped group", c.device_id));
-        // Every member off first, so lighting them is the press's doing.
-        for member in members {
-            store
-                .update_device_state(
-                    member,
-                    DeviceStateValue::Light(LightState {
-                        is_on: false,
-                        brightness: Some(0),
-                        color_temp: None,
-                        rgb_color: None,
-                    }),
-                )
-                .await
-                .unwrap();
-        }
+        // The group and every member off first, so lighting them is the
+        // press's doing. Through the group, as a client switches it off:
+        // a toggle goes by the group's state, and the group must read off.
         let mut rx = bus.subscribe();
+        let DeviceStateValue::Light(group) =
+            store.get_device(&target.to_string()).await.unwrap().state
+        else {
+            panic!("{target} isn't a light");
+        };
+        home.manager
+            .set_virtual_device_state(
+                &target.to_string(),
+                DeviceStateValue::Light(LightState {
+                    is_on: false,
+                    ..group
+                }),
+            )
+            .await
+            .expect("group off");
+        home.pump(&mut rx).await;
+        for member in members {
+            assert!(!home.light(member).await.0, "{member} is still on");
+        }
 
         // The press, as the sync engine reports it: stored, and echoed.
         let pressed = DeviceStateValue::Switch(SwitchState {
@@ -402,13 +415,17 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
 }
 
 /// #35: the shipped controller follows the gestures a hub reports whole
-/// (`ButtonPressed`), against the dummy. Its binding is `press_on = on`,
-/// `press_off = off` and `press_on_long = inc 10`, on Bedroom Lights, which
-/// starts on at 75 (the dummy's kitchen light).
-/// - A click is a press and a release: the group goes on, then off, and so
-///   does every member. It keeps its level.
-/// - A long press runs `inc 10` only: the group and every member come back
-///   on, a step brighter.
+/// (`ButtonPressed`), against the dummy. Its binding is `press_on = toggle`
+/// with no `press_off`, `press_double = set 100` and `press_on_long = inc
+/// 10`, on Bedroom Lights, which starts on at 75 (the dummy's kitchen
+/// light).
+/// - A click toggles: the group goes off and keeps its level, and so does
+///   every member. The next click lights them again, at that level (#35
+///   review, finding 1: a click used to run `on` then `off`, so it always
+///   ended off).
+/// - A long press runs `inc 10` only: the group goes a step brighter.
+/// - A double press runs `set 100` once: full brightness, every member on.
+///   Two clicks' worth of toggles would have cancelled out.
 #[tokio::test]
 async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
     const GROUP: &str = "virtual_bedroom_lights";
@@ -416,16 +433,19 @@ async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
     let [c] = home.controllers.as_slice() else {
         panic!("one shipped controller: {:?}", home.controllers);
     };
+    let action = |value: serde_json::Value| Some(value.as_array().cloned().unwrap());
     assert_eq!(
-        (&c.press_on, &c.press_off, &c.press_on_long),
         (
-            &vec![serde_json::json!("on"), serde_json::json!(GROUP)],
-            &vec![serde_json::json!("off"), serde_json::json!(GROUP)],
-            &Some(vec![
-                serde_json::json!("inc"),
-                serde_json::json!(GROUP),
-                serde_json::json!(10)
-            ]),
+            Some(c.press_on.clone()),
+            Some(c.press_off.clone()).filter(|a| !a.is_empty()),
+            c.press_double.clone(),
+            c.press_on_long.clone(),
+        ),
+        (
+            action(serde_json::json!(["toggle", GROUP])),
+            None,
+            action(serde_json::json!(["set", GROUP, 100])),
+            action(serde_json::json!(["inc", GROUP, 10])),
         ),
         "the binding this test drives"
     );
@@ -441,21 +461,25 @@ async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
     };
     let mut rx = home.bus.subscribe();
 
-    home.bus.publish(report(ButtonPressType::SinglePress)).await;
-    let events = home.pump(&mut rx).await;
-    assert_eq!(
-        light_echoes(&events, GROUP),
-        vec![(true, Some(75)), (false, Some(75))],
-        "a click: on, then off"
-    );
-    assert_eq!(home.light(GROUP).await, (false, Some(75)));
-    for member in members {
-        let echoed: Vec<bool> = light_echoes(&events, member)
-            .into_iter()
-            .map(|(is_on, _)| is_on)
-            .collect();
-        assert_eq!(echoed, vec![true, false], "{member}: on, then off");
-        assert!(!home.light(member).await.0, "{member} is still on");
+    for (click, want) in [("one click", false), ("the next click", true)] {
+        home.bus.publish(report(ButtonPressType::SinglePress)).await;
+        let events = home.pump(&mut rx).await;
+        assert_eq!(
+            light_echoes(&events, GROUP),
+            vec![(want, Some(75))],
+            "{click}: one toggle, keeping the level"
+        );
+        assert_eq!(home.light(GROUP).await, (want, Some(75)), "{click}");
+        for member in members {
+            assert_eq!(home.light(member).await.0, want, "{click}: {member}");
+            // A member the dummy starts off (the living room) has nothing
+            // to echo on the first click.
+            let echoed = light_echoes(&events, member);
+            assert!(
+                echoed.iter().all(|(is_on, _)| *is_on == want),
+                "{click}: {member} echoed {echoed:?}"
+            );
+        }
     }
 
     home.bus.publish(report(ButtonPressType::LongPress)).await;
@@ -465,8 +489,16 @@ async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
         vec![(true, Some(85))],
         "a long press: inc 10, and nothing else"
     );
+
+    home.bus.publish(report(ButtonPressType::DoublePress)).await;
+    let events = home.pump(&mut rx).await;
+    assert_eq!(
+        light_echoes(&events, GROUP),
+        vec![(true, Some(100))],
+        "a double press: set 100, once"
+    );
     for member in members {
-        assert!(home.light(member).await.0, "{member} is still off");
+        assert!(home.light(member).await.0, "{member} is off");
     }
 }
 

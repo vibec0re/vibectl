@@ -1012,7 +1012,9 @@ mod tests {
     use v1bectl_sync::{
         Capability, DeviceId, DeviceType, GatewayError, GatewayHealth, SwitchState, SyncStatus,
     };
-    use v1bectl_virtual::{ButtonController, DummyGateway, LightGroupLinear};
+    use v1bectl_virtual::{
+        ButtonController, DummyGateway, LightGroupLinear, VirtualDeviceTomlConfig,
+    };
 
     const GROUP: &str = "virtual_bedroom_lights";
     /// (member, its brightness when the group is on at 50%): the linear
@@ -1418,32 +1420,42 @@ mod tests {
         assert!(echoes(&events, GROUP).is_empty(), "group re-echoed");
     }
 
-    /// The dummy's switch, bound to Bedroom Lights the way the shipped
-    /// `virtual_devices/button_ctrl.toml` binds it: `on` on a press, `off`
-    /// on a release, `inc 10` on a long press.
+    /// The shipped `virtual_devices/button_ctrl.toml`, read from the file
+    /// and registered the way `v1bectl_server` registers it: it binds the
+    /// dummy's switch to Bedroom Lights. `toggle` on a click, `set 100` on
+    /// a double press, `inc 10` on a long press.
     async fn add_shipped_controller(home: &Home) {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../virtual_devices");
+        let configs = v1bectl_virtual::load_virtual_devices_from_dir(&dir)
+            .await
+            .expect("load virtual_devices/");
+        let Some(c) = configs.into_iter().find_map(|config| match config {
+            VirtualDeviceTomlConfig::ButtonController(c)
+                if c.device_id == "ctrl_lightgroup_bed" =>
+            {
+                Some(c)
+            }
+            _ => None,
+        }) else {
+            panic!("button_ctrl.toml no longer ships ctrl_lightgroup_bed");
+        };
+        assert_eq!(c.button, SWITCH, "the button the shipped controller binds");
         let config = VirtualDeviceConfig {
-            device_id: "ctrl_lightgroup_bed".to_string(),
+            device_id: c.device_id.clone(),
             device_type: VirtualDeviceType::ButtonController,
-            name: "Bedroom Lights Controller".to_string(),
+            name: c.name.clone(),
             description: None,
             enabled: true,
             config: serde_json::json!({}),
         };
-        let [press_on, press_off, press_on_long, press_off_long] = [
-            serde_json::json!(["on", GROUP]),
-            serde_json::json!(["off", GROUP]),
-            serde_json::json!(["inc", GROUP, 10]),
-            serde_json::json!(["dec", GROUP, 10]),
-        ]
-        .map(|value| value.as_array().cloned().expect("action"));
         let controller = ButtonController::new(
             config,
-            SWITCH.to_string(),
-            &press_on,
-            &press_off,
-            Some(&press_on_long),
-            Some(&press_off_long),
+            c.button.clone(),
+            &c.press_on,
+            &c.press_off,
+            c.press_on_long.as_deref(),
+            c.press_off_long.as_deref(),
+            c.press_double.as_deref(),
         )
         .expect("controller");
         home.manager
@@ -1471,9 +1483,11 @@ mod tests {
     /// It's answered, its `ButtonPressed` goes on the bus, and the
     /// controller bound to the switch runs from there, as for a real
     /// remote. Bedroom Lights starts on at 75 (the dummy's kitchen light).
-    /// A click turns it on, then off, and its members with it. A long press
-    /// brings them back, at 85, and each member write is queued for the
-    /// gateway.
+    /// A click toggles it off, keeping 75, and its members with it (#35
+    /// review, finding 1: it used to run `on` then `off`, so a click always
+    /// ended off). The next click lights it again at 75. A long press takes
+    /// it to 85 and a double press to 100, and each member write is queued
+    /// for the gateway.
     #[tokio::test]
     async fn press_button_runs_the_controller_bound_to_the_dummy_switch() {
         let home = home().await;
@@ -1515,22 +1529,36 @@ mod tests {
         );
         assert_eq!(
             levels(&events, GROUP),
-            vec![(true, Some(75)), (false, Some(75))],
-            "a click: on, then off"
+            vec![(false, Some(75))],
+            "a click: toggled off, keeping the level"
         );
         assert_members_off(&home.store).await;
 
-        let response = press(&home.server, SWITCH, ButtonPressType::LongPress).await;
-        assert!(
-            matches!(response, ApiResponse::ButtonPressed { .. }),
-            "unexpected response: {response:?}"
-        );
-        let events = pump(&home, &mut rx).await;
-        assert_eq!(
-            levels(&events, GROUP),
-            vec![(true, Some(85))],
-            "a long press: inc 10"
-        );
+        for (press_type, want, case) in [
+            (
+                ButtonPressType::SinglePress,
+                (true, Some(75)),
+                "the next click: back on at 75",
+            ),
+            (
+                ButtonPressType::LongPress,
+                (true, Some(85)),
+                "a long press: inc 10",
+            ),
+            (
+                ButtonPressType::DoublePress,
+                (true, Some(100)),
+                "a double press: set 100",
+            ),
+        ] {
+            let response = press(&home.server, SWITCH, press_type).await;
+            assert!(
+                matches!(response, ApiResponse::ButtonPressed { .. }),
+                "unexpected response: {response:?}"
+            );
+            let events = pump(&home, &mut rx).await;
+            assert_eq!(levels(&events, GROUP), vec![want], "{case}");
+        }
         for (member, _) in MEMBERS_AT_50 {
             let state = light(&home.store, member).await;
             assert!(state.is_on, "{member} should be on: {state:?}");

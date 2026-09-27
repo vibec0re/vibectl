@@ -1000,17 +1000,17 @@ mod tests {
         press_off: serde_json::Value,
     ) -> ButtonController {
         let none = serde_json::json!([]);
-        let actions = [press_on, press_off, none.clone(), none];
+        let actions = [press_on, press_off, none.clone(), none.clone(), none];
         controller_with(device_id, button, actions)
     }
 
     /// A button controller `device_id` bound to `button`, with `actions`:
-    /// `[press_on, press_off, press_on_long, press_off_long]`, each `[]`
-    /// for none.
+    /// `[press_on, press_off, press_on_long, press_off_long,
+    /// press_double]`, each `[]` for none.
     fn controller_with(
         device_id: &str,
         button: &str,
-        actions: [serde_json::Value; 4],
+        actions: [serde_json::Value; 5],
     ) -> ButtonController {
         let config = VirtualDeviceConfig {
             device_id: device_id.to_string(),
@@ -1020,7 +1020,7 @@ mod tests {
             enabled: true,
             config: serde_json::json!({}),
         };
-        let [press_on, press_off, press_on_long, press_off_long] =
+        let [press_on, press_off, press_on_long, press_off_long, press_double] =
             actions.map(|value| value.as_array().cloned().expect("action"));
         ButtonController::new(
             config,
@@ -1029,6 +1029,7 @@ mod tests {
             &press_off,
             Some(&press_on_long),
             Some(&press_off_long),
+            Some(&press_double),
         )
         .expect("controller")
     }
@@ -1304,7 +1305,6 @@ mod tests {
             .add_virtual_device(Box::new(scene))
             .await
             .expect("register");
-
         assert_eq!(
             manager.dangling_references().await,
             vec![
@@ -1633,10 +1633,13 @@ mod tests {
 
     /// #35: each gesture a hub reports whole (`ButtonPressed`) runs the
     /// actions [`ButtonController`]'s table gives it, in order. Light `a`
-    /// starts on at 50, the press adds 20, the release takes 5 off, and the
-    /// long press sets 90, so each echo of `a` shows which action ran:
+    /// starts on at 50, the press adds 20, the release takes 5 off, the
+    /// long press sets 90 and the double press sets 30, so each echo of `a`
+    /// shows which action ran:
     /// - a click is a press and a release: 70, then 65;
-    /// - a double press is two clicks: 70, 65, 85, 80;
+    /// - a double press runs `press_double` alone: 30;
+    /// - a double press on a controller without a double action is two
+    ///   clicks: 70, 65, 85, 80;
     /// - a long press is a press still held: `press_on_long` only, 90. The
     ///   long release (`off`) never runs: nothing reports it;
     /// - a long press on a controller without a long action is the press
@@ -1645,17 +1648,24 @@ mod tests {
     async fn each_reported_gesture_runs_its_press_and_release_actions() {
         use ButtonPressType::{DoublePress, LongPress, SinglePress};
         let long = serde_json::json!(["set", "a", 90]);
+        let double = serde_json::json!(["set", "a", 30]);
         let none = serde_json::json!([]);
-        for (case, press_type, press_on_long, want) in [
-            ("a click", SinglePress, long.clone(), vec![70, 65]),
+        for (case, press_type, [press_on_long, press_double], want) in [
+            ("a click", SinglePress, [&long, &double], vec![70, 65]),
+            ("a double press", DoublePress, [&long, &double], vec![30]),
             (
-                "a double press",
+                "a double press, no double action",
                 DoublePress,
-                long.clone(),
+                [&long, &none],
                 vec![70, 65, 85, 80],
             ),
-            ("a long press", LongPress, long, vec![90]),
-            ("a long press, no long action", LongPress, none, vec![70]),
+            ("a long press", LongPress, [&long, &double], vec![90]),
+            (
+                "a long press, no long action",
+                LongPress,
+                [&none, &double],
+                vec![70],
+            ),
         ] {
             let store = StateStore::new();
             let bus = Arc::new(EventBus::new(100));
@@ -1665,8 +1675,9 @@ mod tests {
             let actions = [
                 serde_json::json!(["inc", "a", 20]),
                 serde_json::json!(["dec", "a", 5]),
-                press_on_long,
+                press_on_long.clone(),
                 serde_json::json!(["off", "a"]),
+                press_double.clone(),
             ];
             manager
                 .add_virtual_device(Box::new(controller_with("ctrl", "btn", actions)))
@@ -1766,6 +1777,123 @@ mod tests {
             vec![light(true, 70), light(true, 65)],
             "a button that never reported a gesture must still fire on its echoes"
         );
+    }
+
+    /// #35 review, finding 1: a controller that toggles on a click (as the
+    /// shipped `button_ctrl.toml` does: `toggle` on the press, no release)
+    /// flips its group with each click, through the group to its members.
+    /// On at 60, a click switches the group and every member off, and the
+    /// group keeps 60. All off, a click lights them at the group's level.
+    /// Either way the second click gives back the start, members included.
+    #[tokio::test]
+    async fn a_toggle_click_flips_the_group_and_two_give_back_the_start() {
+        let lit = light(true, 60);
+        for kind in KINDS {
+            for (case, members, flipped) in [
+                (
+                    "on at 60",
+                    [lit.clone(), lit.clone(), lit.clone()],
+                    light(false, 60),
+                ),
+                (
+                    "all off",
+                    [off(), off(), off()],
+                    light(true, DEFAULT_GROUP_LEVEL),
+                ),
+            ] {
+                let (manager, store, bus) = started_group(kind, members).await;
+                let (press_on, press_off) =
+                    (serde_json::json!(["toggle", "g"]), serde_json::json!([]));
+                add_controller(&manager, &store, press_on, press_off).await;
+                let mut start = Vec::new();
+                for id in ["g", "a", "b", "c"] {
+                    start.push(stored(&store, id).await);
+                }
+                let mut rx = bus.subscribe();
+
+                report(&bus, "btn", ButtonPressType::SinglePress).await;
+                let events = pump(&manager, &mut rx).await;
+                assert_eq!(
+                    echoes(&events, "g"),
+                    vec![flipped.clone()],
+                    "{kind:?}, {case}: one click, one write"
+                );
+                assert_eq!(stored(&store, "g").await, flipped, "{kind:?}, {case}");
+                let DeviceStateValue::Light(group) = &flipped else {
+                    unreachable!()
+                };
+                for id in ["a", "b", "c"] {
+                    let DeviceStateValue::Light(member) = stored(&store, id).await else {
+                        panic!("{id} isn't a light");
+                    };
+                    assert_eq!(
+                        member.is_on, group.is_on,
+                        "{kind:?}, {case}: {id} after a click: {member:?}"
+                    );
+                }
+
+                report(&bus, "btn", ButtonPressType::SinglePress).await;
+                pump(&manager, &mut rx).await;
+                let mut end = Vec::new();
+                for id in ["g", "a", "b", "c"] {
+                    end.push(stored(&store, id).await);
+                }
+                assert_eq!(end, start, "{kind:?}, {case}: two clicks");
+            }
+        }
+    }
+
+    /// #35 review, finding 1: toggles don't race. Nine clicks of a toggling
+    /// controller, handled all at once on four threads. Each toggle reads
+    /// the group and writes it back under one hold of the manager's lock,
+    /// so each starts from what the one before it left: the group's echoes
+    /// alternate off, on, off, …, and it ends off (nine is odd) at its
+    /// level, with every member off. A toggle that read the group and
+    /// wrote it under two holds would lose a flip.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rapid_toggle_clicks_through_the_manager_do_not_race() {
+        const CLICKS: usize = 9;
+        let lit = light(true, 60);
+        let (manager, store, bus) =
+            started_group(Kind::Curves, [lit.clone(), lit.clone(), lit]).await;
+        let (press_on, press_off) = (serde_json::json!(["toggle", "g"]), serde_json::json!([]));
+        add_controller(&manager, &store, press_on, press_off).await;
+        let mut rx = bus.subscribe();
+        let click = DeviceEvent {
+            timestamp: std::time::SystemTime::now(),
+            device_id: "btn".to_string(),
+            event_type: EventType::ButtonPressed {
+                button_id: "main".to_string(),
+                press_type: ButtonPressType::SinglePress,
+            },
+        };
+
+        let clicks: Vec<_> = (0..CLICKS)
+            .map(|_| {
+                let (manager, click) = (manager.clone(), click.clone());
+                tokio::spawn(async move { manager.handle_event(&click).await })
+            })
+            .collect();
+        for click in clicks {
+            click.await.expect("click task").expect("click");
+        }
+        let events = pump(&manager, &mut rx).await;
+
+        let group: Vec<bool> = echoes(&events, "g")
+            .into_iter()
+            .map(|state| {
+                matches!(
+                    state,
+                    DeviceStateValue::Light(LightState { is_on: true, .. })
+                )
+            })
+            .collect();
+        let alternating: Vec<bool> = (0..CLICKS).map(|click| click % 2 == 1).collect();
+        assert_eq!(group, alternating, "the group's echoes, one per click");
+        assert_eq!(stored(&store, "g").await, light(false, 60));
+        for id in ["a", "b", "c"] {
+            assert_eq!(stored(&store, id).await, off(), "{id}");
+        }
     }
 
     /// #34 review, nit 3: a member that's on at level 0 (the TUI's `-` can
