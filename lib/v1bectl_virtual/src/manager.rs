@@ -165,12 +165,22 @@ impl VirtualDeviceManager {
         self.publish_state(member_id, old_state, new_state).await;
     }
 
-    /// Add a virtual device to the manager
+    /// Add a virtual device to the manager. It first takes its state from
+    /// its inputs as the store holds them (see
+    /// [`VirtualDevice::seed_from_inputs`]), so register a group after its
+    /// members are in the store.
     pub async fn add_virtual_device(
         &self,
-        device: Box<dyn VirtualDevice>,
+        mut device: Box<dyn VirtualDevice>,
     ) -> Result<(), VirtualDeviceError> {
         let device_id = device.device_id().clone();
+        if let Err(e) = device.seed_from_inputs().await {
+            tracing::warn!(
+                "⚠️ Virtual device {} couldn't take its state from its inputs: {}",
+                device_id,
+                e
+            );
+        }
         let input_devices = device.input_devices();
         let output_devices = device.output_devices();
 
@@ -392,8 +402,7 @@ impl VirtualDeviceManager {
             if virtual_device.accounts_for(device_id, &input.state) {
                 // The input is where this device's own state puts it: the
                 // echo of its own write, or a change it already reflects.
-                // Re-deriving anyway is lossy (linear ranges) and forgets the
-                // level on off, so an on after an off would light nothing.
+                // Re-deriving anyway is lossy (linear ranges).
                 continue;
             }
 
@@ -590,7 +599,7 @@ mod tests {
     //! feeds it the bus, so each test decides exactly when tracking catches
     //! up, and nothing waits on a clock.
     use super::*;
-    use crate::{DummyGateway, LightGroup, SceneController};
+    use crate::{DummyGateway, LightGroup, LightGroupLinear, SceneController, DEFAULT_GROUP_LEVEL};
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
     use tokio::sync::watch;
@@ -621,9 +630,15 @@ mod tests {
         })
     }
 
-    /// What a `LightGroup` starts as.
+    /// A member light that's off.
     fn off() -> DeviceStateValue {
         light(false, 0)
+    }
+
+    /// What a group with none of its members on starts as: off, with a
+    /// level to light them at (#16).
+    fn group_start() -> DeviceStateValue {
+        light(false, DEFAULT_GROUP_LEVEL)
     }
 
     /// A 1:1 `LightGroup` named `g` over `lights`, registered in `store`,
@@ -669,6 +684,69 @@ mod tests {
         let store = StateStore::new();
         let (manager, bus) = manager_with_group_in(store.clone(), lights).await;
         (manager, store, bus)
+    }
+
+    /// A `LightGroupLinear` named `device_id` over `lights`, each over the
+    /// whole range, so a member's level is the group's.
+    fn linear_group(device_id: &str, lights: &[&str], store: &Arc<StateStore>) -> LightGroupLinear {
+        let members = lights
+            .iter()
+            .map(|id| (id.to_string(), id.to_string()))
+            .collect();
+        let ranges = lights.iter().map(|id| (id.to_string(), (0, 100))).collect();
+        let config = VirtualDeviceConfig {
+            device_id: device_id.to_string(),
+            device_type: VirtualDeviceType::LightGroupLinear,
+            name: device_id.to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        LightGroupLinear::new(config, members, ranges, store.clone()).expect("linear group")
+    }
+
+    /// Both group kinds; each has its own `calculate_group_state`.
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        Curves,
+        Linear,
+    }
+
+    const KINDS: [Kind; 2] = [Kind::Curves, Kind::Linear];
+
+    /// Lights `a`, `b` and `c` in the store as `members` has them, then a
+    /// 1:1 group `g` of `kind` over them, registered the way the server
+    /// registers one at startup: after its members.
+    async fn started_group(
+        kind: Kind,
+        members: [DeviceStateValue; 3],
+    ) -> (VirtualDeviceManager, Arc<StateStore>, Arc<EventBus>) {
+        let store = StateStore::new();
+        for (id, state) in ["a", "b", "c"].into_iter().zip(members) {
+            store.add_device(light_info(id), state).await;
+        }
+        let lights = ["a", "b", "c"];
+        let group: Box<dyn VirtualDevice> = match kind {
+            Kind::Curves => Box::new(group("g", &lights, &store)),
+            Kind::Linear => Box::new(linear_group("g", &lights, &store)),
+        };
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        manager.add_virtual_device(group).await.expect("register");
+        (manager, store, bus)
+    }
+
+    /// A plain `on`, as the API makes it of `{is_on: true}` (the widget's
+    /// toggle): the group's stored state, switched on.
+    async fn plain_on(manager: &VirtualDeviceManager, store: &StateStore, device_id: &str) {
+        let DeviceStateValue::Light(mut state) = stored(store, device_id).await else {
+            panic!("{device_id} isn't a light");
+        };
+        state.is_on = true;
+        manager
+            .set_virtual_device_state(&device_id.to_string(), DeviceStateValue::Light(state))
+            .await
+            .expect("plain on");
     }
 
     /// Input tracking, caught up: hands the manager every event published so
@@ -853,13 +931,13 @@ mod tests {
             "nothing changed, nothing to echo: {events:?}"
         );
         assert_eq!(stored(&store, "a").await, off());
-        assert_eq!(stored(&store, "g").await, off());
+        assert_eq!(stored(&store, "g").await, group_start());
         assert_eq!(
             manager
                 .get_virtual_device_state(&"g".to_string())
                 .await
                 .unwrap(),
-            off(),
+            group_start(),
             "the group's own state must match the store"
         );
     }
@@ -900,6 +978,138 @@ mod tests {
                 ("scene".to_string(), "missing_scene_light".to_string()),
             ]
         );
+    }
+
+    /// #16: a group takes its level from its members when it's registered,
+    /// or the default one if none of them is on. Never 0: the widget's
+    /// toggle sends a plain `on`, and at 0 that lights nothing.
+    #[tokio::test]
+    async fn group_starts_with_a_level() {
+        for kind in KINDS {
+            let (manager, store, _bus) =
+                started_group(kind, [light(true, 40), light(true, 60), off()]).await;
+            let seeded = light(true, 50);
+            assert_eq!(
+                stored(&store, "g").await,
+                seeded,
+                "{kind:?}: from its lit members"
+            );
+            assert_eq!(
+                manager
+                    .get_virtual_device_state(&"g".to_string())
+                    .await
+                    .unwrap(),
+                seeded,
+                "{kind:?}: the group's own state must match the store"
+            );
+
+            let (_manager, store, _bus) = started_group(kind, [off(), off(), off()]).await;
+            assert_eq!(
+                stored(&store, "g").await,
+                group_start(),
+                "{kind:?}: none lit"
+            );
+        }
+    }
+
+    /// #16, "plain on after start lights nothing": groups started at level
+    /// 0, so a plain `on` fanned out 0% and turned every member off.
+    #[tokio::test]
+    async fn plain_on_after_start_lights_the_members() {
+        for kind in KINDS {
+            let (manager, store, _bus) = started_group(kind, [off(), off(), off()]).await;
+            plain_on(&manager, &store, "g").await;
+            for id in ["a", "b", "c"] {
+                assert_eq!(
+                    stored(&store, id).await,
+                    light(true, DEFAULT_GROUP_LEVEL),
+                    "{kind:?}: plain on must light {id}"
+                );
+            }
+        }
+    }
+
+    /// #16 (#22 re-review): an outside off of every member (the hub app, a
+    /// wall switch) re-derives the group to off, and it must keep its level.
+    /// It went to `{off, 0}`, and the next plain `on` lit nothing.
+    #[tokio::test]
+    async fn outside_off_of_every_member_keeps_the_group_level() {
+        for kind in KINDS {
+            let (manager, store, bus) = started_group(kind, [off(), off(), off()]).await;
+            let mut rx = bus.subscribe();
+            manager
+                .set_virtual_device_state(&"g".to_string(), light(true, 60))
+                .await
+                .expect("write");
+            pump(&manager, &mut rx).await;
+
+            // Stored and echoed, as the sync engine's GatewayWins does.
+            for id in ["a", "b", "c"] {
+                let old = stored(&store, id).await;
+                store
+                    .update_device_state(&id.to_string(), off())
+                    .await
+                    .unwrap();
+                bus.publish(state_event(&id.to_string(), Some(&old), &off()))
+                    .await;
+            }
+            let events = pump(&manager, &mut rx).await;
+            assert_eq!(
+                stored(&store, "g").await,
+                light(false, 60),
+                "{kind:?}: the group must go off and keep its level"
+            );
+            assert_eq!(
+                echoes(&events, "g"),
+                vec![light(false, 60)],
+                "{kind:?}: one re-derived group echo"
+            );
+
+            plain_on(&manager, &store, "g").await;
+            for id in ["a", "b", "c"] {
+                assert_eq!(
+                    stored(&store, id).await,
+                    light(true, 60),
+                    "{kind:?}: plain on must light {id} at the kept level"
+                );
+            }
+        }
+    }
+
+    /// #16: `on` without a level restores the group's last one, and a level
+    /// of 0 is off at the level it had.
+    #[tokio::test]
+    async fn on_without_a_level_restores_it_and_level_zero_keeps_it() {
+        let without_level = |is_on| {
+            DeviceStateValue::Light(LightState {
+                is_on,
+                brightness: None,
+                color_temp: Some(2700),
+                rgb_color: None,
+            })
+        };
+        for kind in KINDS {
+            let (manager, store, _bus) = started_group(kind, [off(), off(), off()]).await;
+            let g = "g".to_string();
+            for (asked, want, member) in [
+                (light(true, 30), light(true, 30), light(true, 30)),
+                (without_level(false), light(false, 30), off()),
+                (without_level(true), light(true, 30), light(true, 30)),
+                (light(true, 0), light(false, 30), off()),
+                (without_level(true), light(true, 30), light(true, 30)),
+            ] {
+                manager
+                    .set_virtual_device_state(&g, asked.clone())
+                    .await
+                    .expect("write");
+                assert_eq!(stored(&store, "g").await, want, "{kind:?}: after {asked:?}");
+                assert_eq!(
+                    stored(&store, "a").await,
+                    member,
+                    "{kind:?}: a after {asked:?}"
+                );
+            }
+        }
     }
 
     /// #15: input tracking must outlive falling behind the bus. Tracking is

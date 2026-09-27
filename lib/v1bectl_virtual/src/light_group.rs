@@ -64,6 +64,72 @@ pub(crate) fn fanned_out(target: &LightState, actual: &DeviceStateValue) -> bool
     actual.is_on == target.is_on && (!target.is_on || actual.brightness == target.brightness)
 }
 
+/// The level a group starts at when none of its members is on (#16), so a
+/// plain `on` right after start lights them. A group only uses it until it
+/// has a level of its own, and with none there is nothing to restore. Full
+/// brightness is what a plain wall switch gives the room; anything lower
+/// would be a guessed dim. At 100 every member of a linear group lights, at
+/// the top of its range.
+pub const DEFAULT_GROUP_LEVEL: u8 = 100;
+
+/// The level of the group state `group`: its brightness, or
+/// [`DEFAULT_GROUP_LEVEL`] if it has none (or 0).
+fn level_of(group: &LightState) -> u8 {
+    group
+        .brightness
+        .filter(|&level| level > 0)
+        .unwrap_or(DEFAULT_GROUP_LEVEL)
+}
+
+/// The state a group takes for the write `asked`, when it was at `current`.
+///
+/// A group always has a level, on or off: the last non-zero one it was set
+/// to or derived (#16). So its state says what the next plain `on` lights,
+/// and a client that merges `is_on: true` into it, as the API does, gets
+/// exactly that. `on` without a level restores it. A level of 0 is off, and
+/// keeps it for the next `on`.
+pub(crate) fn resolve_write(current: &LightState, asked: LightState) -> LightState {
+    match asked.brightness {
+        Some(level) if level > 0 => asked,
+        Some(_) => LightState {
+            is_on: false,
+            brightness: Some(level_of(current)),
+            ..asked
+        },
+        None => LightState {
+            brightness: Some(level_of(current)),
+            ..asked
+        },
+    }
+}
+
+/// Re-derive the group state `group` from `lit`, the levels of its members
+/// that are on: on if any is, at their average level. With none on it only
+/// goes off and keeps its level (#16). Re-deriving it to 0 would make the
+/// next plain `on` light nothing.
+pub(crate) fn re_derive(group: &mut LightState, lit: &[u8]) {
+    group.is_on = !lit.is_empty();
+    let total: u32 = lit.iter().map(|&level| u32::from(level)).sum();
+    let average = u32::try_from(lit.len())
+        .ok()
+        .and_then(|count| total.checked_div(count))
+        .and_then(|average| u8::try_from(average).ok());
+    if let Some(average) = average.filter(|&average| average > 0) {
+        group.brightness = Some(average);
+    }
+}
+
+/// What a group starts as, before [`VirtualDevice::seed_from_inputs`]: off,
+/// at [`DEFAULT_GROUP_LEVEL`].
+pub(crate) fn initial_group_state() -> LightState {
+    LightState {
+        is_on: false,
+        brightness: Some(DEFAULT_GROUP_LEVEL),
+        color_temp: Some(2700),
+        rgb_color: None,
+    }
+}
+
 /// Light Group Virtual Device - controls multiple lights as one unit 💡
 pub struct LightGroup {
     config: VirtualDeviceConfig,
@@ -106,12 +172,7 @@ impl LightGroup {
             config,
             lights,
             brightness_curves,
-            current_state: LightState {
-                is_on: false,
-                brightness: Some(0),
-                color_temp: Some(2700),
-                rgb_color: None,
-            },
+            current_state: initial_group_state(),
             state_store,
         })
     }
@@ -147,31 +208,21 @@ impl LightGroup {
         Ok(())
     }
 
-    /// Calculate group state from member light states
+    /// Calculate group state from member light states (see [`re_derive`]):
+    /// with no member on, the group keeps its level.
     async fn calculate_group_state(&mut self) -> Result<(), VirtualDeviceError> {
-        let mut total_brightness = 0u32;
-        let mut lights_on = 0;
-        let mut any_on = false;
-
+        let mut lit = Vec::new();
         for light_id in &self.lights {
             if let Some(device_state) = self.state_store.get_device(light_id).await {
                 if let DeviceStateValue::Light(light_state) = device_state.state {
                     if light_state.is_on {
-                        any_on = true;
-                        lights_on += 1;
-                        total_brightness += light_state.brightness.unwrap_or(100) as u32;
+                        lit.push(light_state.brightness.unwrap_or(100));
                     }
                 }
             }
         }
 
-        self.current_state.is_on = any_on;
-        if lights_on > 0 {
-            self.current_state.brightness = Some((total_brightness / lights_on as u32) as u8);
-        } else {
-            self.current_state.brightness = Some(0);
-        }
-
+        re_derive(&mut self.current_state, &lit);
         Ok(())
     }
 }
@@ -197,6 +248,7 @@ impl VirtualDevice for LightGroup {
                 // only then take the new state: if a member fails, the group
                 // keeps its old one (the manager then re-derives it from the
                 // members that did change).
+                let light_state = resolve_write(&self.current_state, light_state);
                 self.apply_brightness_curves(&light_state).await?;
                 self.current_state = light_state;
 
@@ -204,6 +256,10 @@ impl VirtualDevice for LightGroup {
             }
             _ => Err(VirtualDeviceError::InvalidStateType),
         }
+    }
+
+    async fn seed_from_inputs(&mut self) -> Result<(), VirtualDeviceError> {
+        self.calculate_group_state().await
     }
 
     async fn on_input_changed(

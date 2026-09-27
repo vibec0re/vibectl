@@ -52,6 +52,14 @@ pub trait VirtualDevice: Send + Sync {
     /// Called when virtual device state should change (API request)
     async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError>;
 
+    /// Take the state this device's inputs give it, as the store holds them
+    /// now. The manager calls this once, when it registers the device. So a
+    /// group starts out showing its members, and with a level to light them
+    /// at (#16), instead of a made-up "off at 0". The default does nothing.
+    async fn seed_from_inputs(&mut self) -> Result<(), VirtualDeviceError> {
+        Ok(())
+    }
+
     /// Called when input device states change. `new_state` is the input as
     /// the store holds it when the manager gets to the change, which can be
     /// newer than the event that announced it.
