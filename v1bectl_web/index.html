@@ -12,6 +12,11 @@
     <meta http-equiv="Expires" content="0">
     <title>VIBEC0RE :: NEST</title>
 
+    <!-- 🔥 Cargo.toml has both a `[lib] cdylib` and a same-named bin (src/main.rs);
+         without this, trunk sees two artifacts named v1bectl_web and refuses to
+         guess. Build the bin. 💖 -->
+    <link data-trunk rel="rust" data-bin="v1bectl_web" />
+
     <!-- 🔥 CYBER THEME - NO BOOTSTRAP NEEDED! 💖 -->
     <link data-trunk rel="scss" href="assets/styles/cyber.scss" />
 
