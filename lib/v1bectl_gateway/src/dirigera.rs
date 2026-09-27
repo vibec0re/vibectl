@@ -1210,11 +1210,8 @@ fn device_state_changed_event_type(device_id: &str, data: Option<&serde_json::Va
 // 🔥 VIBEC0RE TESTS — DIRIGERA EVENT STREAM VS A FAKE SELF-SIGNED HUB 💖
 //
 // The fake hub is a blocking std TLS WebSocket server on 127.0.0.1 with a
-// checked-in, TEST-ONLY self-signed `localhost` certificate, generated with:
-//
-//   openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 36500 \
-//     -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-//     -keyout selfsigned-localhost.key.pem -out selfsigned-localhost.crt.pem
+// checked-in, TEST-ONLY self-signed `localhost` certificate; how it was made
+// is in tests/fixtures/README.md.
 #[cfg(test)]
 mod event_stream_tests {
     use super::*;
@@ -1237,8 +1234,11 @@ mod event_stream_tests {
     /// Generous upper bound for anything the tests wait on.
     const WAIT: Duration = Duration::from_secs(10);
 
-    /// What the fake hub does with one accepted WebSocket session.
+    /// What the fake hub does with one accepted connection.
     enum Session {
+        /// Accept the TCP connection and drop it before TLS, like a hub whose
+        /// web server isn't up yet: the client's attempt fails.
+        Reject,
         /// Send the frames, then close the connection from the hub's side.
         SendThenClose(Vec<String>),
         /// Send the frames, then keep the connection open until the client leaves.
@@ -1249,6 +1249,8 @@ mod event_stream_tests {
         addr: SocketAddr,
         /// Sessions that completed their TLS + WebSocket handshake.
         served: Arc<AtomicUsize>,
+        /// Connections dropped by a `Session::Reject`.
+        rejected: Arc<AtomicUsize>,
         /// Handshake failures the hub saw, so a RED test says *why*.
         errors: Arc<Mutex<Vec<String>>>,
     }
@@ -1275,18 +1277,20 @@ mod event_stream_tests {
             native_tls::Identity::from_pkcs8(CERT_PEM, KEY_PEM).expect("fixture identity");
         let acceptor = native_tls::TlsAcceptor::new(identity).expect("TLS acceptor");
         let served = Arc::new(AtomicUsize::new(0));
+        let rejected = Arc::new(AtomicUsize::new(0));
         let errors = Arc::new(Mutex::new(Vec::new()));
 
-        let (served_in, errors_in) = (Arc::clone(&served), Arc::clone(&errors));
+        let (served_in, rejected_in) = (Arc::clone(&served), Arc::clone(&rejected));
+        let errors_in = Arc::clone(&errors);
         std::thread::spawn(move || {
             let mut sessions = sessions.into_iter().peekable();
             for tcp in listener.incoming() {
                 let Some(session) = sessions.peek() else {
                     break;
                 };
-                let result = tcp
-                    .map_err(|e| format!("accept: {e}"))
-                    .and_then(|tcp| serve_session(&acceptor, tcp, session, &served_in));
+                let result = tcp.map_err(|e| format!("accept: {e}")).and_then(|tcp| {
+                    serve_session(&acceptor, tcp, session, &served_in, &rejected_in)
+                });
                 match result {
                     Ok(()) => {
                         sessions.next();
@@ -1302,6 +1306,7 @@ mod event_stream_tests {
         FakeHub {
             addr,
             served,
+            rejected,
             errors,
         }
     }
@@ -1311,7 +1316,18 @@ mod event_stream_tests {
         tcp: std::net::TcpStream,
         session: &Session,
         served: &AtomicUsize,
+        rejected: &AtomicUsize,
     ) -> Result<(), String> {
+        let (frames, close) = match session {
+            Session::Reject => {
+                drop(tcp);
+                rejected.fetch_add(1, Ordering::SeqCst);
+                return Ok(());
+            }
+            Session::SendThenClose(frames) => (frames, true),
+            Session::SendThenHold(frames) => (frames, false),
+        };
+
         let tls = acceptor
             .accept(tcp)
             .map_err(|e| format!("TLS handshake: {e}"))?;
@@ -1319,10 +1335,6 @@ mod event_stream_tests {
             .map_err(|e| format!("WebSocket handshake: {e}"))?;
         served.fetch_add(1, Ordering::SeqCst);
 
-        let (frames, close) = match session {
-            Session::SendThenClose(frames) => (frames, true),
-            Session::SendThenHold(frames) => (frames, false),
-        };
         for frame in frames {
             ws.send(tungstenite::Message::Text(frame.clone()))
                 .map_err(|e| format!("send: {e}"))?;
@@ -1512,7 +1524,9 @@ mod event_stream_tests {
         assert_eq!(hub.served.load(Ordering::SeqCst), 2);
     }
 
-    // (c) Nothing listens yet, so connects are refused; once the hub is up, it connects.
+    // (c) The hub isn't up yet: at first nothing listens (connects are
+    // refused), then it drops the first connection it accepts. The listener
+    // keeps retrying until an attempt gets through.
     #[tokio::test]
     async fn event_stream_retries_until_the_hub_is_up() {
         // Reserve a free port, then release it so nothing is listening there.
@@ -1527,12 +1541,18 @@ mod event_stream_tests {
         let listener = TcpListener::bind(addr).expect("re-bind the reserved port");
         let hub = spawn_fake_hub(
             listener,
-            vec![Session::SendThenHold(vec![state_changed_frame(
-                "light_1", 42,
-            )])],
+            vec![
+                Session::Reject,
+                Session::SendThenHold(vec![state_changed_frame("light_1", 42)]),
+            ],
         );
 
         assert_eq!(next_event(&mut events, &hub).await.device_id, "light_1");
+        // The hub serves its sessions in order, so the frame proves that an
+        // earlier attempt was rejected and the listener tried again: this
+        // test can't pass on a first-try connect.
+        assert_eq!(hub.rejected.load(Ordering::SeqCst), 1, "rejected attempts");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1, "served sessions");
     }
 
     // Once every receiver is gone, the listener stops instead of reconnecting.
