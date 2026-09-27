@@ -912,11 +912,14 @@ fn dirigera_ws_connector() -> Result<Connector, native_tls::Error> {
 }
 
 /// One connect attempt: TCP, TLS through `connector`, WebSocket handshake.
+///
+/// The error is boxed: `tungstenite::Error` is 136 bytes, which trips
+/// `clippy::result_large_err` on newer toolchains (CI runs latest stable).
 async fn connect_dirigera_ws(
     request: &ClientRequestBuilder,
     connector: &Connector,
     connect_timeout: Duration,
-) -> Result<DirigeraWsStream, tungstenite::Error> {
+) -> Result<DirigeraWsStream, Box<tungstenite::Error>> {
     let handshake = tokio_tungstenite::connect_async_tls_with_config(
         request.clone(),
         None,
