@@ -266,7 +266,6 @@ impl SyncEngine {
         let _ = self.shutdown_tx.send(true);
     }
 
-    // Queue a sync task
     /// Queue a sync task. A `PushToGateway` goes into the sync buffer, where
     /// the latest value per device wins; anything else joins the task queue
     /// by priority.
@@ -283,14 +282,20 @@ impl SyncEngine {
         if let SyncTaskType::PushToGateway { new_state } = &task.task_type {
             let protected = task.priority == SyncPriority::Critical;
             let mut buffer = self.sync_buffer.write().await;
-            self.buffer_push(
+            // 🛡️ A user write is protected from the moment it's queued, not
+            // from when its push reaches the gateway (#23). Arming under the
+            // buffer lock means a drained value is never newer than what the
+            // pending confirmation expects.
+            if protected {
+                self.arm_protection(&task.device_id, new_state).await;
+            }
+            Self::buffer_push(
                 &mut buffer,
                 &task.device_id,
                 new_state,
                 task.priority.clone(),
                 protected,
-            )
-            .await;
+            );
         } else {
             // Non-push tasks go to regular queue
             let mut queue = self.sync_queue.write().await;
@@ -314,24 +319,17 @@ impl SyncEngine {
         );
     }
 
-    /// 💖 Put `state` in the sync buffer for `device_id`, replacing whatever
-    /// was waiting there. `buffer` is the held buffer lock.
-    ///
-    /// 🛡️ A `protected` write is shielded from the moment it's queued, not
-    /// from when its push reaches the gateway (#23). Arming under the buffer
-    /// lock means a drained value is never newer than what the pending
-    /// confirmation expects.
-    async fn buffer_push(
-        &self,
+    /// 💖 Put `state` in the sync buffer (`buffer`, under its held lock) for
+    /// `device_id`, replacing whatever was waiting there. A `protected`
+    /// entry is a user write: the caller has armed its window, and the drain
+    /// restarts it.
+    fn buffer_push(
         buffer: &mut HashMap<DeviceId, SyncBufferEntry>,
         device_id: &DeviceId,
         state: &DeviceStateValue,
         priority: SyncPriority,
         protected: bool,
     ) {
-        if protected {
-            self.arm_protection(device_id, state).await;
-        }
         buffer.insert(
             device_id.clone(),
             SyncBufferEntry {
@@ -366,6 +364,19 @@ impl SyncEngine {
     /// until the push lands, which is what the window covers. Protection
     /// used to follow the priority instead, so with the boost off (`High`)
     /// a pull before the push landed reverted the write.
+    ///
+    /// 🔒 A write is one critical section, under the sync buffer's lock
+    /// (#32): arm the window, write the store, echo, queue the push. Two
+    /// writes to one device can't interleave, so the store, the order of the
+    /// echoes, the pending confirmation and the buffered push all end on the
+    /// same (the later) write. They used to be separate steps, and a write
+    /// that overtook another between its store write and its push left the
+    /// store on one value and the hub on the other.
+    ///
+    /// Lock order: sync buffer, then pending confirmations (#23's order,
+    /// also `queue_sync`'s). The store, the event bus and the optimistic
+    /// states are taken and released inside; none of them is ever held
+    /// while one of the first two is taken.
     pub async fn apply_optimistic_update(
         &self,
         device_id: &DeviceId,
@@ -376,60 +387,52 @@ impl SyncEngine {
             device_id
         );
 
-        if !self.config.optimistic_updates {
-            // Fall back to normal sync if optimistic updates disabled
-            self.mark_pending_sync(device_id).await;
-            let mut buffer = self.sync_buffer.write().await;
-            self.buffer_push(
-                &mut buffer,
-                device_id,
-                &new_state,
-                SyncPriority::Critical,
-                true,
-            )
-            .await;
-            return Ok(());
-        }
-
-        let priority = if self.config.client_priority_boost {
+        let priority = if self.config.client_priority_boost || !self.config.optimistic_updates {
             SyncPriority::Critical // 🔥 CLIENT CHANGES GET PRIORITY!
         } else {
             SyncPriority::High
         };
+        self.mark_pending_sync(device_id).await;
+
+        // 🔒 tests/optimistic_update.rs waits for this line: it's how it
+        // knows a second write is about to queue behind the first.
+        debug!("🔒 {} waiting for the write lock", device_id);
+        let mut buffer = self.sync_buffer.write().await;
 
         // 0. 🛡️ ARM THE PROTECTION WINDOW FIRST (#23)! The store is about to
         // run ahead of the hub, and a pull that lands before the push goes
         // out must not take that for an external change and revert it.
         self.arm_protection(device_id, &new_state).await;
 
-        // 1. IMMEDIATELY update local state - NO WAITING!
-        if let Err(e) = self
-            .store
-            .update_device_state(device_id, new_state.clone())
-            .await
-        {
-            // Nothing was written, so there's nothing to protect.
-            self.pending_confirmations.write().await.remove(device_id);
-            return Err(e.into());
-        }
+        if self.config.optimistic_updates {
+            // 1. IMMEDIATELY update local state - NO WAITING!
+            if let Err(e) = self
+                .store
+                .update_device_state(device_id, new_state.clone())
+                .await
+            {
+                // Nothing was written, so there's nothing to protect.
+                self.pending_confirmations.write().await.remove(device_id);
+                return Err(e.into());
+            }
 
-        // 2. Broadcast event IMMEDIATELY - UI updates NOW!
-        self.event_bus
-            .publish(DeviceEvent {
-                timestamp: std::time::SystemTime::now(),
-                device_id: device_id.clone(),
-                event_type: EventType::AttributeChanged {
-                    attribute: "state".to_string(),
-                    old_value: serde_json::Value::Null,
-                    new_value: serde_json::to_value(&new_state).unwrap_or(serde_json::Value::Null),
-                },
-            })
-            .await;
+            // 2. Broadcast event IMMEDIATELY - UI updates NOW! Still under
+            // the lock, so the last echo is the store's value.
+            self.event_bus
+                .publish(DeviceEvent {
+                    timestamp: std::time::SystemTime::now(),
+                    device_id: device_id.clone(),
+                    event_type: EventType::AttributeChanged {
+                        attribute: "state".to_string(),
+                        old_value: serde_json::Value::Null,
+                        new_value: serde_json::to_value(&new_state)
+                            .unwrap_or(serde_json::Value::Null),
+                    },
+                })
+                .await;
 
-        // 3. Track optimistic state
-        {
-            let mut optimistic = self.optimistic_states.write().await;
-            optimistic.insert(
+            // 3. Track optimistic state
+            self.optimistic_states.write().await.insert(
                 device_id.clone(),
                 OptimisticState {
                     client_state: new_state.clone(),
@@ -439,12 +442,8 @@ impl SyncEngine {
             );
         }
 
-        // 4. Queue gateway sync in background (with boost if enabled). This
-        // re-arms the window with the same value.
-        self.mark_pending_sync(device_id).await;
-        let mut buffer = self.sync_buffer.write().await;
-        self.buffer_push(&mut buffer, device_id, &new_state, priority, true)
-            .await;
+        // 4. Queue gateway sync in background (with boost if enabled).
+        Self::buffer_push(&mut buffer, device_id, &new_state, priority, true);
         drop(buffer);
 
         debug!("✅ Optimistic update applied - user sees change INSTANTLY!");
