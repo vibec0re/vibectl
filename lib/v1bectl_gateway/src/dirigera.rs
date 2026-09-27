@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::broadcast;
 use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest, ClientRequestBuilder};
@@ -34,6 +35,8 @@ pub struct DirigeraGateway {
     #[allow(dead_code)]
     timeout: Duration,
     event_sender: broadcast::Sender<DeviceEvent>,
+    /// The one WebSocket listener feeding `event_sender` (see `event_stream`).
+    ws_listener: WsListener,
 }
 
 // Dirigera API response structures
@@ -151,6 +154,7 @@ impl DirigeraGateway {
             access_token: access_token.to_string(),
             timeout,
             event_sender,
+            ws_listener: WsListener::default(),
         }
     }
 
@@ -782,10 +786,19 @@ impl Gateway for DirigeraGateway {
     /// or a read error, it reconnects with capped exponential backoff — 1 s,
     /// doubling up to 60 s, and back to 1 s once a connection has stayed up for
     /// 30 s. It runs for the lifetime of the process, and stops only once every
-    /// receiver of the returned stream has been dropped. Events the hub sends
-    /// while we're disconnected are lost: the sync engine's periodic pull
-    /// catches up on device state, but button presses in that gap are not
-    /// replayed.
+    /// receiver of the gateway's event stream has been dropped. Events the hub
+    /// sends while we're disconnected are lost: the sync engine's periodic
+    /// pull catches up on device state, but button presses in that gap are
+    /// not replayed.
+    ///
+    /// # One hub connection per gateway 🔒
+    ///
+    /// Each call returns a new receiver of the gateway's one event channel,
+    /// as `DummyGateway` does, so calling it more than once is fine: every
+    /// caller sees each event once. Only the first call opens the WebSocket
+    /// and starts the background task; later calls subscribe to that task's
+    /// stream. If the task has stopped because every receiver was dropped,
+    /// the next call starts a new one.
     ///
     /// # Errors
     ///
@@ -794,8 +807,16 @@ impl Gateway for DirigeraGateway {
     /// built. Connection problems are not errors here; they are retried in the
     /// background.
     async fn event_stream(&self) -> Result<EventStream, GatewayError> {
-        info!("🔥 STARTING DIRIGERA WEBSOCKET EVENT STREAM! 🚀");
+        self.subscribe_events(ReconnectPolicy::DIRIGERA)
+    }
+}
 
+// 🔥 DIRIGERA WEBSOCKET EVENT STREAM — TLS, RECONNECT LOOP, FRAME PARSING 💖
+
+impl DirigeraGateway {
+    /// [`Gateway::event_stream`] with an explicit reconnect `policy`, so the
+    /// tests can run it with millisecond backoff.
+    fn subscribe_events(&self, policy: ReconnectPolicy) -> Result<EventStream, GatewayError> {
         let request = dirigera_ws_request(&self.ws_url, &self.access_token)?;
         let connector = dirigera_ws_connector().map_err(|e| {
             GatewayError::InternalError(format!("Failed to build WS TLS connector: {e}"))
@@ -804,21 +825,70 @@ impl Gateway for DirigeraGateway {
         // Subscribe *before* spawning, so the listener can never see zero
         // receivers on its first check and mistake a fresh stream for an
         // abandoned one.
-        let events = self.event_sender.subscribe();
-
-        tokio::spawn(run_dirigera_ws(
-            self.ws_url.clone(),
-            request,
-            connector,
-            ReconnectPolicy::DIRIGERA,
-            self.event_sender.clone(),
-        ));
+        let (events, start_listener) = self.ws_listener.subscribe(&self.event_sender);
+        if start_listener {
+            info!("🔥 STARTING DIRIGERA WEBSOCKET EVENT STREAM! 🚀");
+            tokio::spawn(run_dirigera_ws(
+                self.ws_url.clone(),
+                request,
+                connector,
+                policy,
+                self.event_sender.clone(),
+                self.ws_listener.clone(),
+            ));
+        } else {
+            debug!("🔧 Dirigera WebSocket listener already running - sharing its event stream");
+        }
 
         Ok(events)
     }
 }
 
-// 🔥 DIRIGERA WEBSOCKET EVENT STREAM — TLS, RECONNECT LOOP, FRAME PARSING 💖
+/// Whether a gateway's WebSocket listener task is running. 🔒
+///
+/// There is at most one listener per gateway. Subscribing, and the listener's
+/// decision to stop, both happen under this one lock. A caller that
+/// subscribes just as the last old receiver goes away therefore either keeps
+/// the running listener alive or starts a new one; it never ends up on a
+/// channel that nobody feeds.
+#[derive(Debug, Clone, Default)]
+struct WsListener {
+    running: Arc<Mutex<bool>>,
+}
+
+impl WsListener {
+    /// Subscribe to `events`. The `bool` is `true` when no listener was
+    /// running: it is now marked as running, and the caller must start it.
+    fn subscribe(&self, events: &broadcast::Sender<DeviceEvent>) -> (EventStream, bool) {
+        let mut running = self.lock();
+        let receiver = events.subscribe();
+        let start = !std::mem::replace(&mut *running, true);
+        (receiver, start)
+    }
+
+    /// For the listener: if nobody is subscribed to `events` any more, mark
+    /// the listener as stopped and return `true`, so it exits.
+    fn stop_if_unheard(&self, events: &broadcast::Sender<DeviceEvent>) -> bool {
+        let mut running = self.lock();
+        if events.receiver_count() == 0 {
+            *running = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn is_running(&self) -> bool {
+        *self.lock()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, bool> {
+        // A bool can't be left half-written, so a poisoned lock is still
+        // safe to use.
+        self.running.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// How the event-stream listener paces its reconnects. 🔁
 #[derive(Debug, Clone, Copy)]
@@ -946,45 +1016,46 @@ async fn connect_dirigera_ws(
 /// Keep the hub's event stream connected until nobody is listening. 🔁
 ///
 /// Connect, pump frames into `event_sender`, and on any failure or close
-/// wait out the backoff from `policy` and go again.
+/// wait out the backoff from `policy` and go again. Whether to stop is
+/// decided through `listener` (see [`WsListener`]).
 async fn run_dirigera_ws(
     ws_url: String,
     request: ClientRequestBuilder,
     connector: Connector,
     policy: ReconnectPolicy,
     event_sender: broadcast::Sender<DeviceEvent>,
+    listener: WsListener,
 ) {
     let mut prev_delay = None;
 
     loop {
-        if event_sender.receiver_count() == 0 {
+        if listener.stop_if_unheard(&event_sender) {
             info!("🛑 Nobody is listening to Dirigera events anymore - stopping the WebSocket listener");
             return;
         }
 
         info!("🚀 Connecting to Dirigera WebSocket at: {ws_url}");
-        let connected_for = match connect_dirigera_ws(&request, &connector, policy.connect_timeout)
-            .await
-        {
-            Ok(ws_stream) => {
-                info!("✅ WebSocket connected to Dirigera hub!");
-                let connected_at = Instant::now();
+        let connected_for =
+            match connect_dirigera_ws(&request, &connector, policy.connect_timeout).await {
+                Ok(ws_stream) => {
+                    info!("✅ WebSocket connected to Dirigera hub!");
+                    let connected_at = Instant::now();
 
-                match pump_dirigera_ws(ws_stream, &event_sender).await {
-                    WsSessionEnd::Closed => warn!("💔 WebSocket closed by Dirigera hub"),
-                    WsSessionEnd::Failed(e) => error!("❌ WebSocket error: {e}"),
-                    WsSessionEnd::NoReceivers => {
-                        info!("🛑 Nobody is listening to Dirigera events anymore - stopping the WebSocket listener");
-                        return;
+                    match pump_dirigera_ws(ws_stream, &event_sender).await {
+                        WsSessionEnd::Closed => warn!("💔 WebSocket closed by Dirigera hub"),
+                        WsSessionEnd::Failed(e) => error!("❌ WebSocket error: {e}"),
+                        // Stop, or reconnect at once if someone subscribed in
+                        // the meantime: the check at the top decides, under the
+                        // listener lock.
+                        WsSessionEnd::NoReceivers => continue,
                     }
+                    Some(connected_at.elapsed())
                 }
-                Some(connected_at.elapsed())
-            }
-            Err(e) => {
-                error!("❌ Failed to connect WebSocket: {e}");
-                None
-            }
-        };
+                Err(e) => {
+                    error!("❌ Failed to connect WebSocket: {e}");
+                    None
+                }
+            };
 
         let delay = policy.after_attempt(prev_delay, connected_for);
         info!("⏰ Retrying Dirigera WebSocket in {delay:?}");
@@ -1149,7 +1220,6 @@ mod event_stream_tests {
     use super::*;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
     use tungstenite::handshake::server::{ErrorResponse, Request, Response};
     use tungstenite::http::{HeaderValue, StatusCode};
 
@@ -1313,9 +1383,25 @@ mod event_stream_tests {
     fn start_listener(url: String) -> (EventStream, tokio::task::JoinHandle<()>) {
         let request = dirigera_ws_request(&url, TEST_TOKEN).expect("WS request");
         let connector = dirigera_ws_connector().expect("TLS connector");
-        let (event_sender, events) = broadcast::channel(16);
-        let task = tokio::spawn(run_dirigera_ws(url, request, connector, FAST, event_sender));
+        let (event_sender, _) = broadcast::channel(16);
+        let listener = WsListener::default();
+        let (events, _) = listener.subscribe(&event_sender);
+        let task = tokio::spawn(run_dirigera_ws(
+            url,
+            request,
+            connector,
+            FAST,
+            event_sender,
+            listener,
+        ));
         (events, task)
+    }
+
+    /// A real `DirigeraGateway` whose event stream goes to `ws_url`.
+    fn gateway_for(ws_url: String) -> DirigeraGateway {
+        let mut gateway = DirigeraGateway::new("127.0.0.1", TEST_TOKEN, WAIT);
+        gateway.ws_url = ws_url;
+        gateway
     }
 
     async fn next_event(events: &mut EventStream, hub: &FakeHub) -> DeviceEvent {
@@ -1469,6 +1555,96 @@ mod event_stream_tests {
             .expect("listener should stop without receivers")
             .expect("listener task should not panic");
         assert_eq!(hub.served.load(Ordering::SeqCst), 1, "must not reconnect");
+    }
+
+    // A second `event_stream()` call must not open a second hub connection.
+    #[tokio::test]
+    async fn event_stream_twice_opens_one_hub_connection() {
+        // A bare TCP listener that counts connections and holds them open, so
+        // a client's TLS handshake just waits and never retries during the
+        // test (the connect timeout below is longer than the test).
+        let listener = bind_localhost();
+        let addr = listener.local_addr().unwrap();
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for tcp in listener.incoming().flatten() {
+                held.push(tcp);
+                if accepted_tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let hold = ReconnectPolicy {
+            connect_timeout: WAIT,
+            ..FAST
+        };
+
+        let gateway = gateway_for(format!("wss://{addr}/v1"));
+        let _first = gateway.subscribe_events(hold).expect("first event_stream");
+        let _second = gateway.subscribe_events(hold).expect("second event_stream");
+
+        tokio::time::timeout(WAIT, accepted.recv())
+            .await
+            .expect("the listener should connect to the hub");
+        let second_connection =
+            tokio::time::timeout(Duration::from_millis(300), accepted.recv()).await;
+        assert!(
+            second_connection.is_err(),
+            "a second event_stream() call opened a second hub connection"
+        );
+    }
+
+    // Every caller gets each event once, from the one shared connection.
+    #[tokio::test]
+    async fn every_event_stream_caller_gets_each_event_once() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![
+                state_changed_frame("light_1", 10),
+                state_changed_frame("light_2", 20),
+            ])],
+        );
+        let gateway = gateway_for(hub.url());
+        let mut first = gateway.subscribe_events(FAST).expect("first event_stream");
+        let mut second = gateway.subscribe_events(FAST).expect("second event_stream");
+
+        for events in [&mut first, &mut second] {
+            assert_eq!(next_event(events, &hub).await.device_id, "light_1");
+            assert_eq!(next_event(events, &hub).await.device_id, "light_2");
+            assert!(events.is_empty(), "no duplicate events");
+        }
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1);
+    }
+
+    // Once the listener has stopped for lack of receivers, the next
+    // `event_stream()` call starts a new one instead of returning a dead stream.
+    #[tokio::test]
+    async fn event_stream_after_the_listener_stopped_starts_a_new_one() {
+        let hub = spawn_fake_hub(
+            bind_localhost(),
+            vec![Session::SendThenHold(vec![state_changed_frame(
+                "light_1", 42,
+            )])],
+        );
+        let gateway = gateway_for(hub.url());
+
+        // `#[tokio::test]` runs on one thread, so the spawned listener can't
+        // run before this receiver is dropped: its first check sees nobody
+        // listening and it stops without connecting.
+        drop(gateway.subscribe_events(FAST).expect("first event_stream"));
+        tokio::time::timeout(WAIT, async {
+            while gateway.ws_listener.is_running() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("listener should stop without receivers");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 0);
+
+        let mut events = gateway.subscribe_events(FAST).expect("second event_stream");
+        assert_eq!(next_event(&mut events, &hub).await.device_id, "light_1");
+        assert_eq!(hub.served.load(Ordering::SeqCst), 1);
     }
 
     /// A connect attempt that never got through (`connected_for: None`).
