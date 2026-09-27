@@ -89,7 +89,13 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
             let event_bus_clone = event_bus.clone();
             tokio::spawn(async move {
                 info!("🎯 Gateway event stream connected - forwarding to EventBus!");
-                while let Ok(event) = gateway_events.recv().await {
+                // `Lagged` events are intentionally just skipped (with a warning) here:
+                // the sync engine's periodic pull worker re-reads hub state on its own
+                // schedule, so a skipped gateway event self-heals instead of leaving the
+                // server permanently blind like the old `while let Ok` did on any lag.
+                while let Some(event) =
+                    recv_lossy(&mut gateway_events, "gateway event stream").await
+                {
                     // Forward gateway events to our main EventBus
                     event_bus_clone.publish(event).await;
                 }
@@ -441,7 +447,8 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
         tokio::spawn(async move {
             info!("🎯 Event logger started - monitoring all device events!");
 
-            while let Ok(event) = event_rx.recv().await {
+            // Lagged events are lost (just a log line), not fatal: this task only logs.
+            while let Some(event) = recv_lossy(&mut event_rx, "event logger").await {
                 match &event.event_type {
                     EventType::ButtonPressed {
                         button_id,
