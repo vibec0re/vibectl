@@ -149,6 +149,10 @@ impl AxumServer {
 
     // 🔥 Set sync engine for OPTIMISTIC UPDATES!
     pub fn with_sync_engine(mut self, sync_engine: Arc<SyncEngine>) -> Self {
+        // Virtual writes fan out to physical members, and those take the same
+        // path as a direct write: store, echo, gateway push.
+        self.virtual_device_manager
+            .attach_sync_engine(Arc::clone(&sync_engine));
         self.sync_engine = Some(sync_engine);
         self
     }
@@ -888,4 +892,294 @@ async fn handle_websocket(socket: WebSocket, server: AxumServer) {
         "🔥 WebSocket connection {} closed - ASYNC VIBES ENDED!",
         subscriber_id
     );
+}
+
+#[cfg(test)]
+mod tests {
+    //! Write → echo round trips through `handle_api_request`, against the
+    //! dummy `basic_home` hub, wired the way `v1bectl_server` wires them.
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::broadcast;
+
+    const GROUP: &str = "virtual_bedroom_lights";
+    /// (member, its brightness when the group is on at 50%): the linear
+    /// ranges of the shipped `virtual_devices/bedroom_lights.toml`.
+    const MEMBERS_AT_50: [(&str, u8); 3] = [
+        ("light_bedroom", 90),
+        ("light_living_room", 65),
+        ("light_kitchen", 25),
+    ];
+
+    struct Home {
+        server: AxumServer,
+        store: Arc<StateStore>,
+        bus: Arc<EventBus>,
+        engine: Arc<SyncEngine>,
+        gateway: Arc<dyn Gateway>,
+    }
+
+    /// Dummy devices seeded into the store as the server does at startup,
+    /// a sync engine attached, and the Bedroom Lights linear group registered.
+    async fn home() -> Home {
+        let store = StateStore::new();
+        let bus = Arc::new(EventBus::new(1000));
+        let gateway: Arc<dyn Gateway> = Arc::new(DummyGateway::new("basic_home"));
+        for info in gateway.discover_devices().await.expect("discover") {
+            let state = gateway
+                .get_device_state(&info.device_id)
+                .await
+                .expect("initial state");
+            store.add_device(info, state).await;
+        }
+        let engine = Arc::new(SyncEngine::new(
+            store.clone(),
+            bus.clone(),
+            gateway.clone(),
+            None,
+        ));
+        let server = AxumServer::new(0, store.clone(), bus.clone(), gateway.clone())
+            .with_sync_engine(engine.clone());
+
+        let members = HashMap::from([
+            ("top".to_string(), "light_bedroom".to_string()),
+            ("main".to_string(), "light_living_room".to_string()),
+            ("bed".to_string(), "light_kitchen".to_string()),
+        ]);
+        let ranges = HashMap::from([
+            ("top".to_string(), (80, 100)),
+            ("main".to_string(), (40, 90)),
+            ("bed".to_string(), (0, 50)),
+        ]);
+        let config = VirtualDeviceConfig {
+            device_id: GROUP.to_string(),
+            device_type: VirtualDeviceType::LightGroupLinear,
+            name: "Bedroom Lights".to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        let group = LightGroupLinear::new(config, members, ranges, store.clone()).expect("group");
+        let manager = server.virtual_device_manager();
+        manager
+            .add_virtual_device(Box::new(group))
+            .await
+            .expect("register group");
+        // The manager's input tracking, as `AxumServer::start` runs it.
+        manager.start().await.expect("start manager");
+
+        Home {
+            server,
+            store,
+            bus,
+            engine,
+            gateway,
+        }
+    }
+
+    async fn set_light(
+        server: &AxumServer,
+        device_id: &str,
+        is_on: Option<bool>,
+        brightness: Option<u8>,
+    ) -> ApiResponse {
+        let request = ApiRequest::SetLightState {
+            device_id: device_id.to_string(),
+            is_on,
+            brightness,
+            color_temp: None,
+            rgb_color: None,
+        };
+        server.handle_api_request(request, String::new()).await
+    }
+
+    /// Everything published until the bus has been quiet for 300ms.
+    async fn drain(rx: &mut broadcast::Receiver<DeviceEvent>) -> Vec<DeviceEvent> {
+        let mut events = Vec::new();
+        while let Ok(Ok(event)) = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await
+        {
+            events.push(event);
+        }
+        events
+    }
+
+    /// The states echoed for `device_id`, in either shape clients decode.
+    fn echoes(events: &[DeviceEvent], device_id: &str) -> Vec<DeviceStateValue> {
+        events
+            .iter()
+            .filter(|e| e.device_id == device_id)
+            .filter_map(|e| match &e.event_type {
+                EventType::StateChanged { new_state, .. } => new_state.clone(),
+                EventType::AttributeChanged {
+                    attribute,
+                    new_value,
+                    ..
+                } if attribute == "state" => serde_json::from_value(new_value.clone()).ok(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn light(store: &StateStore, device_id: &str) -> LightState {
+        match store.get_device(&device_id.to_string()).await {
+            Some(DeviceState {
+                state: DeviceStateValue::Light(light),
+                ..
+            }) => light,
+            other => panic!("{device_id} is not a light in the store: {other:?}"),
+        }
+    }
+
+    /// #1: a virtual group write must echo the group and every member it
+    /// changed, exactly once each, with the state the store now holds.
+    #[tokio::test]
+    async fn virtual_group_write_echoes_group_and_members() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+
+        let response = set_light(&home.server, GROUP, Some(true), Some(50)).await;
+        assert!(
+            matches!(
+                response,
+                ApiResponse::LightUpdated {
+                    new_state: LightState {
+                        is_on: true,
+                        brightness: Some(50),
+                        ..
+                    }
+                }
+            ),
+            "unexpected response: {response:?}"
+        );
+        let events = drain(&mut rx).await;
+
+        let group = home.store.get_device(&GROUP.to_string()).await.unwrap();
+        assert_eq!(
+            echoes(&events, GROUP),
+            vec![group.state],
+            "group {GROUP} must be echoed exactly once, with its stored state"
+        );
+
+        for (member, brightness) in MEMBERS_AT_50 {
+            let state = light(&home.store, member).await;
+            assert!(state.is_on, "{member} should be on: {state:?}");
+            assert_eq!(state.brightness, Some(brightness), "{member} brightness");
+            assert_eq!(
+                echoes(&events, member),
+                vec![DeviceStateValue::Light(state)],
+                "member {member} must be echoed exactly once, with its stored state"
+            );
+            // Handed to the gateway sync, like a direct write to the member.
+            let status = home.engine.get_sync_status(&member.to_string()).await;
+            assert!(
+                matches!(status, Some(SyncStatus::PendingSync { .. })),
+                "member {member} write never queued for the gateway: {status:?}"
+            );
+        }
+    }
+
+    /// The members' echoes of our own fan-out must not re-derive the group.
+    /// If they did, an off would store brightness 0 and the next plain `on`
+    /// would light nothing.
+    #[tokio::test]
+    async fn group_off_then_on_restores_members() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+
+        set_light(&home.server, GROUP, Some(true), Some(50)).await;
+        drain(&mut rx).await;
+        set_light(&home.server, GROUP, Some(false), None).await;
+        drain(&mut rx).await;
+
+        let group = light(&home.store, GROUP).await;
+        assert!(!group.is_on, "group should be off: {group:?}");
+        assert_eq!(group.brightness, Some(50), "group forgot its level");
+        for (member, _) in MEMBERS_AT_50 {
+            assert!(!light(&home.store, member).await.is_on, "{member} still on");
+        }
+
+        set_light(&home.server, GROUP, Some(true), None).await;
+        drain(&mut rx).await;
+
+        for (member, brightness) in MEMBERS_AT_50 {
+            let state = light(&home.store, member).await;
+            assert!(state.is_on, "{member} should be back on: {state:?}");
+            assert_eq!(state.brightness, Some(brightness), "{member} brightness");
+        }
+    }
+
+    /// A direct write to a group member still echoes once (no double
+    /// publish on the physical path), and the group it feeds re-derives its
+    /// state and echoes that.
+    #[tokio::test]
+    async fn member_write_echoes_once_and_updates_group() {
+        let home = home().await;
+        let mut rx = home.bus.subscribe();
+
+        set_light(&home.server, "light_kitchen", Some(true), Some(40)).await;
+        let events = drain(&mut rx).await;
+
+        let kitchen = light(&home.store, "light_kitchen").await;
+        assert_eq!(kitchen.brightness, Some(40));
+        assert_eq!(
+            echoes(&events, "light_kitchen"),
+            vec![DeviceStateValue::Light(kitchen)],
+            "a physical write must be echoed exactly once"
+        );
+
+        let group = light(&home.store, GROUP).await;
+        assert!(group.is_on, "group should follow its lit member: {group:?}");
+        assert_eq!(
+            echoes(&events, GROUP),
+            vec![DeviceStateValue::Light(group)],
+            "the re-derived group state must be echoed once"
+        );
+    }
+
+    /// The live-gateway half of #1: member writes must reach the hub. If they
+    /// only hit the store, the pull worker (GatewayWins) reverts them.
+    #[tokio::test]
+    async fn virtual_member_writes_reach_the_gateway() {
+        let home = home().await;
+        let engine = home.engine.clone();
+        let runner = tokio::spawn(async move { engine.start().await });
+        // Let the immediate first pull finish before writing.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        set_light(&home.server, GROUP, Some(true), Some(50)).await;
+
+        for (member, _) in MEMBERS_AT_50 {
+            let want = home
+                .store
+                .get_device(&member.to_string())
+                .await
+                .unwrap()
+                .state;
+            let reached = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let hub = home.gateway.get_device_state(&member.to_string()).await;
+                    if hub.as_ref().ok() == Some(&want) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await;
+            assert!(reached.is_ok(), "{member} never reached the gateway");
+        }
+
+        // Outlive a pull cycle (2s): nothing may be reverted.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        for (member, brightness) in MEMBERS_AT_50 {
+            let state = light(&home.store, member).await;
+            assert!(state.is_on, "{member} was reverted: {state:?}");
+            assert_eq!(state.brightness, Some(brightness), "{member} was reverted");
+        }
+
+        home.engine.stop().await;
+        runner
+            .await
+            .expect("sync engine task")
+            .expect("sync engine");
+    }
 }
