@@ -9,6 +9,12 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Read-only token for every job: the web job runs trunk, which fetches sass,
+# wasm-bindgen and wasm-opt from GitHub releases at build time without a
+# checksum, so nothing it executes should be able to write to the repo.
+permissions:
+  contents: read
+
 jobs:
   check:
     name: fmt + clippy + test
