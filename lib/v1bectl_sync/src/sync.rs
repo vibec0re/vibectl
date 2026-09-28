@@ -14,7 +14,11 @@
 //!   [`SyncConfig::retry_interval`]), up to
 //!   [`SyncConfig::max_retry_attempts`] failures per write. A due retry goes
 //!   back into the sync buffer, so every push of a device goes out from the
-//!   buffer worker: one at a time, in order.
+//!   buffer worker: one at a time, in order. A retry only ever resends its
+//!   own write, and only while that write is still the device's latest one
+//!   and unconfirmed: once the hub confirmed it, its window ran out or a
+//!   newer write came in, the retry is dropped. That is checked when it's
+//!   queued again and once more right before it goes out (#45).
 //!
 //! # Throttling
 //!
@@ -22,13 +26,15 @@
 //! coalescing: the sync buffer keeps only the latest value per device, so
 //! however fast a client writes (a dragged slider, say), each drain sends at
 //! most one PATCH per device, and a device gets at most one buffered PATCH
-//! per `push_interval` tick (20 per second at the default 50 ms). Retries go
-//! through the buffer too, so that holds for them as well.
+//! per `push_interval` tick (20 per second at the default 50 ms). Retries and
+//! the pull's `ServerWins` pushes go through the buffer too, so that holds
+//! for them as well.
 
 use crate::events::EventBus;
 use crate::gateway::{Gateway, GatewayError};
 use crate::store::StateStore;
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, RwLock};
@@ -57,6 +63,9 @@ pub struct SyncBufferEntry {
     /// `n` for its `n`-th retry, which the retry worker puts back in the
     /// buffer (#32). A newer write replaces the entry and starts from 0.
     pub failed_attempts: u32,
+    /// The user write this pushes, when it's `protected`: its
+    /// [`PendingConfirmation::generation`]. 0 when it isn't.
+    pub generation: u64,
 }
 
 // 🔥 PENDING CONFIRMATION TRACKER - UI CHANGES ARE SACRED! 💖
@@ -81,6 +90,11 @@ pub struct PendingConfirmation {
     /// current value while the previous write's PATCH is still in flight,
     /// which is about to move the hub away. A newer write resets it (#32).
     pub pushed: bool,
+    /// Which write armed the entry. Every write gets a new generation, so a
+    /// newer write, even one of the same value, is told apart from the one
+    /// it superseded. A retry carries its write's generation and goes out
+    /// only while the entry still has it (#45).
+    pub generation: u64,
 }
 
 #[derive(Clone)]
@@ -89,7 +103,7 @@ pub struct SyncEngine {
     event_bus: Arc<EventBus>,
     gateway: Arc<dyn Gateway>,
     sync_queue: Arc<RwLock<VecDeque<SyncTask>>>,
-    retry_queue: Arc<RwLock<HashMap<DeviceId, RetryEntry>>>,
+    retry_queue: Arc<RwLock<HashMap<RetryKey, RetryEntry>>>,
     sync_status: Arc<RwLock<HashMap<DeviceId, SyncStatus>>>,
     config: SyncConfig,
     shutdown_tx: watch::Sender<bool>,
@@ -100,6 +114,10 @@ pub struct SyncEngine {
     sync_buffer: Arc<RwLock<HashMap<DeviceId, SyncBufferEntry>>>,
     // 🔥 PENDING CONFIRMATIONS - UI CHANGES GET PROTECTION WINDOW! 💖
     pending_confirmations: Arc<RwLock<HashMap<DeviceId, PendingConfirmation>>>,
+    /// The next write generation to hand out (see
+    /// [`PendingConfirmation::generation`]). It starts at 1: 0 is "not a
+    /// user write".
+    next_generation: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +156,38 @@ pub struct RetryEntry {
     pub last_error: Option<String>,
     /// It retries a user write ([`SyncBufferEntry::protected`]).
     pub protected: bool,
+    /// That user write's [`PendingConfirmation::generation`]; 0 when it
+    /// isn't `protected`.
+    pub generation: u64,
+}
+
+/// What kind of task a retry retries. Retries are keyed per device *and*
+/// kind (#45): they used to be keyed per device only, so a queued pull's
+/// success cancelled a push retry of the same device, and its failure
+/// replaced one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TaskKind {
+    Push,
+    Pull,
+    Refresh,
+}
+
+impl SyncTaskType {
+    fn kind(&self) -> TaskKind {
+        match self {
+            Self::PushToGateway { .. } => TaskKind::Push,
+            Self::PullFromGateway => TaskKind::Pull,
+            Self::ForceRefresh => TaskKind::Refresh,
+        }
+    }
+}
+
+/// A retry's key in the retry queue: one waiting retry per device and kind
+/// of task.
+type RetryKey = (DeviceId, TaskKind);
+
+fn retry_key(task: &SyncTask) -> RetryKey {
+    (task.device_id.clone(), task.task_type.kind())
 }
 
 #[derive(Debug, Clone)]
@@ -185,15 +235,6 @@ pub struct SyncConfig {
     pub conflict_resolution: ConflictResolution,
     // 🔥 NEW VIBEOPTIMIZATION SETTINGS!
     pub optimistic_updates: bool,
-    /// Queue user writes ([`SyncEngine::apply_optimistic_update`]) as
-    /// `SyncPriority::Critical` instead of `High`.
-    ///
-    /// This doesn't change their protection: every user write gets a
-    /// protection window either way (#32). Nothing orders buffered pushes by
-    /// priority either (each drain sends every device's latest value), so
-    /// for now the flag only changes the priority recorded on the push and
-    /// on its retry.
-    pub client_priority_boost: bool,
     /// 🛡️ How long a user write is shielded from pulls that still report the
     /// old value. It starts at the write and restarts when the push goes out,
     /// so it covers both the wait in the sync buffer and the hub's round trip.
@@ -227,8 +268,7 @@ impl Default for SyncConfig {
             batch_size: 10,
             conflict_resolution: ConflictResolution::GatewayWins, // 🔥 PHYSICAL SWITCHES WIN! <3
             // 🔥 VIBEOPTIMIZED DEFAULTS!
-            optimistic_updates: true,    // INSTANT UI FEEDBACK!
-            client_priority_boost: true, // TUI FEELS INSTANT!
+            optimistic_updates: true, // INSTANT UI FEEDBACK!
             protection_window: Duration::from_secs(5), // 🛡️ UI changes are PROTECTED!
         }
     }
@@ -254,6 +294,7 @@ impl SyncEngine {
             optimistic_states: Arc::new(RwLock::new(HashMap::new())),
             sync_buffer: Arc::new(RwLock::new(HashMap::new())),
             pending_confirmations: Arc::new(RwLock::new(HashMap::new())), // 🔥 UI PROTECTION! 💖
+            next_generation: Arc::new(AtomicU64::new(1)),
             config,
             shutdown_tx,
         }
@@ -308,7 +349,8 @@ impl SyncEngine {
     /// A `Critical` push counts as a user write and gets a protection window
     /// ([`SyncConfig::protection_window`]). User writes normally come in
     /// through [`Self::apply_optimistic_update`], which protects them whatever
-    /// their priority.
+    /// their priority. A push below `Critical` is dropped while a user write
+    /// waits in the buffer for the same device.
     pub async fn queue_sync(&self, task: SyncTask) {
         debug!("Queuing sync task: {:?}", task);
         self.mark_pending_sync(&task.device_id).await;
@@ -317,20 +359,40 @@ impl SyncEngine {
         if let SyncTaskType::PushToGateway { new_state } = &task.task_type {
             let protected = task.priority == SyncPriority::Critical;
             let mut buffer = self.sync_buffer.write().await;
+            // A push that isn't a user write doesn't replace one waiting in
+            // the buffer (#50 review): the user's value would never go out,
+            // and the pull would revert it once its window ran out.
+            if !protected
+                && buffer
+                    .get(&task.device_id)
+                    .is_some_and(|waiting| waiting.protected)
+            {
+                debug!(
+                    "Push for {} dropped: a user write is waiting in the buffer",
+                    task.device_id
+                );
+                return;
+            }
             // 🛡️ A user write is protected from the moment it's queued, not
             // from when its push reaches the gateway (#23). Arming under the
             // buffer lock means a drained value is never newer than what the
             // pending confirmation expects.
-            if protected {
-                self.arm_protection(&task.device_id, new_state).await;
-            }
+            let generation = if protected {
+                self.arm_protection(&task.device_id, new_state).await
+            } else {
+                0
+            };
             Self::buffer_push(
                 &mut buffer,
                 &task.device_id,
-                new_state,
-                task.priority.clone(),
-                protected,
-                0,
+                SyncBufferEntry {
+                    state: new_state.clone(),
+                    updated_at: Instant::now(),
+                    priority: task.priority.clone(),
+                    protected,
+                    failed_attempts: 0,
+                    generation,
+                },
             );
         } else {
             // Non-push tasks go to regular queue
@@ -355,28 +417,16 @@ impl SyncEngine {
         );
     }
 
-    /// 💖 Put `state` in the sync buffer (`buffer`, under its held lock) for
+    /// 💖 Put `entry` in the sync buffer (`buffer`, under its held lock) for
     /// `device_id`, replacing whatever was waiting there. A `protected`
     /// entry is a user write: the caller has armed its window, and the drain
     /// restarts it, unless the entry is a retry (`failed_attempts` > 0).
     fn buffer_push(
         buffer: &mut HashMap<DeviceId, SyncBufferEntry>,
         device_id: &DeviceId,
-        state: &DeviceStateValue,
-        priority: SyncPriority,
-        protected: bool,
-        failed_attempts: u32,
+        entry: SyncBufferEntry,
     ) {
-        buffer.insert(
-            device_id.clone(),
-            SyncBufferEntry {
-                state: state.clone(),
-                updated_at: Instant::now(),
-                priority,
-                protected,
-                failed_attempts,
-            },
-        );
+        buffer.insert(device_id.clone(), entry);
         debug!(
             "💖 BUFFER UPDATED for {} - the next drain sends the latest value!",
             device_id
@@ -396,13 +446,12 @@ impl SyncEngine {
     /// store and the echo follow once a pull confirms the push.
     ///
     /// 🛡️ Every write through here gets a protection window
-    /// ([`SyncConfig::protection_window`]), whatever priority
-    /// `client_priority_boost` gives it (#32). This is the entry point for
-    /// user writes (the API server's handlers and the virtual manager's
-    /// member fan-out), and the path where the store runs ahead of the hub
-    /// until the push lands, which is what the window covers. Protection
-    /// used to follow the priority instead, so with the boost off (`High`)
-    /// a pull before the push landed reverted the write.
+    /// ([`SyncConfig::protection_window`]) and is queued
+    /// `SyncPriority::Critical` (#32, #45). This is the entry point for user
+    /// writes (the API server's handlers, the legacy TCP server and the
+    /// virtual manager's member fan-out), and the path where the store runs
+    /// ahead of the hub until the push lands, which is what the window
+    /// covers.
     ///
     /// 🔒 A write is one critical section, under the sync buffer's lock
     /// (#32): arm the window, write the store, echo, queue the push. Two
@@ -426,11 +475,6 @@ impl SyncEngine {
             device_id
         );
 
-        let priority = if self.config.client_priority_boost || !self.config.optimistic_updates {
-            SyncPriority::Critical // 🔥 CLIENT CHANGES GET PRIORITY!
-        } else {
-            SyncPriority::High
-        };
         self.mark_pending_sync(device_id).await;
 
         // 🔒 tests/optimistic_update.rs waits for this line: it's how it
@@ -441,7 +485,7 @@ impl SyncEngine {
         // 0. 🛡️ ARM THE PROTECTION WINDOW FIRST (#23)! The store is about to
         // run ahead of the hub, and a pull that lands before the push goes
         // out must not take that for an external change and revert it.
-        self.arm_protection(device_id, &new_state).await;
+        let generation = self.arm_protection(device_id, &new_state).await;
 
         if self.config.optimistic_updates {
             // 1. IMMEDIATELY update local state - NO WAITING!
@@ -481,8 +525,19 @@ impl SyncEngine {
             );
         }
 
-        // 4. Queue gateway sync in background (with boost if enabled).
-        Self::buffer_push(&mut buffer, device_id, &new_state, priority, true, 0);
+        // 4. Queue gateway sync in background - CLIENT CHANGES GET PRIORITY! 🔥
+        Self::buffer_push(
+            &mut buffer,
+            device_id,
+            SyncBufferEntry {
+                state: new_state,
+                updated_at: Instant::now(),
+                priority: SyncPriority::Critical,
+                protected: true,
+                failed_attempts: 0,
+                generation,
+            },
+        );
         drop(buffer);
 
         debug!("✅ Optimistic update applied - user sees change INSTANTLY!");
@@ -605,6 +660,27 @@ impl SyncEngine {
 
         // Process each buffered entry
         for (device_id, entry) in entries {
+            // 🔁 A retry was current when it was queued again, but it may
+            // have waited since (in the buffer, and in this batch behind
+            // other devices' PATCHes). Check again right before it goes out,
+            // so a retry whose write was confirmed, ran out its window or
+            // was superseded in the meantime doesn't push that write again
+            // (#45). What's left is the time from here to the hub applying
+            // the PATCH; closing that too would mean holding the pending
+            // entry across the gateway call.
+            if entry.failed_attempts > 0
+                && !self
+                    .retry_is_current(&device_id, entry.protected, entry.generation)
+                    .await
+            {
+                debug!(
+                    "🔁 Retry for {} dropped before its push: its write was confirmed, \
+                     abandoned or superseded while it waited",
+                    device_id
+                );
+                continue;
+            }
+
             // Create a sync task for this buffered entry
             let task = SyncTask {
                 device_id: device_id.clone(),
@@ -622,7 +698,8 @@ impl SyncEngine {
             // this, not its retries: a hub that keeps failing mustn't keep
             // the store protected.
             if entry.protected && entry.failed_attempts == 0 {
-                self.refresh_protection(&device_id, &entry.state).await;
+                self.refresh_protection(&device_id, &entry.state, entry.generation)
+                    .await;
             }
 
             if let Err(e) = self.execute_sync_task(&task).await {
@@ -635,8 +712,14 @@ impl SyncEngine {
                 // Removing the entry here could also unprotect a newer write
                 // that already re-armed it.
                 warn!("Buffered sync failed for {}: {}", device_id, e);
-                self.queue_retry(&task, e.to_string(), entry.failed_attempts, entry.protected)
-                    .await;
+                self.queue_retry(
+                    &task,
+                    e.to_string(),
+                    entry.failed_attempts,
+                    entry.protected,
+                    entry.generation,
+                )
+                .await;
             } else {
                 debug!("✅ BUFFERED SYNC SUCCESS for {} - no spam! <3", device_id);
             }
@@ -652,7 +735,10 @@ impl SyncEngine {
     /// between would find no pending confirmation, see the store ahead of
     /// the hub, and revert the write. A newer write re-arms the entry with
     /// its own value, so the entry always expects the latest one.
-    async fn arm_protection(&self, device_id: &DeviceId, expected_state: &DeviceStateValue) {
+    ///
+    /// Returns the write's generation ([`PendingConfirmation::generation`]).
+    async fn arm_protection(&self, device_id: &DeviceId, expected_state: &DeviceStateValue) -> u64 {
+        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut pending = self.pending_confirmations.write().await;
         pending.insert(
             device_id.clone(),
@@ -662,31 +748,50 @@ impl SyncEngine {
                 sent_at: Instant::now(),
                 protection_window: self.config.protection_window,
                 pushed: false,
+                generation,
             },
         );
         debug!(
             "🛡️ SYNC_DEBUG: Armed pending confirmation for {} - {:?} protection window!",
             device_id, self.config.protection_window
         );
+        generation
     }
 
     /// 🛡️ Restart the protection window as a buffered push goes out, so it
     /// still covers the hub's confirmation, and mark the entry
     /// [`PendingConfirmation::pushed`] if this push carries its value.
     ///
-    /// `expected_state` stays as it is. Every write sets it, so it already
-    /// holds `pushed` (the buffer keeps only the latest value) or a newer
-    /// write that came in after this push was drained. Writing `pushed` back
-    /// would move the expectation back to a stale value, and the hub
-    /// confirming that stale value would then revert the newer write. For
-    /// the same reason a stale push doesn't mark the entry pushed: the newer
-    /// value hasn't gone out yet. If there is no entry (a pull already
-    /// confirmed it, or it expired), the push re-arms one for `pushed`.
-    async fn refresh_protection(&self, device_id: &DeviceId, pushed: &DeviceStateValue) {
+    /// Usually `expected_state` stays as it is. Every write sets it, so it
+    /// already holds `pushed` (the buffer keeps only the latest value) or a
+    /// newer write that came in after this push was drained. Writing
+    /// `pushed` back would move the expectation back to a stale value, and
+    /// the hub confirming that stale value would then revert the newer
+    /// write. For the same reason a stale push doesn't mark the entry
+    /// pushed: the newer value hasn't gone out yet. If there is no entry (a
+    /// pull already confirmed it, or it expired), the push re-arms one for
+    /// `pushed`, with its write's `generation`.
+    ///
+    /// An entry older than this push's write (a lower `generation`) was
+    /// re-armed that way by an older push, after this write's own entry ran
+    /// out while its push waited. This push takes it over (#50 review): it's
+    /// the latest write. Left on the older write, the entry dropped this
+    /// write's retries as superseded, and the hub and the store ended on the
+    /// older value.
+    async fn refresh_protection(
+        &self,
+        device_id: &DeviceId,
+        pushed: &DeviceStateValue,
+        generation: u64,
+    ) {
         let mut pending = self.pending_confirmations.write().await;
         if let Some(confirmation) = pending.get_mut(device_id) {
             confirmation.sent_at = Instant::now();
-            if Self::states_equal(&confirmation.expected_state, pushed) {
+            if generation > confirmation.generation {
+                confirmation.expected_state = pushed.clone();
+                confirmation.generation = generation;
+                confirmation.pushed = true;
+            } else if Self::states_equal(&confirmation.expected_state, pushed) {
                 confirmation.pushed = true;
             }
             debug!(
@@ -702,6 +807,7 @@ impl SyncEngine {
                     sent_at: Instant::now(),
                     protection_window: self.config.protection_window,
                     pushed: true,
+                    generation,
                 },
             );
             debug!(
@@ -727,7 +833,7 @@ impl SyncEngine {
         for task in tasks {
             if let Err(e) = self.execute_sync_task(&task).await {
                 warn!("Sync task failed: {:?}, error: {}", task, e);
-                self.queue_retry(&task, e.to_string(), 0, false).await;
+                self.queue_retry(&task, e.to_string(), 0, false, 0).await;
             }
         }
 
@@ -786,17 +892,17 @@ impl SyncEngine {
         match result {
             Ok(()) => {
                 // Success - update status
-                let mut status = self.sync_status.write().await;
-                status.insert(
+                self.sync_status.write().await.insert(
                     task.device_id.clone(),
                     SyncStatus::InSync {
                         last_synced: chrono::Utc::now().timestamp_millis().cast_unsigned(),
                     },
                 );
 
-                // Remove from retry queue if it was there
-                let mut retry_queue = self.retry_queue.write().await;
-                retry_queue.remove(&task.device_id);
+                // Remove from retry queue if it was there: a retry of the
+                // same kind only (#45). A pull's success says nothing about
+                // a push waiting to be retried.
+                self.retry_queue.write().await.remove(&retry_key(task));
 
                 // 🔥 Clear optimistic state after successful sync!
                 if matches!(&task.task_type, SyncTaskType::PushToGateway { .. }) {
@@ -810,8 +916,7 @@ impl SyncEngine {
             }
             Err(e) => {
                 // Failed - update status
-                let mut status = self.sync_status.write().await;
-                status.insert(
+                self.sync_status.write().await.insert(
                     task.device_id.clone(),
                     SyncStatus::Failed {
                         error: e.to_string(),
@@ -956,9 +1061,7 @@ impl SyncEngine {
                 // Only push server state to gateway for writable device types
                 if Self::is_device_writable(server_state) && !Self::is_problematic_outlet(device_id)
                 {
-                    self.gateway
-                        .set_device_state(device_id, server_state.clone())
-                        .await?;
+                    self.buffer_server_state(device_id, gateway_state).await;
                 } else {
                     // For read-only devices (sensors) or problematic outlets, always use gateway state
                     debug!(
@@ -1010,9 +1113,7 @@ impl SyncEngine {
                     if Self::is_device_writable(server_state)
                         && !Self::is_problematic_outlet(device_id)
                     {
-                        self.gateway
-                            .set_device_state(device_id, server_state.clone())
-                            .await?;
+                        self.buffer_server_state(device_id, gateway_state).await;
                     } else {
                         // For read-only devices (sensors) or problematic outlets, always use gateway state
                         debug!("Device {} is read-only or problematic outlet, using gateway state instead", device_id);
@@ -1069,10 +1170,61 @@ impl SyncEngine {
         resolution
     }
 
+    /// 🔥 A pull found `device_id` on `gateway_state` and the server wins
+    /// the conflict: queue the store's value in the sync buffer, for the
+    /// buffer worker to push like any other (#45).
+    ///
+    /// The pull used to push it to the gateway itself, so it could be in
+    /// flight while the buffer worker pushed a newer user write of the same
+    /// device. A hub that answered the newer PATCH first ended on the older
+    /// value. Through the buffer, every push of a device goes out from the
+    /// buffer worker, one at a time and in order, and a write made after
+    /// this replaces it before it goes out, or follows it.
+    ///
+    /// Under the buffer lock, so no write comes in between the checks and
+    /// the queueing: a user write waiting in the buffer, or one whose
+    /// pending confirmation was armed since the pull checked for one, owns
+    /// the device's push, and the store is read again for its latest value.
+    async fn buffer_server_state(&self, device_id: &DeviceId, gateway_state: &DeviceStateValue) {
+        let mut buffer = self.sync_buffer.write().await;
+        if buffer.contains_key(device_id)
+            || self
+                .pending_confirmations
+                .read()
+                .await
+                .contains_key(device_id)
+        {
+            debug!(
+                "Conflict for {}: a user write is queued or unconfirmed - it wins",
+                device_id
+            );
+            return;
+        }
+        let Some(device) = self.store.get_device(device_id).await else {
+            return;
+        };
+        if Self::states_equal(&device.state, gateway_state) {
+            return;
+        }
+        Self::buffer_push(
+            &mut buffer,
+            device_id,
+            SyncBufferEntry {
+                state: device.state,
+                updated_at: Instant::now(),
+                priority: SyncPriority::High, // State conflicts
+                protected: false,
+                failed_attempts: 0,
+                generation: 0,
+            },
+        );
+    }
+
     /// Schedule a retry of `task`, which just failed after `failed_before`
     /// earlier failures of the same write, with exponential backoff. After
     /// `max_retry_attempts` failures, the first one included, it's given up.
-    /// `protected`: it's a user write ([`SyncBufferEntry::protected`]).
+    /// `protected`: it's a user write ([`SyncBufferEntry::protected`]), the
+    /// one with that `generation`.
     ///
     /// The count is per write (#32). It travels with the retry through the
     /// sync buffer, a newer write starts from 0, and its retry replaces the
@@ -1080,12 +1232,17 @@ impl SyncEngine {
     /// supersedes). It used to be per device, so a new write to a device
     /// with failures behind it was given up early. The first failure used to
     /// skip the cap, so `max_retry_attempts: 1` still retried once.
+    ///
+    /// Waiting retries are keyed per device and kind of task (#45), so a
+    /// pull's retry and a push's retry of one device don't replace each
+    /// other.
     async fn queue_retry(
         &self,
         task: &SyncTask,
         error: String,
         failed_before: u32,
         protected: bool,
+        generation: u64,
     ) {
         let attempts = failed_before.saturating_add(1);
         let mut retry_queue = self.retry_queue.write().await;
@@ -1097,7 +1254,7 @@ impl SyncEngine {
                 "❌ Max retry attempts ({}) reached for device {}, giving up",
                 attempts, task.device_id
             );
-            retry_queue.remove(&task.device_id);
+            retry_queue.remove(&retry_key(task));
             return;
         }
 
@@ -1111,13 +1268,14 @@ impl SyncEngine {
             .unwrap_or(self.config.max_retry_delay)
             .min(self.config.max_retry_delay);
         retry_queue.insert(
-            task.device_id.clone(),
+            retry_key(task),
             RetryEntry {
                 task: task.clone(),
                 attempts,
                 next_retry: Instant::now() + delay,
                 last_error: Some(error),
                 protected,
+                generation,
             },
         );
 
@@ -1146,17 +1304,25 @@ impl SyncEngine {
             if let SyncTaskType::PushToGateway { .. } = retry.task.task_type {
                 self.requeue_retry(retry).await;
             } else if let Err(e) = self.execute_sync_task(&retry.task).await {
-                self.queue_retry(&retry.task, e.to_string(), retry.attempts, retry.protected)
-                    .await;
+                self.queue_retry(
+                    &retry.task,
+                    e.to_string(),
+                    retry.attempts,
+                    retry.protected,
+                    retry.generation,
+                )
+                .await;
             }
         }
 
         Ok(())
     }
 
-    /// 🔁 Put a due push retry back into the sync buffer, with the value
-    /// [`Self::latest_push_state`] picks, for the buffer worker to send like
-    /// any other push (#32).
+    /// 🔁 Put a due push retry back into the sync buffer, for the buffer
+    /// worker to send like any other push (#32), unless it's no longer
+    /// current: a write waiting in the buffer supersedes it (the next drain
+    /// pushes that, and it gets its own retries if it fails), or
+    /// [`Self::retry_is_current`] says its write is done with.
     ///
     /// So every push of a device goes out from the buffer worker, one at a
     /// time and in order. The retry worker used to send it to the gateway
@@ -1166,78 +1332,82 @@ impl SyncEngine {
     /// took for its confirmation; once the window ran out, the pull took the
     /// hub's value, and the user's write was reverted and never pushed again.
     ///
-    /// The entry keeps the retry's failure count and whether it's a user
-    /// write. Being a retry, its push doesn't restart the protection window:
-    /// only a write's own push does.
+    /// The entry keeps the retry's value, its failure count, and which user
+    /// write it retries, if any. Being a retry, its push doesn't restart the
+    /// protection window: only a write's own push does. The buffer worker
+    /// checks once more that it's current right before it goes out.
     async fn requeue_retry(&self, retry: RetryEntry) {
         let device_id = &retry.task.device_id;
+        let SyncTaskType::PushToGateway { new_state } = &retry.task.task_type else {
+            return;
+        };
+        // Under the buffer lock, so no write can come in between the checks
+        // and the queueing.
         let mut buffer = self.sync_buffer.write().await;
-        #[expect(
-            clippy::single_match_else,
-            reason = "kept as a match, not reshaped to if-let/else, while it holds the sync buffer lock across the latest_push_state() await (#32 review)"
-        )]
-        match self.latest_push_state(&buffer, &retry).await {
-            Some(state) => Self::buffer_push(
-                &mut buffer,
-                device_id,
-                &state,
-                retry.task.priority.clone(),
-                retry.protected,
-                retry.attempts,
-            ),
-            None => debug!(
-                "🔁 Retry for {} dropped: a newer write is queued, the write was confirmed \
-                 or abandoned, or the device is gone",
+        if buffer.contains_key(device_id)
+            || !self
+                .retry_is_current(device_id, retry.protected, retry.generation)
+                .await
+        {
+            debug!(
+                "🔁 Retry for {} dropped: a newer write is queued, the write was confirmed, \
+                 abandoned or superseded, or the device is gone",
                 device_id
-            ),
+            );
+            return;
         }
+        Self::buffer_push(
+            &mut buffer,
+            device_id,
+            SyncBufferEntry {
+                state: new_state.clone(),
+                updated_at: Instant::now(),
+                priority: retry.task.priority.clone(),
+                protected: retry.protected,
+                failed_attempts: retry.attempts,
+                generation: retry.generation,
+            },
+        );
     }
 
-    /// 🔁 What a due push `retry` sends now, or `None` if there's nothing
-    /// left to retry. `buffer` is the sync buffer, under the lock the caller
-    /// holds to queue the retry, so no write can come in between.
+    /// 🔁 Whether a push retry of `device_id` still has something to do.
+    /// `protected` and `generation` say which write it retries (see
+    /// [`RetryEntry`]). A retry resends its own value, never another one.
     ///
-    /// A retry sends the device's latest value, not the value that failed
-    /// (#32): that one may be older than a write made since, and landing
-    /// after it would overwrite it on the hub.
+    /// - A user write's retry (`protected`) is current while the device's
+    ///   pending confirmation is still that write's: same `generation`
+    ///   (#45). Otherwise the hub confirmed the write; or its window ran out
+    ///   and the pull took the hub's value, and the write is abandoned
+    ///   rather than pushed after the UI already showed it reverted; or a
+    ///   newer write superseded it, and that write's own push and retries
+    ///   carry the device's latest value.
     ///
-    /// - A write waiting in the sync buffer supersedes the retry: the next
-    ///   drain pushes it, and it gets its own retries if that fails.
-    /// - Otherwise a pending confirmation's `expected_state` is the latest
-    ///   user write (every write re-arms it, under the buffer lock held
-    ///   here). With `optimistic_updates` off, the store doesn't have it yet.
-    /// - Otherwise a user write has nothing left to retry. The hub confirmed
-    ///   it, or its window ran out and the pull took the hub's value: the
-    ///   write is abandoned rather than pushed after the UI already showed it
-    ///   reverted. This used to resend the store's value (#32 review), which
-    ///   by then is the hub's own, or a stale one that undoes a switch change
-    ///   the next pull hasn't seen yet.
-    /// - A push that never had a pending confirmation (a `queue_sync` push
-    ///   below `Critical`) resends its own value, while the device is still
-    ///   in the store.
-    async fn latest_push_state(
+    ///   A retry used to send the pending entry's value instead, whichever
+    ///   write that was (#32). So the retry of an older write that came due
+    ///   while a newer write's PATCH was in flight sent the newer value
+    ///   again: a duplicate PATCH that went out after the newer one landed,
+    ///   and undid a physical switch change made in between.
+    /// - Any other push (a `queue_sync` push below `Critical`, a pull's
+    ///   `ServerWins` push) is current while the device is in the store and
+    ///   no user write is pending on it: a pending user write owns the
+    ///   device's pushes. Such a retry used to take that write's value, and
+    ///   carry it on past the write's confirmation or abandonment (#45).
+    async fn retry_is_current(
         &self,
-        buffer: &HashMap<DeviceId, SyncBufferEntry>,
-        retry: &RetryEntry,
-    ) -> Option<DeviceStateValue> {
-        let device_id = &retry.task.device_id;
-        if buffer.contains_key(device_id) {
-            return None;
-        }
-        let expected = self
+        device_id: &DeviceId,
+        protected: bool,
+        generation: u64,
+    ) -> bool {
+        let pending = self
             .pending_confirmations
             .read()
             .await
             .get(device_id)
-            .map(|confirmation| confirmation.expected_state.clone());
-        if expected.is_some() || retry.protected {
-            return expected;
+            .map(|confirmation| confirmation.generation);
+        if protected {
+            return pending == Some(generation);
         }
-        self.store.get_device(device_id).await?;
-        match &retry.task.task_type {
-            SyncTaskType::PushToGateway { new_state } => Some(new_state.clone()),
-            _ => None,
-        }
+        pending.is_none() && self.store.get_device(device_id).await.is_some()
     }
 
     /// One pull cycle: read every device in the store from the gateway and
@@ -1297,34 +1467,50 @@ impl SyncEngine {
         Ok(())
     }
 
-    /// 🧹 Drop the pending confirmations and optimistic-state records of
-    /// devices that are no longer in the store (#32).
+    /// 🧹 Drop the pending confirmations, optimistic-state records and sync
+    /// statuses of devices that are no longer in the store (#32, #45).
     ///
     /// Nothing else would: a pending confirmation is only cleared by a pull
     /// of its device (or a write's failed store write), and pulls only read
     /// devices in the store. A device that came back under the same id
     /// (rediscovered, say) would start with a stale window that ignores its
-    /// first real changes.
+    /// first real changes. A removed device's sync status only went stale,
+    /// and was counted in [`Self::get_sync_stats`] for good.
     ///
     /// This takes the buffer lock, then the pending one (the engine's lock
     /// order), so it can't run in the middle of a write: a write arms its
     /// entry and checks the store in one critical section under the buffer
-    /// lock (see [`Self::apply_optimistic_update`]).
+    /// lock (see [`Self::apply_optimistic_update`]). The sync statuses are
+    /// pruned after those locks are released, under their own.
     async fn forget_removed_devices(&self) {
-        let _buffer = self.sync_buffer.write().await;
-        let mut pending = self.pending_confirmations.write().await;
-        let mut optimistic = self.optimistic_states.write().await;
-        let tracked: Vec<DeviceId> = pending.keys().chain(optimistic.keys()).cloned().collect();
+        {
+            let _buffer = self.sync_buffer.write().await;
+            let mut pending = self.pending_confirmations.write().await;
+            let mut optimistic = self.optimistic_states.write().await;
+            let tracked: Vec<DeviceId> = pending.keys().chain(optimistic.keys()).cloned().collect();
+            for device_id in tracked {
+                if self.store.get_device(&device_id).await.is_none() {
+                    let had_pending = pending.remove(&device_id).is_some();
+                    optimistic.remove(&device_id);
+                    if had_pending {
+                        debug!(
+                            "🧹 {} is gone from the store - dropped its pending confirmation",
+                            device_id
+                        );
+                    }
+                }
+            }
+        }
+
+        let mut status = self.sync_status.write().await;
+        let tracked: Vec<DeviceId> = status.keys().cloned().collect();
         for device_id in tracked {
             if self.store.get_device(&device_id).await.is_none() {
-                let had_pending = pending.remove(&device_id).is_some();
-                optimistic.remove(&device_id);
-                if had_pending {
-                    debug!(
-                        "🧹 {} is gone from the store - dropped its pending confirmation",
-                        device_id
-                    );
-                }
+                status.remove(&device_id);
+                debug!(
+                    "🧹 {} is gone from the store - dropped its sync status",
+                    device_id
+                );
             }
         }
     }
