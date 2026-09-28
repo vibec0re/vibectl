@@ -94,7 +94,11 @@ enum ApiResponse {
         devices: Vec<DeviceState>,
         total_count: u32,
     }, // 🔥 Fixed to match server!
+    /// `device_id` is whose state it is (#10). A server from before it
+    /// doesn't send one.
     DeviceState {
+        #[serde(default)]
+        device_id: Option<String>,
         state: DeviceStateValue,
     },
     LightUpdated {
@@ -154,7 +158,13 @@ impl App {
         // 🔥 GET XDG STATE DIR FOR FAVORITES! 💖
         let favorites_path = Self::get_favorites_path();
         let favorites = Self::load_favorites(&favorites_path);
+        Self::with_favorites(server_url, favorites_path, favorites)
+    }
 
+    /// A fresh app with `favorites`, saved to `favorites_path`. [`Self::new`]
+    /// loads them from the user's state directory (creating it if needed);
+    /// a test passes its own, and leaves that directory alone.
+    fn with_favorites(server_url: String, favorites_path: PathBuf, favorites: Vec<String>) -> Self {
         Self {
             devices: Vec::new(),
             selected_device: 0,
@@ -585,29 +595,14 @@ fn handle_api_response(app: &mut App, response: ApiResponse) {
             app.status_message = format!("🎯 Found {total_count} devices!");
             app.add_event(&format!("📡 Loaded {total_count} devices"));
         }
-        ApiResponse::DeviceState { state } => {
-            // For now, just update the first matching device by type
-            // TODO: Need device_id in the state response to match properly
-            for device in &mut app.devices {
-                let type_matches = matches!(
-                    (&device.state, &state),
-                    (DeviceStateValue::Light(_), DeviceStateValue::Light(_))
-                        | (DeviceStateValue::Outlet(_), DeviceStateValue::Outlet(_))
-                        | (DeviceStateValue::Switch(_), DeviceStateValue::Switch(_))
-                        | (DeviceStateValue::Sensor(_), DeviceStateValue::Sensor(_))
-                        | (
-                            DeviceStateValue::MotionSensor(_),
-                            DeviceStateValue::MotionSensor(_)
-                        )
-                );
-
-                if type_matches {
-                    device.state = state.clone();
-                    device.last_updated = Instant::now();
-                    break;
-                }
-            }
-        }
+        // Matched by id (#10). A server from before that doesn't say whose
+        // state it is, and its answer is dropped below: guessing by type put
+        // it on the first device of that type, so with two lights, light B's
+        // state landed on light A's row.
+        ApiResponse::DeviceState {
+            device_id: Some(device_id),
+            state,
+        } => app.update_device_state(&device_id, state),
         ApiResponse::LightUpdated { new_state: _ } => {
             app.status_message = "💡 Light updated!".to_string();
             app.add_event("💡 Light state changed");
@@ -1608,5 +1603,74 @@ mod tests {
         let fresh: Vec<bool> = devices.iter().map(|d| d.last_updated > long_ago).collect();
         assert_eq!(fresh, [true, true, false], "just updated: c, b, not a");
         assert_eq!(devices[1].state, light("b", true).state, "b's new state");
+    }
+
+    /// #10: a `DeviceState` answer lands on the device it names. It used to
+    /// land on the first device of the same type, so with two lights, `b`'s
+    /// state went to `a`'s row. An answer from a server that doesn't name
+    /// the device (from before #10, decoded here from its own shape) is
+    /// dropped rather than guessed.
+    #[test]
+    fn a_device_state_answer_lands_on_the_device_it_names() {
+        #[derive(Serialize)]
+        enum OlderServerResponse {
+            DeviceState { state: DeviceStateValue },
+        }
+
+        let long_ago = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let mut app = App::with_favorites(String::new(), PathBuf::new(), Vec::new());
+        app.devices = [light("a", false), light("b", false)]
+            .into_iter()
+            .map(|device| AppDevice {
+                info: device.device_info,
+                state: device.state,
+                last_updated: long_ago,
+            })
+            .collect();
+        let rows = |app: &App| -> Vec<(bool, bool)> {
+            app.devices
+                .iter()
+                .map(|d| (d.state == light("", true).state, d.last_updated > long_ago))
+                .collect()
+        };
+
+        handle_api_response(
+            &mut app,
+            ApiResponse::DeviceState {
+                device_id: Some("b".to_string()),
+                state: light("b", true).state,
+            },
+        );
+        assert_eq!(
+            rows(&app),
+            [(false, false), (true, true)],
+            "(on, just updated): b only"
+        );
+
+        let mut older = Vec::new();
+        ciborium::into_writer(
+            &OlderServerResponse::DeviceState {
+                state: light("a", true).state,
+            },
+            &mut older,
+        )
+        .unwrap();
+        let older: ApiResponse = ciborium::from_reader(older.as_slice()).expect("still decodes");
+        assert!(
+            matches!(
+                older,
+                ApiResponse::DeviceState {
+                    device_id: None,
+                    ..
+                }
+            ),
+            "{older:?}"
+        );
+        handle_api_response(&mut app, older);
+        assert_eq!(
+            rows(&app),
+            [(false, false), (true, true)],
+            "an answer that doesn't name its device changes nothing"
+        );
     }
 }
