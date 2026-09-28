@@ -11,7 +11,7 @@
 // part of it.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -111,6 +111,8 @@ pub struct TestHub {
     /// What a pull reads, per device. A device not in here (a sentinel)
     /// reads as `Empty`.
     reported: Mutex<HashMap<DeviceId, DeviceStateValue>>,
+    /// Devices whose reads fail (logged all the same).
+    failing_reads: Mutex<HashSet<DeviceId>>,
     /// Read when a PATCH passes the gate, so a test can change it while
     /// `PATCHes` are held.
     on_set: Mutex<OnSet>,
@@ -130,6 +132,7 @@ impl TestHub {
         }
         Arc::new(Self {
             reported: Mutex::new(HashMap::new()),
+            failing_reads: Mutex::new(HashSet::new()),
             on_set: Mutex::new(on_set),
             gate,
             picked: watch::channel(vec![]).0,
@@ -145,6 +148,11 @@ impl TestHub {
 
     pub fn reported(&self, id: &str) -> Option<DeviceStateValue> {
         self.reported.lock().unwrap().get(id).cloned()
+    }
+
+    /// Reads of `id` fail from now on (a device that dropped off the mesh).
+    pub fn fail_reads_of(&self, id: &str) {
+        self.failing_reads.lock().unwrap().insert(id.to_string());
     }
 
     /// What the hub does with the `PATCHes` that pass the gate from now on,
@@ -212,8 +220,12 @@ impl Gateway for TestHub {
             .get(device_id)
             .cloned()
             .unwrap_or(DeviceStateValue::Empty);
+        let fails = self.failing_reads.lock().unwrap().contains(device_id);
         self.log
             .send_modify(|log| log.reads.push(device_id.clone()));
+        if fails {
+            return Err(GatewayError::DeviceUnreachable(device_id.clone()));
+        }
         Ok(state)
     }
 
