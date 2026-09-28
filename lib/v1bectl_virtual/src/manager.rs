@@ -1,6 +1,6 @@
 use crate::button_controller::ButtonAction;
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +22,11 @@ use v1bectl_sync::{
 /// echo. So they never interleave. A second write can't land between a
 /// first write's fan-out and its commits, and echoes go out in the order the
 /// store changed.
+///
+/// The one exception is a scene's transition, which waits between its steps
+/// (#58). It runs without the lock, and only its commit takes it, so a fade
+/// doesn't hold up everything else while it waits. What overlaps it is
+/// ordered by commit (see [`Self::set_virtual_device_state`]).
 pub struct VirtualDeviceManager {
     /// All virtual devices indexed by device ID
     virtual_devices: Arc<RwLock<HashMap<DeviceId, Box<dyn VirtualDevice>>>>,
@@ -702,18 +707,78 @@ impl VirtualDeviceManager {
     /// longer accounts for those members, so input tracking re-derives it
     /// from them like after any outside change: the group ends up showing
     /// what happened.
+    ///
+    /// # A scene's transition runs without the lock (#58)
+    ///
+    /// A write whose plan takes time, a scene that fades or steps through a
+    /// sequence, is planned without the `virtual_devices` lock, delays and
+    /// all ([`VirtualDevice::plan_write_detached`]). The lock is taken
+    /// only to look the device up and hand out the plan, and again to
+    /// commit where the transition ends. That commit is still one hold of
+    /// the lock: the members, the scene's own state and their echoes, with
+    /// no other virtual write in between. A one-second fade used to hold
+    /// the lock for its whole second, and every other virtual write, input
+    /// tracking, resync and button press waited it out.
+    ///
+    /// So what overlaps a transition is ordered by commit, and the last
+    /// commit wins:
+    ///
+    /// - **A write to the scene's lights during the transition** (a group
+    ///   write, a button action, or a direct write through the API) lands
+    ///   at once. Where it shares lights with the scene, the scene's commit
+    ///   then overwrites it when the transition ends. A direct write to a
+    ///   light always went that way, since it never took this lock. A group
+    ///   write used to wait out the transition instead, and land after it.
+    /// - **Two activations of one scene controller** commit in the order
+    ///   their transitions end, not the order they started. An instant
+    ///   scene activated during a fade lands at once, and the fade then
+    ///   overwrites it when it ends. The controller's own state is always
+    ///   the scene of its last commit, and its lights are where that commit
+    ///   put them, in the store and in the controller alike. (Each commit
+    ///   is all or nothing against other virtual writes, so two scenes'
+    ///   lights never end up mixed.)
+    /// - **A scene controller removed during its transition** commits
+    ///   nothing when the transition ends. The activation fails with
+    ///   `DeviceNotFound`, as a write to a device the manager doesn't have
+    ///   does. Removal used to wait out the transition.
+    ///
+    /// None of this can deadlock: the plan holds no lock while it waits,
+    /// and the commit takes only the lock every other write takes.
+    ///
+    /// Everything else is as it was: the same final states, the same
+    /// delays before the commit, the same echoes, and the same error for a
+    /// device the store doesn't have. A write that doesn't wait (a group
+    /// write, an instant scene, a deactivation) is still planned and
+    /// committed under one hold of the lock.
     pub async fn set_virtual_device_state(
         &self,
         device_id: &DeviceId,
         new_state: DeviceStateValue,
     ) -> Result<(), VirtualDeviceError> {
-        // Held to the end (see the type's docs).
         let mut devices = self.virtual_devices.write().await;
-        self.write_virtual(&mut devices, device_id, new_state).await
+        let Some(virtual_device) = devices.get(device_id) else {
+            return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
+        };
+        let Some(plan) = virtual_device.plan_write_detached(&new_state) else {
+            // Held to the end (see the type's docs).
+            return self.write_virtual(&mut devices, device_id, new_state).await;
+        };
+
+        // A plan that waits runs without the lock (see above), and takes it
+        // again only to commit.
+        drop(devices);
+        let planned = plan.await;
+        let mut devices = self.virtual_devices.write().await;
+        if !devices.contains_key(device_id) {
+            // Removed while its plan ran: nothing to commit it for.
+            return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
+        }
+        self.commit_write(&mut devices, device_id, planned).await
     }
 
     /// [`Self::set_virtual_device_state`], for a caller that already holds
-    /// the `virtual_devices` lock: `devices` is what it guards.
+    /// the `virtual_devices` lock: `devices` is what it guards. The write is
+    /// planned and committed in that one hold.
     async fn write_virtual(
         &self,
         devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
@@ -729,7 +794,21 @@ impl VirtualDeviceManager {
         // (#55). The device writing its members into the store itself, for
         // the manager to commit after, left a gap a pull could revert them
         // in.
-        let result = match virtual_device.plan_write(new_state).await {
+        let planned = virtual_device.plan_write(new_state).await;
+        self.commit_write(devices, device_id, planned).await
+    }
+
+    /// Commit `planned`, the write `device_id` planned (or the error its
+    /// plan failed with): its members, in order, then its own new state,
+    /// stored and echoed. `devices` is what the `virtual_devices` lock
+    /// guards, which the caller holds, and which has `device_id`.
+    async fn commit_write(
+        &self,
+        devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        device_id: &DeviceId,
+        planned: Result<VirtualWrite, VirtualDeviceError>,
+    ) -> Result<(), VirtualDeviceError> {
+        let result = match planned {
             Ok(write) => self
                 .commit_members(devices, write.members)
                 .await
@@ -1491,18 +1570,31 @@ mod tests {
         assert_eq!(echoes(&events, "scene"), vec![evening], "scene echo");
     }
 
-    /// Scene controller `scene`, with one scene, `evening`, that takes each
-    /// of `devices` to its state with `transition` (a `TransitionType`, as
-    /// its config has it).
-    fn scene(
-        store: &Arc<StateStore>,
+    /// Scene `name`, as a scene controller's config has it: it takes each
+    /// of `devices` to its state with `transition` (a `TransitionType`).
+    fn scene_config(
+        name: &str,
         devices: &[(&str, DeviceStateValue)],
         transition: &serde_json::Value,
-    ) -> SceneController {
+    ) -> (String, serde_json::Value) {
         let device_states: serde_json::Map<String, serde_json::Value> = devices
             .iter()
             .map(|(id, state)| ((*id).to_string(), serde_json::json!(state)))
             .collect();
+        let scene = serde_json::json!({
+            "name": name,
+            "device_states": device_states,
+            "transition_type": transition,
+        });
+        (name.to_string(), scene)
+    }
+
+    /// Scene controller `scene`, with `scenes` (see [`scene_config`]).
+    fn scene_controller(
+        store: &Arc<StateStore>,
+        scenes: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> SceneController {
+        let scenes: serde_json::Map<String, serde_json::Value> = scenes.into_iter().collect();
         SceneController::new(
             VirtualDeviceConfig {
                 device_id: "scene".to_string(),
@@ -1510,15 +1602,21 @@ mod tests {
                 name: "Scene".to_string(),
                 description: None,
                 enabled: true,
-                config: serde_json::json!({ "scenes": { "evening": {
-                    "name": "evening",
-                    "device_states": device_states,
-                    "transition_type": transition,
-                } } }),
+                config: serde_json::json!({ "scenes": scenes }),
             },
             store.clone(),
         )
         .expect("scene")
+    }
+
+    /// Scene controller `scene`, with one scene, `evening` (see
+    /// [`scene_config`]).
+    fn scene(
+        store: &Arc<StateStore>,
+        devices: &[(&str, DeviceStateValue)],
+        transition: &serde_json::Value,
+    ) -> SceneController {
+        scene_controller(store, [scene_config("evening", devices, transition)])
     }
 
     /// The scene `evening`, active: what activates it.
@@ -1659,6 +1757,193 @@ mod tests {
             no_scene(),
             "the scene's own state must match the store"
         );
+    }
+
+    /// A one-second fade of `a` to 80, activated on its own task, and where
+    /// its lights are when it ends.
+    fn fade_of_a() -> (
+        (String, serde_json::Value),
+        [(&'static str, DeviceStateValue); 1],
+    ) {
+        let targets = [("a", light(true, 80))];
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        (scene_config("evening", &targets, &fade), targets)
+    }
+
+    fn activate(
+        manager: &VirtualDeviceManager,
+        scene_name: &str,
+    ) -> tokio::task::JoinHandle<Result<(), VirtualDeviceError>> {
+        let manager = manager.clone();
+        let state = DeviceStateValue::Scene(SceneState {
+            scene_name: scene_name.to_string(),
+            is_active: true,
+        });
+        tokio::spawn(async move {
+            manager
+                .set_virtual_device_state(&"scene".to_string(), state)
+                .await
+        })
+    }
+
+    /// #58: a scene's transition doesn't hold the manager's lock while it
+    /// waits. A write to an unrelated group, 100 ms into a one-second fade,
+    /// lands at once, with the fade still running. It used to wait out the
+    /// rest of the fade, about 900 ms, and input tracking, resync and
+    /// button presses with it. The fade still ends at its target after its
+    /// full second. (A paused clock: "at once" is exactly zero.)
+    #[tokio::test(start_paused = true)]
+    async fn a_group_write_does_not_wait_for_a_fade() {
+        let store = StateStore::new();
+        for id in ["a", "c", "d"] {
+            store.add_device(light_info(id), off()).await;
+        }
+        let (manager, _bus) = manager_with_group_in(store.clone(), &["c", "d"]).await;
+        let (evening_config, targets) = fade_of_a();
+        manager
+            .add_virtual_device(Box::new(scene_controller(&store, [evening_config])))
+            .await
+            .expect("register");
+
+        let started = tokio::time::Instant::now();
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let asked = tokio::time::Instant::now();
+        manager
+            .set_virtual_device_state(&"g".to_string(), light(true, 60))
+            .await
+            .expect("group write");
+        assert_eq!(
+            asked.elapsed(),
+            Duration::ZERO,
+            "the group write waited for the fade"
+        );
+        assert!(!fade.is_finished(), "the fade is over already");
+        for id in ["c", "d"] {
+            assert_eq!(stored(&store, id).await, light(true, 60), "{id}");
+        }
+
+        fade.await.expect("fade task").expect("fade");
+        assert_eq!(started.elapsed(), Duration::from_secs(1), "fade time");
+        for (id, target) in &targets {
+            assert_eq!(&stored(&store, id).await, target, "{id} ends at its target");
+        }
+        assert_eq!(stored(&store, "scene").await, evening());
+    }
+
+    /// #58: what overlaps a scene's transition is ordered by commit, and the
+    /// last commit wins (see [`VirtualDeviceManager::set_virtual_device_state`]).
+    /// During a one-second fade of `a` to 80, a group write puts `a` at 60,
+    /// and then an instant scene of the same controller puts it at 30 and
+    /// becomes the active scene. Each lands at once. The fade commits last,
+    /// when it ends: `a` at 80, and the fade's scene active, in the store
+    /// and in the controller's own state. Nothing deadlocks, and each
+    /// commit's echoes come in the order the commits did.
+    #[tokio::test(start_paused = true)]
+    async fn what_overlaps_a_fade_is_ordered_by_commit_and_the_last_one_wins() {
+        let store = StateStore::new();
+        store.add_device(light_info("a"), off()).await;
+        let (manager, bus) = manager_with_group_in(store.clone(), &["a"]).await;
+        let (evening_config, targets) = fade_of_a();
+        let morning_config = scene_config(
+            "morning",
+            &[("a", light(true, 30))],
+            &serde_json::json!("Instant"),
+        );
+        manager
+            .add_virtual_device(Box::new(scene_controller(
+                &store,
+                [evening_config, morning_config],
+            )))
+            .await
+            .expect("register");
+        let morning = DeviceStateValue::Scene(SceneState {
+            scene_name: "morning".to_string(),
+            is_active: true,
+        });
+        let mut rx = bus.subscribe();
+
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let asked = tokio::time::Instant::now();
+        manager
+            .set_virtual_device_state(&"g".to_string(), light(true, 60))
+            .await
+            .expect("group write");
+        assert_eq!(stored(&store, "a").await, light(true, 60), "group write");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        manager
+            .set_virtual_device_state(&"scene".to_string(), morning.clone())
+            .await
+            .expect("morning");
+        assert_eq!(stored(&store, "a").await, light(true, 30), "morning");
+        assert_eq!(stored(&store, "scene").await, morning, "morning active");
+        assert_eq!(
+            asked.elapsed(),
+            Duration::from_millis(100),
+            "a write waited for the fade"
+        );
+        assert!(!fade.is_finished(), "the fade is over already");
+
+        fade.await.expect("fade task").expect("fade");
+        let events = pump(&manager, &mut rx).await;
+        for (id, target) in &targets {
+            assert_eq!(&stored(&store, id).await, target, "the fade commits last");
+        }
+        assert_eq!(stored(&store, "scene").await, evening(), "evening active");
+        assert_eq!(
+            manager
+                .get_virtual_device_state(&"scene".to_string())
+                .await
+                .unwrap(),
+            evening(),
+            "the scene's own state must match the store"
+        );
+        assert_eq!(
+            echoes(&events, "a"),
+            vec![light(true, 60), light(true, 30), light(true, 80)],
+            "a's echoes, in commit order"
+        );
+        assert_eq!(
+            echoes(&events, "scene"),
+            vec![morning, evening()],
+            "the scene's echoes, in commit order"
+        );
+    }
+
+    /// #58: a scene controller removed while its fade runs commits nothing
+    /// when the fade ends. The activation fails with `DeviceNotFound`, as a
+    /// write to a device the manager doesn't have does, and the fade's
+    /// lights stay where they were. (Removal used to wait out the fade,
+    /// behind the lock.)
+    #[tokio::test(start_paused = true)]
+    async fn a_scene_removed_during_its_fade_commits_nothing() {
+        let store = StateStore::new();
+        store.add_device(light_info("a"), off()).await;
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let (evening_config, _) = fade_of_a();
+        manager
+            .add_virtual_device(Box::new(scene_controller(&store, [evening_config])))
+            .await
+            .expect("register");
+
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        manager
+            .remove_virtual_device(&"scene".to_string())
+            .await
+            .expect("remove");
+        assert!(!fade.is_finished(), "the fade is over already");
+
+        let result = fade.await.expect("fade task");
+        assert!(
+            matches!(&result, Err(VirtualDeviceError::DeviceNotFound(id)) if id == "scene"),
+            "{result:?}"
+        );
+        assert_eq!(stored(&store, "a").await, off(), "a was committed");
+        assert!(store.get_device(&"scene".to_string()).await.is_none());
     }
 
     /// Scene devices and controller targets are outputs, not inputs. A

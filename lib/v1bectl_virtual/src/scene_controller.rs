@@ -1,5 +1,6 @@
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
+    DetachedPlan, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualWrite,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -10,6 +11,9 @@ use v1bectl_sync::{
     DeviceId, DeviceStateValue, LightState, SceneState, SensorState, StateStore, SwitchState,
 };
 
+/// How long each step of a fade is.
+const FADE_STEP: Duration = Duration::from_millis(100);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene {
     pub name: String,
@@ -17,11 +21,37 @@ pub struct Scene {
     pub transition_type: TransitionType,
 }
 
+impl Scene {
+    /// Whether activating it waits: a fade of at least one step, or a
+    /// sequence with a delay before one of its devices.
+    fn waits(&self) -> bool {
+        match &self.transition_type {
+            TransitionType::Instant => false,
+            TransitionType::Fade { duration_ms } => {
+                Duration::from_millis(*duration_ms) >= FADE_STEP
+            }
+            TransitionType::Sequence { delays_ms } => delays_ms
+                .iter()
+                .take(self.device_states.len())
+                .any(|&delay_ms| delay_ms > 0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransitionType {
     Instant,
     Fade { duration_ms: u64 },
     Sequence { delays_ms: Vec<u64> },
+}
+
+/// What a write to a scene controller asks of it.
+enum Activation {
+    /// `none`, or no name: deactivate the current scene. No device is
+    /// written.
+    Deactivate,
+    /// Activate the scene of that name.
+    Activate(String, Arc<Scene>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +84,9 @@ impl Staged {
 /// Scene Controller Virtual Device - manages multi-device scenes 🎬
 pub struct SceneController {
     config: VirtualDeviceConfig,
-    scenes: HashMap<String, Scene>,
+    /// Shared with the transitions that run without the manager's lock
+    /// (see `plan_write_detached`).
+    scenes: HashMap<String, Arc<Scene>>,
     current_scene: Option<String>,
     // kept: parsed from config and retained for upcoming animated scene
     // transitions; transitions are applied instantly for now.
@@ -73,6 +105,10 @@ impl SceneController {
         let scenes: HashMap<String, Scene> =
             serde_json::from_value(config.config.get("scenes").cloned().unwrap_or_default())
                 .map_err(|e| VirtualDeviceError::Config(format!("Invalid scenes config: {e}")))?;
+        let scenes = scenes
+            .into_iter()
+            .map(|(name, scene)| (name, Arc::new(scene)))
+            .collect();
 
         let transition_duration_ms: u64 = serde_json::from_value(
             config
@@ -96,6 +132,51 @@ impl SceneController {
         })
     }
 
+    /// What writing `new_state` asks of this controller. It only looks the
+    /// scene up, so it's quick, and reads nothing that can change.
+    fn activation(&self, new_state: &DeviceStateValue) -> Result<Activation, VirtualDeviceError> {
+        // Parse scene activation from scene state
+        let DeviceStateValue::Scene(scene_state) = new_state else {
+            return Err(VirtualDeviceError::InvalidStateType);
+        };
+        let scene_name = &scene_state.scene_name;
+        if scene_name == "none" || scene_name.is_empty() {
+            return Ok(Activation::Deactivate);
+        }
+        self.scenes.get(scene_name).map_or_else(
+            || {
+                Err(VirtualDeviceError::Config(format!(
+                    "Scene not found: {scene_name}"
+                )))
+            },
+            |scene| Ok(Activation::Activate(scene_name.clone(), Arc::clone(scene))),
+        )
+    }
+
+    /// The write `activation` takes: its devices where the scene's
+    /// transition leaves them (see [`Self::plan_activation`]), and the scene
+    /// active, or no device and no scene active for a deactivation. It
+    /// borrows nothing of the controller, so it can run without the
+    /// manager's lock (see [`VirtualDevice::plan_write_detached`]).
+    async fn plan(store: &StateStore, activation: Activation) -> VirtualWrite {
+        match activation {
+            Activation::Deactivate => VirtualWrite {
+                members: Vec::new(),
+                state: DeviceStateValue::Scene(SceneState {
+                    scene_name: "none".to_string(),
+                    is_active: false,
+                }),
+            },
+            Activation::Activate(scene_name, scene) => VirtualWrite {
+                members: Self::plan_activation(store, &scene).await,
+                state: DeviceStateValue::Scene(SceneState {
+                    scene_name,
+                    is_active: true,
+                }),
+            },
+        }
+    }
+
     /// The member writes that activating `scene` takes: where its
     /// transition leaves each of its devices, in the order it first sets
     /// them.
@@ -108,13 +189,16 @@ impl SceneController {
     /// doesn't have ends the transition where writing it used to fail, as
     /// its last write: the manager's commit of it fails the activation
     /// there.
-    async fn plan_activation(&self, scene: &Scene) -> Vec<(DeviceId, DeviceStateValue)> {
+    async fn plan_activation(
+        store: &StateStore,
+        scene: &Scene,
+    ) -> Vec<(DeviceId, DeviceStateValue)> {
         let mut staged = Staged::default();
         match scene.transition_type {
             TransitionType::Instant => {
                 // Set all devices immediately
                 for (device_id, state) in &scene.device_states {
-                    if !self.stage(&mut staged, device_id, state.clone()).await {
+                    if !Self::stage(store, &mut staged, device_id, state.clone()).await {
                         break;
                     }
                 }
@@ -122,13 +206,12 @@ impl SceneController {
             TransitionType::Fade { duration_ms } => {
                 // Calculate intermediate steps for smooth transitions
                 let duration = Duration::from_millis(duration_ms);
-                let step_duration = Duration::from_millis(100); // 100ms steps
-                let steps = (duration.as_millis() / step_duration.as_millis()) as usize;
+                let steps = (duration.as_millis() / FADE_STEP.as_millis()) as usize;
 
                 if steps == 0 {
                     // Just set immediately if duration too short
                     for (device_id, state) in &scene.device_states {
-                        if !self.stage(&mut staged, device_id, state.clone()).await {
+                        if !Self::stage(store, &mut staged, device_id, state.clone()).await {
                             break;
                         }
                     }
@@ -148,7 +231,7 @@ impl SceneController {
                     for (device_id, target_state) in &scene.device_states {
                         let current_state = match staged.get(device_id) {
                             Some(state) => state.clone(),
-                            None => self.state_store.get_device(device_id).await.map_or_else(
+                            None => store.get_device(device_id).await.map_or_else(
                                 || Self::get_default_state_for_target(target_state),
                                 |ds| ds.state,
                             ),
@@ -156,13 +239,13 @@ impl SceneController {
 
                         let interpolated_state =
                             Self::interpolate_states(&current_state, target_state, progress);
-                        if !self.stage(&mut staged, device_id, interpolated_state).await {
+                        if !Self::stage(store, &mut staged, device_id, interpolated_state).await {
                             break 'fade;
                         }
                     }
 
                     if step < steps {
-                        tokio::time::sleep(step_duration).await;
+                        tokio::time::sleep(FADE_STEP).await;
                     }
                 }
             }
@@ -174,7 +257,7 @@ impl SceneController {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         }
                     }
-                    if !self.stage(&mut staged, device_id, state.clone()).await {
+                    if !Self::stage(store, &mut staged, device_id, state.clone()).await {
                         break;
                     }
                 }
@@ -188,13 +271,13 @@ impl SceneController {
     /// into the store. Returns whether the store has the device: a write to
     /// one it doesn't have failed, and ended the activation.
     async fn stage(
-        &self,
+        store: &StateStore,
         staged: &mut Staged,
         device_id: &DeviceId,
         state: DeviceStateValue,
     ) -> bool {
         staged.set(device_id, state);
-        self.state_store.get_device(device_id).await.is_some()
+        store.get_device(device_id).await.is_some()
     }
 
     /// Get default state for a target device type
@@ -320,37 +403,29 @@ impl VirtualDevice for SceneController {
         &self,
         new_state: DeviceStateValue,
     ) -> Result<VirtualWrite, VirtualDeviceError> {
-        // Parse scene activation from scene state
-        let scene_name = match new_state {
-            DeviceStateValue::Scene(ref scene_state) => scene_state.scene_name.clone(),
-            _ => return Err(VirtualDeviceError::InvalidStateType),
+        Ok(Self::plan(&self.state_store, self.activation(&new_state)?).await)
+    }
+
+    /// [`Self::plan_write`] as a plan of its own, for an activation whose
+    /// transition waits: a fade, or a sequence with a delay (#58). It holds
+    /// the scene and the store, and nothing of the controller, so its
+    /// delays pass without the manager's lock.
+    ///
+    /// An activation that doesn't wait (an instant scene, a fade shorter
+    /// than a step, a deactivation, or a write that fails at once) is
+    /// `None`: the manager plans and commits it under one hold of its lock,
+    /// as before.
+    fn plan_write_detached(&self, new_state: &DeviceStateValue) -> Option<DetachedPlan> {
+        let Ok(Activation::Activate(scene_name, scene)) = self.activation(new_state) else {
+            return None;
         };
-
-        if scene_name == "none" || scene_name.is_empty() {
-            // Deactivate current scene
-            return Ok(VirtualWrite {
-                members: Vec::new(),
-                state: DeviceStateValue::Scene(SceneState {
-                    scene_name: "none".to_string(),
-                    is_active: false,
-                }),
-            });
+        if !scene.waits() {
+            return None;
         }
-
-        if let Some(scene) = self.scenes.get(&scene_name) {
-            // Activate the scene
-            Ok(VirtualWrite {
-                members: self.plan_activation(scene).await,
-                state: DeviceStateValue::Scene(SceneState {
-                    scene_name,
-                    is_active: true,
-                }),
-            })
-        } else {
-            Err(VirtualDeviceError::Config(format!(
-                "Scene not found: {scene_name}"
-            )))
-        }
+        let store = Arc::clone(&self.state_store);
+        Some(Box::pin(async move {
+            Ok(Self::plan(&store, Activation::Activate(scene_name, scene)).await)
+        }))
     }
 
     fn take_state(&mut self, state: DeviceStateValue) {
@@ -525,6 +600,54 @@ mod tests {
             "the delays up to the missing device (at {at} of {order:?})"
         );
         assert_eq!(write.members, want, "up to the missing device");
+    }
+
+    /// #58: only an activation that waits is planned apart from the
+    /// controller, without the manager's lock: a fade of at least one step,
+    /// or a sequence with a delay before one of its devices. Everything
+    /// else is planned and committed in one hold of the lock, as before.
+    #[tokio::test]
+    async fn only_an_activation_that_waits_is_planned_detached() {
+        let store = store_with(&["a", "b"]).await;
+        let targets = [("a", light(true, 10)), ("b", light(true, 20))];
+        let named = |scene_name: &str| {
+            DeviceStateValue::Scene(SceneState {
+                scene_name: scene_name.to_string(),
+                is_active: true,
+            })
+        };
+        let sequence = |delays_ms: &[u64]| TransitionType::Sequence {
+            delays_ms: delays_ms.to_vec(),
+        };
+        for (transition, waits) in [
+            (TransitionType::Instant, false),
+            (TransitionType::Fade { duration_ms: 99 }, false),
+            (TransitionType::Fade { duration_ms: 100 }, true),
+            (sequence(&[]), false),
+            (sequence(&[0, 0]), false),
+            // Only two devices: a third delay never runs.
+            (sequence(&[0, 0, 500]), false),
+            (sequence(&[0, 100]), true),
+        ] {
+            let controller = controller(&store, &targets, &transition);
+            assert_eq!(
+                controller.plan_write_detached(&evening()).is_some(),
+                waits,
+                "{transition:?}"
+            );
+            for other in [named("none"), named(""), named("nope"), light(true, 1)] {
+                assert!(
+                    controller.plan_write_detached(&other).is_none(),
+                    "{transition:?}: {other:?}"
+                );
+            }
+        }
+
+        // A detached plan is the one `plan_write` makes.
+        let controller = controller(&store, &targets, &sequence(&[0, 100]));
+        let detached = controller.plan_write_detached(&evening()).expect("waits");
+        let planned = controller.plan_write(evening()).await.expect("plan");
+        assert_eq!(detached.await.expect("detached plan"), planned);
     }
 
     /// #58: a fade that reaches a device the store doesn't have stops at
