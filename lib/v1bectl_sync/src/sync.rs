@@ -349,7 +349,8 @@ impl SyncEngine {
     /// A `Critical` push counts as a user write and gets a protection window
     /// ([`SyncConfig::protection_window`]). User writes normally come in
     /// through [`Self::apply_optimistic_update`], which protects them whatever
-    /// their priority.
+    /// their priority. A push below `Critical` is dropped while a user write
+    /// waits in the buffer for the same device.
     pub async fn queue_sync(&self, task: SyncTask) {
         debug!("Queuing sync task: {:?}", task);
         self.mark_pending_sync(&task.device_id).await;
@@ -358,6 +359,20 @@ impl SyncEngine {
         if let SyncTaskType::PushToGateway { new_state } = &task.task_type {
             let protected = task.priority == SyncPriority::Critical;
             let mut buffer = self.sync_buffer.write().await;
+            // A push that isn't a user write doesn't replace one waiting in
+            // the buffer (#50 review): the user's value would never go out,
+            // and the pull would revert it once its window ran out.
+            if !protected
+                && buffer
+                    .get(&task.device_id)
+                    .is_some_and(|waiting| waiting.protected)
+            {
+                debug!(
+                    "Push for {} dropped: a user write is waiting in the buffer",
+                    task.device_id
+                );
+                return;
+            }
             // 🛡️ A user write is protected from the moment it's queued, not
             // from when its push reaches the gateway (#23). Arming under the
             // buffer lock means a drained value is never newer than what the
@@ -747,15 +762,22 @@ impl SyncEngine {
     /// still covers the hub's confirmation, and mark the entry
     /// [`PendingConfirmation::pushed`] if this push carries its value.
     ///
-    /// `expected_state` stays as it is. Every write sets it, so it already
-    /// holds `pushed` (the buffer keeps only the latest value) or a newer
-    /// write that came in after this push was drained. Writing `pushed` back
-    /// would move the expectation back to a stale value, and the hub
-    /// confirming that stale value would then revert the newer write. For
-    /// the same reason a stale push doesn't mark the entry pushed: the newer
-    /// value hasn't gone out yet. If there is no entry (a pull already
-    /// confirmed it, or it expired), the push re-arms one for `pushed`,
-    /// with its write's `generation`.
+    /// Usually `expected_state` stays as it is. Every write sets it, so it
+    /// already holds `pushed` (the buffer keeps only the latest value) or a
+    /// newer write that came in after this push was drained. Writing
+    /// `pushed` back would move the expectation back to a stale value, and
+    /// the hub confirming that stale value would then revert the newer
+    /// write. For the same reason a stale push doesn't mark the entry
+    /// pushed: the newer value hasn't gone out yet. If there is no entry (a
+    /// pull already confirmed it, or it expired), the push re-arms one for
+    /// `pushed`, with its write's `generation`.
+    ///
+    /// An entry older than this push's write (a lower `generation`) was
+    /// re-armed that way by an older push, after this write's own entry ran
+    /// out while its push waited. This push takes it over (#50 review): it's
+    /// the latest write. Left on the older write, the entry dropped this
+    /// write's retries as superseded, and the hub and the store ended on the
+    /// older value.
     async fn refresh_protection(
         &self,
         device_id: &DeviceId,
@@ -765,7 +787,11 @@ impl SyncEngine {
         let mut pending = self.pending_confirmations.write().await;
         if let Some(confirmation) = pending.get_mut(device_id) {
             confirmation.sent_at = Instant::now();
-            if Self::states_equal(&confirmation.expected_state, pushed) {
+            if generation > confirmation.generation {
+                confirmation.expected_state = pushed.clone();
+                confirmation.generation = generation;
+                confirmation.pushed = true;
+            } else if Self::states_equal(&confirmation.expected_state, pushed) {
                 confirmation.pushed = true;
             }
             debug!(

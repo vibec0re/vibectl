@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use common::*;
 use v1bectl_sync::{
-    ConflictResolution, SyncConfig, SyncPriority, SyncStatus, SyncTask, SyncTaskType,
+    ConflictResolution, DeviceStateValue, SyncConfig, SyncPriority, SyncStatus, SyncTask,
+    SyncTaskType,
 };
 
 // ---------------------------------------------------------------------
@@ -359,11 +360,12 @@ enum FirstPush {
     UserWrite,
 }
 
-/// A push of `a` fails, and its retry waits. The user then writes `a`, and
-/// the retry comes due while that write's PATCH is in flight. The write
-/// lands, the hub confirms it, and someone flips the switch at the wall.
-/// The retry must not undo that: the user's write superseded it, and owns
-/// the device's pushes (#45).
+/// A push of `a` is held, and the user writes `a` meanwhile. The push then
+/// fails, the write's push goes out and is held, and the failed push's
+/// retry comes due while that PATCH is in flight. The write lands, the hub
+/// confirms it, and someone flips the switch at the wall. The retry must not
+/// undo that: the user's write superseded it, and owns the device's pushes
+/// (#45).
 ///
 /// The retry used to be queued again with the write's value (the pending
 /// entry's), whatever push it retried. That duplicate PATCH went out once
@@ -372,11 +374,12 @@ enum FirstPush {
 /// user's value as if it were its own, past the write's confirmation or
 /// abandonment (`FirstPush::Queued`).
 ///
-/// The retry delay (500 ms) only has to outlast the moment between the
-/// first push failing and the write's push going out (at the next 5 ms
-/// buffer tick); the "test timing" assertion says if it didn't.
+/// The write is queued before the push fails, and the buffer worker pushes
+/// it at its next 5 ms tick. A retry that came due before that (a runner
+/// stalled for the 100 ms retry delay) would find the write in the buffer
+/// and be dropped for that instead: the test could then only pass.
 async fn a_superseded_retry_leaves_a_switch_change(first: FirstPush) {
-    let delay = Duration::from_millis(500);
+    let delay = Duration::from_millis(100);
     let rig = Rig::new(
         &["a"],
         TestHub::new(OnSet::Fail, true),
@@ -410,12 +413,10 @@ async fn a_superseded_retry_leaves_a_switch_change(first: FirstPush) {
             log.sets_started.len() == 1
         })
         .await;
-    rig.hub.release(1);
-    rig.wait_for_retry_queue("its retry queued", 1).await;
-
-    // The user writes while the retry waits, and the write's push is held.
-    rig.hub.set_on_set(OnSet::Apply);
+    // The user writes while that push is held. The push then fails: the
+    // buffer worker queues its retry, and pushes the write next (held).
     rig.write("a", written.clone()).await;
+    rig.hub.release(1);
     rig.hub
         .wait("the write's push at the gate", |log| {
             log.sets_started.len() == 2
@@ -424,12 +425,13 @@ async fn a_superseded_retry_leaves_a_switch_change(first: FirstPush) {
     assert_eq!(
         rig.hub.log().sets_for("a"),
         vec![older, written.clone()],
-        "{first:?}, test timing: the retry came due before the write was pushed"
+        "{first:?}: PATCHes"
     );
     // The retry comes due while that PATCH is in flight.
     rig.wait_for_retry_queue("the retry taken out", 0).await;
 
     // The write lands, and the hub confirms it. Then the switch is flipped.
+    rig.hub.set_on_set(OnSet::Apply);
     rig.hub.release(1);
     rig.hub
         .wait("the write landed", |log| log.sets_done >= 2)
@@ -484,16 +486,19 @@ async fn a_queued_pushs_retry_does_not_carry_a_user_write_on() {
 /// the abandoned value after all, and the next pull brought it back into
 /// the store.
 ///
-/// `a`'s push fails, and its retry comes due while the buffer worker is held
-/// on `h`'s PATCH, so it waits in the buffer. That's well inside `a`'s
-/// window (200 ms after the failure, of 800 ms); the window then runs out and
-/// the pull reverts `a`, and only then is `h` let through.
+/// Two writes go out in one batch. The first one's push fails, and the
+/// buffer worker goes straight on to the other one's, which is held. The
+/// failed push's retry comes due meanwhile and waits in the buffer, until
+/// its write's window runs out and the pull reverts it. Only then is the
+/// held PATCH let through. (A runner stalled for the 600 ms between the
+/// retry coming due and the window running out would have the retry
+/// dropped when it's queued again instead: the test could then only pass.)
 #[tokio::test]
 async fn a_retry_whose_write_ran_out_its_window_while_it_waited_is_dropped() {
     let delay = Duration::from_millis(200);
     let rig = Rig::new(
-        &["a", "h"],
-        TestHub::new(OnSet::Fail, true),
+        &["h", "a", "b"],
+        TestHub::new(OnSet::Apply, true),
         Pulls::Periodic,
         SyncConfig {
             protection_window: Duration::from_millis(800),
@@ -505,31 +510,26 @@ async fn a_retry_whose_write_ran_out_its_window_while_it_waited_is_dropped() {
     .await;
     let mut rx = rig.bus.subscribe();
 
-    rig.write("a", on()).await;
-    rig.hub
-        .wait("a's push at the gate", |log| log.sets_started.len() == 1)
-        .await;
-    rig.write("h", on()).await;
+    let first = rig.write_one_batch("h", &[("a", on()), ("b", on())]).await;
+    rig.hub.set_on_set(OnSet::Fail);
     rig.hub.release(1);
     rig.hub
-        .wait("h's push at the gate", |log| log.sets_started.len() == 2)
+        .wait("the batch's second push at the gate", |log| {
+            log.sets_started.len() == 3
+        })
         .await;
-    assert_eq!(
-        rig.hub.log().sets_for("h"),
-        vec![on()],
-        "test timing: a's retry went out before h's push"
-    );
-    // a's retry comes due, and goes into the buffer behind h.
-    rig.wait_for_retry_queue("a's retry taken out", 0).await;
-    // a's window runs out, and the pull reverts it.
-    wait_for_echo(&mut rx, "a", &off()).await;
+    // By now the buffer worker has queued the first push's retry. It comes
+    // due, and goes into the buffer behind the held PATCH.
+    rig.wait_for_retry_queue("the retry taken out", 0).await;
+    // Its write's window runs out, and the pull reverts it.
+    wait_for_echo(&mut rx, &first, &off()).await;
 
     rig.hub.set_on_set(OnSet::Apply);
     rig.hub.release(1);
     let resent = rig
         .hub
         .within(Duration::from_millis(300), |log| {
-            log.sets_for("a").len() > 1
+            log.sets_for(&first).len() > 1
         })
         .await;
     rig.hub.open_gate();
@@ -540,12 +540,188 @@ async fn a_retry_whose_write_ran_out_its_window_while_it_waited_is_dropped() {
         .await;
     assert!(
         !resent,
-        "the retry of a write whose window had run out went out: {:?}",
-        rig.hub.log().sets_for("a")
+        "{first}: the retry of a write whose window had run out went out: {:?}",
+        rig.hub.log().sets_for(&first)
     );
     rig.full_pull_cycle().await;
-    assert_eq!(rig.hub.reported("a"), Some(off()), "a on the hub");
-    assert_eq!(rig.stored("a").await, off(), "a in the store");
+    assert_eq!(rig.hub.reported(&first), Some(off()), "{first} on the hub");
+    assert_eq!(rig.stored(&first).await, off(), "{first} in the store");
+
+    rig.shutdown().await;
+}
+
+/// Pull `id` until the store holds `state` (a protection window running
+/// out). Each pull is handled completely before the next ([`Rig::pull`]).
+async fn pull_until_stored(rig: &Rig, id: &str, state: &DeviceStateValue) {
+    tokio::time::timeout(WAIT, async {
+        while rig.stored(id).await != *state {
+            rig.pull(id).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{id} never went to {state:?}"));
+}
+
+/// A write's own push can re-arm the pending entry after it ran out (#32).
+/// If a newer write's entry is the one that ran out, that re-armed entry
+/// belongs to the older write, and the newer write's push takes it over as
+/// it goes out (#50 review, finding 1). It used to leave the entry on the
+/// older write, so when that push failed, its retry was dropped as
+/// superseded: the hub and the store ended on the older value, and the
+/// user's latest write was never pushed again. (Before #45 the retry resent
+/// the entry's stale value instead, to the same end.)
+///
+/// `behind`'s `v1` is drained in a batch and waits behind the other device's
+/// held PATCH. The user writes `v2`, whose window runs out before any of
+/// this goes out, and a pull reverts it. `v1` then goes out and lands; `v2`
+/// goes out and fails, and its retry must follow.
+#[tokio::test]
+async fn a_newer_writes_retry_survives_an_older_push_re_arming_its_entry() {
+    let delay = Duration::from_millis(50);
+    let rig = Rig::new(
+        &["h", "a", "b"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::OnDemand,
+        SyncConfig {
+            protection_window: Duration::from_millis(300),
+            base_retry_delay: delay,
+            max_retry_delay: delay,
+            ..fast_retries()
+        },
+    )
+    .await;
+    let (v1, v2) = (light(true, 30), light(true, 70));
+
+    let first = rig
+        .write_one_batch("h", &[("a", v1.clone()), ("b", v1.clone())])
+        .await;
+    let behind = if first == "a" { "b" } else { "a" };
+    rig.write(behind, v2.clone()).await;
+    pull_until_stored(&rig, behind, &off()).await;
+
+    // `first` lands; `behind`'s v1 goes out, finds no pending entry, and
+    // re-arms one for itself. It lands too.
+    rig.hub.release(1);
+    rig.hub
+        .wait("v1 at the gate", |log| {
+            log.sets_for(behind) == vec![v1.clone()]
+        })
+        .await;
+    rig.hub.release(1);
+    // v2's own push goes out, and fails.
+    rig.hub
+        .wait("v2 at the gate", |log| log.sets_for(behind).len() == 2)
+        .await;
+    rig.hub.set_on_set(OnSet::Fail);
+    rig.hub.release(1);
+    rig.hub
+        .wait("v2 answered", |log| log.sets_done == log.sets_started.len())
+        .await;
+
+    rig.hub.set_on_set(OnSet::Apply);
+    rig.hub.open_gate();
+    rig.hub
+        .wait("v2's retry", |log| log.sets_for(behind).len() >= 3)
+        .await;
+    rig.hub
+        .wait("every PATCH answered", |log| {
+            log.sets_done == log.sets_started.len()
+        })
+        .await;
+    assert_eq!(
+        rig.hub.log().sets_for(behind),
+        vec![v1, v2.clone(), v2.clone()],
+        "{behind}: PATCHes"
+    );
+    rig.pull(behind).await;
+    assert_eq!(
+        rig.hub.reported(behind),
+        Some(v2.clone()),
+        "{behind} on the hub"
+    );
+    assert_eq!(rig.stored(behind).await, v2, "{behind} in the store");
+
+    rig.shutdown().await;
+}
+
+/// A push queued with `queue_sync` below `Critical` doesn't replace a user
+/// write waiting in the buffer for the same device (#50 review, nit 4).
+/// The user's value would never go out, and the pull would revert it once
+/// its window ran out.
+#[tokio::test]
+async fn a_queued_push_does_not_replace_a_buffered_user_write() {
+    let rig = Rig::new(
+        &["h", "a"],
+        TestHub::new(OnSet::Apply, true),
+        Pulls::OnDemand,
+        SyncConfig::default(),
+    )
+    .await;
+    let (queued, written) = (light(true, 30), light(true, 70));
+
+    // Hold the buffer worker on `h`, so both stay in the buffer.
+    rig.write("h", on()).await;
+    rig.hub
+        .wait("h at the gate", |log| log.sets_started.len() == 1)
+        .await;
+    rig.write("a", written.clone()).await;
+    rig.engine
+        .queue_sync(SyncTask {
+            device_id: "a".to_string(),
+            task_type: SyncTaskType::PushToGateway {
+                new_state: queued.clone(),
+            },
+            created_at: Instant::now(),
+            priority: SyncPriority::Normal,
+        })
+        .await;
+
+    rig.hub.open_gate();
+    rig.hub
+        .wait("a's push answered", |log| {
+            !log.sets_for("a").is_empty() && log.sets_done == log.sets_started.len()
+        })
+        .await;
+    assert_eq!(
+        rig.hub.log().sets_for("a"),
+        vec![written.clone()],
+        "PATCHes"
+    );
+    rig.pull("a").await;
+    assert_eq!(rig.stored("a").await, written, "in the store");
+
+    rig.shutdown().await;
+}
+
+/// A device whose read fails doesn't cost the rest of the cycle its pull.
+/// The failing device is the first one each cycle reads (the store's order
+/// doesn't change), so a cycle that stopped at it would never get to the
+/// others.
+#[tokio::test]
+async fn a_failing_read_does_not_end_the_pull_cycle() {
+    const IDS: [&str; 3] = ["a", "b", "c"];
+    let rig = Rig::new(
+        &IDS,
+        TestHub::new(OnSet::Apply, false),
+        Pulls::Periodic,
+        SyncConfig::default(),
+    )
+    .await;
+    let failing = rig.hub.log().reads[0].clone();
+
+    rig.hub.fail_reads_of(&failing);
+    let others: Vec<&str> = IDS.into_iter().filter(|id| *id != failing).collect();
+    for id in &others {
+        rig.hub.report(id, on());
+    }
+    rig.full_pull_cycle().await;
+    for id in others {
+        assert_eq!(
+            rig.stored(id).await,
+            on(),
+            "{id} wasn't pulled: {failing}'s failed read ended the cycle"
+        );
+    }
 
     rig.shutdown().await;
 }
