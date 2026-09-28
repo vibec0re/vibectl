@@ -125,6 +125,17 @@ impl<T: Clone> LagAwareReceiver<T> {
                     Err(TryRecvError::Empty | TryRecvError::Closed) => {}
                 }
             }
+            // The lag is reported here either at the channel's edge or with
+            // the budget spent. Spent is the weaker of the two (#47
+            // re-check): a subscriber that kept pace for a whole ring
+            // without reaching the edge may still be almost a ring behind.
+            // Then whatever its catch-up publishes (the manager's group
+            // echoes, say) pushes the oldest buffered events out, and it
+            // lags, and catches up, once more. That's bounded: a ring's
+            // worth of events is consumed for every catch-up, and it takes
+            // a burst that keeps pace for a whole ring (1024 events on the
+            // server's bus) to get here. An event lost that way is lost the
+            // way any lag loses one.
             let skipped = catch_up.skipped;
             self.catching_up = None;
             warn_lagged(self.name, skipped);
@@ -152,6 +163,11 @@ impl EventBus {
     /// subscriber fall `capacity` events behind (rounded up to a power of
     /// two) before it lags and misses the oldest ones. A test can use a
     /// small one to make a subscriber lag.
+    ///
+    /// # Panics
+    ///
+    /// If `capacity` is 0, or larger than `usize::MAX / 2`: tokio's
+    /// broadcast channel can't hold either.
     #[must_use]
     pub fn with_capacity(max_history: usize, capacity: usize) -> Self {
         let (sender, _) = broadcast::channel(capacity);
