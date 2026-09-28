@@ -9,9 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
-# Read-only token for every job: the web job runs trunk, which fetches sass,
-# wasm-bindgen and wasm-opt from GitHub releases at build time without a
-# checksum, so nothing it executes should be able to write to the repo.
+# Read-only token for every job: the web job's build step shells out to
+# trunk, sass, wasm-bindgen and wasm-opt, so nothing they execute should be
+# able to write to the repo.
 permissions:
   contents: read
 
@@ -58,6 +58,20 @@ jobs:
     env:
       TRUNK_VERSION: "0.21.14" # keep in step with the flake's trunk
       TRUNK_SHA256: "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b"
+      # trunk itself downloads sass / wasm-bindgen / wasm-opt from GitHub
+      # releases at build time and does NOT verify their hashes (see #9), so
+      # we pre-install the exact versions pinned in v1bectl_web/Trunk.toml
+      # ourselves, sha256-verified, and put them on PATH ahead of the build.
+      # When a system binary's `--version` matches the configured version
+      # exactly, trunk uses it instead of downloading. Keep these three
+      # (SASS_/WASM_BINDGEN_/WASM_OPT_VERSION) in lockstep with Trunk.toml's
+      # [tools] table.
+      SASS_VERSION: "1.100.0"
+      SASS_SHA256: "a604a895666b24a7199dc42f3a144f39d7b7f5a7d3261ba7fde54fde5bf03764"
+      WASM_BINDGEN_VERSION: "0.2.100"
+      WASM_BINDGEN_SHA256: "63d6a38deb65bd7023c02bdf382ab66b0d2c0241c8582fd3413b5a808b8aeb5b"
+      WASM_OPT_VERSION: "version_129"
+      WASM_OPT_SHA256: "50b9fa62b9abea752da92ec57e0c555fee578760cd237c40107957715d2976ba"
     steps:
       - uses: actions/checkout@v4
 
@@ -85,11 +99,13 @@ jobs:
       - name: Test
         run: cargo test -p v1bectl_web
 
-      # trunk fetches the exact sass / wasm-bindgen / wasm-opt versions pinned
-      # in v1bectl_web/Trunk.toml. wasm-bindgen has to match Cargo.lock, so
-      # this also catches the two drifting apart. On NixOS use
-      # `nix build .#web` (or `trunk build --release --offline` inside
-      # `nix develop`) instead: the downloaded tools don't run there.
+      # v1bectl_web/Trunk.toml pins the exact sass / wasm-bindgen / wasm-opt
+      # versions trunk needs (wasm-bindgen has to match Cargo.lock, so this
+      # also catches the two drifting apart). Those three get installed by
+      # the next step, sha256-verified, so trunk finds them on PATH instead
+      # of downloading its own. On NixOS use `nix build .#web` (or
+      # `trunk build --release --offline` inside `nix develop`) instead:
+      # generic release binaries don't run there.
       - name: Install trunk
         run: |
           curl -fsSL -o trunk.tar.gz \
@@ -100,6 +116,72 @@ jobs:
           rm trunk.tar.gz
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
+      # Pre-install the tools trunk would otherwise fetch itself (unverified)
+      # mid-build: dart-sass, wasm-bindgen-cli and binaryen's wasm-opt, each
+      # from its release tarball, sha256-checked against the pins above.
+      # trunk compares a system tool's `<tool> --version` output against the
+      # version configured in Trunk.toml and only uses it on an exact match,
+      # so these installs have to land on PATH before "Trunk build" runs.
+      - name: Install sass / wasm-bindgen / wasm-opt (pinned, sha256-verified)
+        run: |
+          mkdir -p "$HOME/.local/opt"
+
+          # dart-sass ships `sass` (a launcher script) next to `src/dart` (a
+          # bundled dart runtime) and `src/sass.snapshot`; the script execs
+          # the runtime by relative path, so the whole `dart-sass/`
+          # directory has to stay intact rather than just copying out the
+          # `sass` script. Put that directory itself on PATH.
+          curl -fsSL -o sass.tar.gz \
+            "https://github.com/sass/dart-sass/releases/download/${SASS_VERSION}/dart-sass-${SASS_VERSION}-linux-x64.tar.gz"
+          echo "${SASS_SHA256}  sass.tar.gz" | sha256sum -c -
+          tar -xzf sass.tar.gz -C "$HOME/.local/opt"
+          rm sass.tar.gz
+          echo "$HOME/.local/opt/dart-sass" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/opt/dart-sass:$PATH"
+
+          # wasm-bindgen-cli: trunk's own tool downloader fetches the
+          # x86_64-unknown-linux-musl build even on a glibc runner, so pin
+          # that same asset (it's a static binary either way).
+          WASM_BINDGEN_DIR="wasm-bindgen-${WASM_BINDGEN_VERSION}-x86_64-unknown-linux-musl"
+          curl -fsSL -o wasm-bindgen.tar.gz \
+            "https://github.com/rustwasm/wasm-bindgen/releases/download/${WASM_BINDGEN_VERSION}/${WASM_BINDGEN_DIR}.tar.gz"
+          echo "${WASM_BINDGEN_SHA256}  wasm-bindgen.tar.gz" | sha256sum -c -
+          tar -xzf wasm-bindgen.tar.gz -C "$HOME/.local/opt"
+          rm wasm-bindgen.tar.gz
+          echo "$HOME/.local/opt/${WASM_BINDGEN_DIR}" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/opt/${WASM_BINDGEN_DIR}:$PATH"
+
+          # binaryen's tarball has bin/wasm-opt plus lib/ (libbinaryen);
+          # keep them together and put bin/ on PATH so wasm-opt finds lib/
+          # next to it.
+          curl -fsSL -o binaryen.tar.gz \
+            "https://github.com/WebAssembly/binaryen/releases/download/${WASM_OPT_VERSION}/binaryen-${WASM_OPT_VERSION}-x86_64-linux.tar.gz"
+          echo "${WASM_OPT_SHA256}  binaryen.tar.gz" | sha256sum -c -
+          tar -xzf binaryen.tar.gz -C "$HOME/.local/opt"
+          rm binaryen.tar.gz
+          echo "$HOME/.local/opt/binaryen-${WASM_OPT_VERSION}/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/opt/binaryen-${WASM_OPT_VERSION}/bin:$PATH"
+
+          # Print what trunk will `--version`-match against.
+          sass --version
+          wasm-bindgen --version
+          wasm-opt --version
+
+      # `--offline` makes trunk error out instead of silently downloading a
+      # tool if a pinned version above ever stops matching Trunk.toml, which
+      # is the strongest guarantee that nothing gets fetched here. `-v`
+      # raises trunk's log to debug level so the log shows it resolving each
+      # tool to the system binary rather than fetching one.
       - name: Trunk build
         working-directory: v1bectl_web
-        run: trunk build --release
+        run: |
+          # No `shell:` key means `bash -e` WITHOUT pipefail, so without this
+          # a failing trunk piped through `tee` exits 0 and the build goes green.
+          set -o pipefail
+          trunk -v build --release --offline 2>&1 | tee trunk-build.log
+          if grep -qi "downloading" trunk-build.log; then
+            echo "::error::trunk downloaded a tool instead of using the pinned, pre-installed one" >&2
+            exit 1
+          fi
+          echo "--- confirmed system tool usage ---"
+          grep -i "using system installed binary" trunk-build.log
