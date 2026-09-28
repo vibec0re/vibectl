@@ -14,6 +14,11 @@ dist = "dist"
 #   - sass is `nix develop --command sass --version`
 #   - wasm_opt is `version_<n>` where n is
 #     `nix develop --command wasm-opt --version` (release builds only)
+# CI (.github/workflows/ci.yml, `web` job) pre-installs sha256-verified sass /
+# wasm-bindgen / wasm-opt matching these same versions so trunk uses those
+# instead of downloading its own unverified copies (#9) — bump the CI job's
+# SASS_/WASM_BINDGEN_/WASM_OPT_VERSION + _SHA256 env vars in lockstep with any
+# change here.
 [tools]
 sass = "1.100.0"
 wasm_bindgen = "0.2.100"
