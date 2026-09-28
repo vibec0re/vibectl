@@ -252,7 +252,6 @@ pub struct SyncConfig {
 pub enum ConflictResolution {
     ServerWins,
     GatewayWins,
-    TimestampWins,
     Manual,
 }
 
@@ -1043,10 +1042,6 @@ impl SyncEngine {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one match arm per ConflictResolution variant, each a flat sequence of store/gateway calls; splitting the arms into their own functions would scatter reviewed conflict-resolution logic (#31, #41) rather than simplify it"
-    )]
     async fn resolve_conflict(
         &self,
         device_id: &DeviceId,
@@ -1097,55 +1092,6 @@ impl SyncEngine {
                         },
                     })
                     .await;
-                Ok(())
-            }
-            ConflictResolution::TimestampWins => {
-                // Get timestamps and decide
-                let server_timestamp = Self::get_state_timestamp(server_state);
-                let gateway_timestamp = Self::get_state_timestamp(gateway_state);
-
-                if server_timestamp >= gateway_timestamp {
-                    debug!(
-                        "Conflict resolution: Server timestamp wins for {}",
-                        device_id
-                    );
-                    // Only push server state to gateway for writable device types
-                    if Self::is_device_writable(server_state)
-                        && !Self::is_problematic_outlet(device_id)
-                    {
-                        self.buffer_server_state(device_id, gateway_state).await;
-                    } else {
-                        // For read-only devices (sensors) or problematic outlets, always use gateway state
-                        debug!("Device {} is read-only or problematic outlet, using gateway state instead", device_id);
-                        self.store
-                            .update_device_state(device_id, gateway_state.clone())
-                            .await
-                            .map_err(|e| GatewayError::InternalError(e.to_string()))?;
-                    }
-                } else {
-                    debug!(
-                        "Conflict resolution: Gateway timestamp wins for {}",
-                        device_id
-                    );
-                    self.store
-                        .update_device_state(device_id, gateway_state.clone())
-                        .await
-                        .map_err(|e| GatewayError::InternalError(e.to_string()))?;
-
-                    self.event_bus
-                        .publish(DeviceEvent {
-                            timestamp: std::time::SystemTime::now(),
-                            device_id: device_id.clone(),
-                            event_type: EventType::AttributeChanged {
-                                attribute: "state".to_string(),
-                                old_value: serde_json::to_value(server_state)
-                                    .unwrap_or(serde_json::Value::Null),
-                                new_value: serde_json::to_value(gateway_state)
-                                    .unwrap_or(serde_json::Value::Null),
-                            },
-                        })
-                        .await;
-                }
                 Ok(())
             }
             ConflictResolution::Manual => {
@@ -1577,12 +1523,6 @@ impl SyncEngine {
             }
             _ => false, // Different types are never equal
         }
-    }
-
-    fn get_state_timestamp(_state: &DeviceStateValue) -> u64 {
-        // TODO: Extract timestamp from state if available
-        // For now, return current time
-        chrono::Utc::now().timestamp_millis().cast_unsigned()
     }
 
     /// Check if a device state is writable (can be pushed back to gateway)
