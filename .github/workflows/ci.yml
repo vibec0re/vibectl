@@ -74,10 +74,10 @@ jobs:
         run: cargo clippy -p v1bectl_web --target wasm32-unknown-unknown --all-targets -- -D warnings
 
       # Some lints depend on the pointer width (`large_enum_variant` only
-      # fires on 64-bit), and the tests below build the lib natively, so lint
-      # it natively too.
-      - name: Clippy (native lib)
-        run: cargo clippy -p v1bectl_web --lib -- -D warnings
+      # fires on 64-bit), and the tests below build natively, so lint natively
+      # too.
+      - name: Clippy (native)
+        run: cargo clippy -p v1bectl_web --all-targets -- -D warnings
 
       # The reconnect state machine and the screen parser are pure, so the
       # tests run natively. The bin only calls `v1bectl_web::run()`, so each

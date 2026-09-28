@@ -273,11 +273,11 @@ struct Liveness {
 }
 
 /// How a socket's task checks its socket when the tab comes back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeStep {
-    /// Send a ping, and reconnect unless its pong arrives within
-    /// `PROBE_TIMEOUT_MS`.
-    SendPing,
+    /// Send a ping with this correlation id, and reconnect unless its pong
+    /// arrives within `PROBE_TIMEOUT_MS`.
+    SendPing(String),
     /// A probe is already waiting for its answer: leave it be.
     AlreadyProbing,
     /// Nothing has arrived for `WATCHDOG_TIMEOUT_MS`, so the page was frozen or
@@ -296,25 +296,31 @@ impl Liveness {
     }
 
     /// Something arrived. For the watchdog that answers any ping. It does not
-    /// answer a probe: see `on_pong`.
+    /// answer a probe: see `on_frame`.
     fn on_inbound(&mut self, now_ms: f64) {
         self.last_inbound_ms = now_ms;
         self.unanswered_ping_ms = None;
     }
 
-    /// A PONG to the ping with `correlation_id` arrived (after `on_inbound`
-    /// for the same frame). Only the pong to the probe's own ping answers the
-    /// probe. Anything else may have been sitting in the socket's buffers
-    /// since before it went half-open: an event, or the pong to an older
-    /// keepalive ping. Counting that as an answer would keep a dead socket
-    /// until the watchdog gives up on it, 65 s later. Returns whether this
-    /// answered the probe.
-    fn on_pong(&mut self, correlation_id: &str) -> bool {
-        let answered = self.probe.as_deref() == Some(correlation_id);
-        if answered {
+    /// A decoded frame arrived (after `on_inbound` for it). A PONG stops
+    /// here: only the pong to the probe's own ping answers the probe.
+    /// Anything else may have been sitting in the socket's buffers since
+    /// before it went half-open: an event, or the pong to an older keepalive
+    /// ping. Counting that as an answer would keep a dead socket until the
+    /// watchdog gives up on it, 65 s later. Every other frame is handed back
+    /// for the UI. The pump gets its UI frames only through here, so it can't
+    /// skip the probe check without also cutting off the UI.
+    fn on_frame(&mut self, inbound: Inbound) -> Option<Inbound> {
+        let Inbound::Pong { correlation_id } = inbound else {
+            return Some(inbound);
+        };
+        if self.probe.as_deref() == Some(correlation_id.as_str()) {
             self.probe = None;
+            log::debug!("🏓 PONG to the tab-return PING");
+        } else {
+            log::debug!("🏓 PONG received - connection alive!");
         }
-        answered
+        None
     }
 
     fn on_ping_sent(&mut self, now_ms: f64) {
@@ -325,18 +331,21 @@ impl Liveness {
         watchdog_expired(now_ms, self.last_inbound_ms, self.unanswered_ping_ms)
     }
 
-    /// The tab came back: how do we check the socket? `SendPing` means: send
-    /// a ping with `ping_id` as its correlation id. The probe then waits for
-    /// that ping's pong (`on_pong`).
-    fn begin_probe(&mut self, now_ms: f64, ping_id: &str) -> ProbeStep {
+    /// The tab came back: how do we check the socket? `SendPing(id)` means:
+    /// send a ping with correlation id `id`. The probe then waits for that
+    /// ping's pong (`on_frame`). The id is minted here and handed out, so the
+    /// ping that goes out can't carry a different id from the one the probe
+    /// waits for (#49 review).
+    fn begin_probe(&mut self, now_ms: f64) -> ProbeStep {
         if self.probe.is_some() {
             return ProbeStep::AlreadyProbing;
         }
         if now_ms - self.last_inbound_ms >= WATCHDOG_TIMEOUT_MS {
             return ProbeStep::Reconnect;
         }
-        self.probe = Some(ping_id.to_owned());
-        ProbeStep::SendPing
+        let ping_id = new_correlation_id();
+        self.probe = Some(ping_id.clone());
+        ProbeStep::SendPing(ping_id)
     }
 
     /// The probe's `PROBE_TIMEOUT_MS` is up: is it still unanswered?
@@ -877,14 +886,11 @@ async fn pump(
                     }
                     if let Message::Bytes(data) = msg {
                         match decode_frame(&data) {
-                            Ok(Inbound::Pong { correlation_id }) => {
-                                if liveness.on_pong(&correlation_id) {
-                                    log::debug!("🏓 PONG to the tab-return PING");
-                                } else {
-                                    log::debug!("🏓 PONG received - connection alive!");
+                            Ok(inbound) => {
+                                if let Some(inbound) = liveness.on_frame(inbound) {
+                                    handle_message(ctx, inbound);
                                 }
                             }
-                            Ok(inbound) => handle_message(ctx, inbound),
                             Err(e) => log::error!("❌ {}", e),
                         }
                     }
@@ -914,9 +920,8 @@ async fn pump(
                     }
                 }
                 Some(Outbound::Probe) => {
-                    let ping_id = new_correlation_id();
-                    match liveness.begin_probe(now_ms(), &ping_id) {
-                        ProbeStep::SendPing => {
+                    match liveness.begin_probe(now_ms()) {
+                        ProbeStep::SendPing(ping_id) => {
                             log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
                             if let Err(e) = send_ping(&mut write, &mut liveness, ping_id).await {
                                 log::error!("❌ Failed to send PING: {:?}", e);
@@ -980,7 +985,7 @@ async fn pump(
 #[derive(Debug, PartialEq)]
 enum Inbound {
     /// The PONG to the ping that carried this correlation id. It goes to the
-    /// socket's task (see `Liveness::on_pong`), not to the UI.
+    /// socket's task (see `Liveness::on_frame`), not to the UI.
     Pong { correlation_id: String },
     /// Any other response, for the UI.
     Response(ApiResponse),
@@ -1233,25 +1238,38 @@ mod tests {
         assert!(!live.watchdog_expired(later));
     }
 
-    /// Feed `live` one inbound PONG the way the pump does: `on_inbound`, then
-    /// `on_pong`. Returns whether it answered the probe.
+    /// Feed `live` one inbound PONG the way the pump does: a real frame,
+    /// through `decode_frame` and then `on_frame`. Returns whether it
+    /// answered the probe.
     fn pong(live: &mut Liveness, now_ms: f64, correlation_id: &str) -> bool {
+        let was_waiting = live.probe_unanswered();
         live.on_inbound(now_ms);
-        live.on_pong(correlation_id)
+        let inbound = decode_frame(&response_frame(correlation_id, &ApiResponse::Pong))
+            .expect("a PONG frame decodes");
+        assert_eq!(live.on_frame(inbound), None, "a PONG never reaches the UI");
+        was_waiting && !live.probe_unanswered()
+    }
+
+    /// The correlation id a `SendPing` step asks the pump to send.
+    fn probe_ping(step: ProbeStep) -> String {
+        match step {
+            ProbeStep::SendPing(ping_id) => ping_id,
+            other => panic!("expected SendPing, got {other:?}"),
+        }
     }
 
     #[test]
     fn tab_return_probe_pings_first_and_its_pong_keeps_the_socket() {
         let mut live = Liveness::new(0.0);
         live.on_inbound(10.0 * S);
-        assert_eq!(live.begin_probe(20.0 * S, "probe-1"), ProbeStep::SendPing);
+        let probe = probe_ping(live.begin_probe(20.0 * S));
         live.on_ping_sent(20.0 * S);
         assert!(live.probe_unanswered());
         // The probe's pong beats the probe timer.
-        assert!(pong(&mut live, 20.05 * S, "probe-1"));
+        assert!(pong(&mut live, 20.05 * S, &probe));
         assert!(!live.probe_unanswered());
-        // The next tab switch probes afresh.
-        assert_eq!(live.begin_probe(40.0 * S, "probe-2"), ProbeStep::SendPing);
+        // The next tab switch probes afresh, under a new id.
+        assert_ne!(probe_ping(live.begin_probe(40.0 * S)), probe);
     }
 
     #[test]
@@ -1263,7 +1281,7 @@ mod tests {
         // dropped it 65 s later.
         let mut live = Liveness::new(0.0);
         live.on_ping_sent(30.0 * S); // keepalive, id "keepalive"
-        assert_eq!(live.begin_probe(30.5 * S, "probe"), ProbeStep::SendPing);
+        let probe = probe_ping(live.begin_probe(30.5 * S));
         live.on_ping_sent(30.5 * S);
         live.on_inbound(30.51 * S); // the buffered event
         assert!(!pong(&mut live, 30.52 * S, "keepalive"));
@@ -1272,16 +1290,30 @@ mod tests {
         // The watchdog is unchanged: any inbound frame counts for it.
         assert!(!live.watchdog_expired(30.52 * S + WATCHDOG_TIMEOUT_MS - 1.0));
         // Had the probe's own pong come back, that would have answered it.
-        assert!(pong(&mut live, 30.6 * S, "probe"));
+        assert!(pong(&mut live, 30.6 * S, &probe));
         assert!(!live.probe_unanswered());
         // A late duplicate of it changes nothing.
-        assert!(!pong(&mut live, 30.7 * S, "probe"));
+        assert!(!pong(&mut live, 30.7 * S, &probe));
+    }
+
+    #[test]
+    fn frames_other_than_a_pong_go_on_to_the_ui() {
+        let mut live = Liveness::new(0.0);
+        let probe = probe_ping(live.begin_probe(1.0 * S));
+        // A response under the probe's id is still not its PONG.
+        let ack = ApiResponse::SubscriptionStarted {
+            subscriber_id: "sub".to_string(),
+        };
+        let inbound = decode_frame(&response_frame(&probe, &ack)).expect("decode");
+        assert_eq!(live.on_frame(inbound), Some(Inbound::Response(ack)));
+        assert!(live.probe_unanswered());
+        assert_eq!(live.on_frame(Inbound::Other), Some(Inbound::Other));
     }
 
     #[test]
     fn tab_return_probe_without_an_answer_reconnects() {
         let mut live = Liveness::new(0.0);
-        assert_eq!(live.begin_probe(5.0 * S, "probe"), ProbeStep::SendPing);
+        probe_ping(live.begin_probe(5.0 * S));
         live.on_ping_sent(5.0 * S);
         // The probe timer fires and nothing has arrived.
         assert!(live.probe_unanswered());
@@ -1292,16 +1324,13 @@ mod tests {
         // visibilitychange twice in a row: one ping, one deadline.
         let mut live = Liveness::new(0.0);
         assert!(!live.probe_unanswered());
-        assert_eq!(live.begin_probe(1.0 * S, "first"), ProbeStep::SendPing);
-        assert_eq!(
-            live.begin_probe(1.5 * S, "second"),
-            ProbeStep::AlreadyProbing
-        );
+        let first = probe_ping(live.begin_probe(1.0 * S));
+        assert_eq!(live.begin_probe(1.5 * S), ProbeStep::AlreadyProbing);
         assert!(live.probe_unanswered());
-        // The probe still waits for the first ping's pong, not the second's
-        // (which was never sent).
-        assert!(!pong(&mut live, 1.6 * S, "second"));
-        assert!(pong(&mut live, 1.7 * S, "first"));
+        // The probe still waits for the first ping's pong: no second ping
+        // went out, so no other pong answers it.
+        assert!(!pong(&mut live, 1.6 * S, "some-other-ping"));
+        assert!(pong(&mut live, 1.7 * S, &first));
     }
 
     #[test]
@@ -1311,12 +1340,9 @@ mod tests {
         let mut live = Liveness::new(0.0);
         live.on_inbound(100.0 * S);
         let mut just_in_time = live.clone();
+        probe_ping(just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0));
         assert_eq!(
-            just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0, "probe"),
-            ProbeStep::SendPing
-        );
-        assert_eq!(
-            live.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS, "probe"),
+            live.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS),
             ProbeStep::Reconnect
         );
         assert!(!live.probe_unanswered());

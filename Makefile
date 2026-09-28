@@ -37,7 +37,7 @@ help:
 	@echo "Other:"
 	@echo "  check         - Run cargo check"
 	@echo "  clippy        - Run clippy lints (mirrors CI's native job)"
-	@echo "  clippy-web    - Run clippy for v1bectl_web, wasm32 + native lib (mirrors CI's web job)"
+	@echo "  clippy-web    - Run clippy for v1bectl_web, wasm32 + native (mirrors CI's web job)"
 	@echo "  fmt           - Format all code"
 	@echo "  clean         - Clean build artifacts"
 	@echo "  dev-setup     - Set up dev environment"
@@ -155,12 +155,12 @@ check:
 clippy:
 	cargo clippy --workspace --exclude v1bectl_web --all-targets -- -D warnings
 
-# Mirrors CI's web job clippy steps. The native lib pass catches lints that
+# Mirrors CI's web job clippy steps. The native pass catches lints that
 # depend on the pointer width (`large_enum_variant` only fires on 64-bit).
 .PHONY: clippy-web
 clippy-web:
 	cargo clippy -p v1bectl_web --target wasm32-unknown-unknown --all-targets -- -D warnings
-	cargo clippy -p v1bectl_web --lib -- -D warnings
+	cargo clippy -p v1bectl_web --all-targets -- -D warnings
 
 .PHONY: fmt
 fmt:
