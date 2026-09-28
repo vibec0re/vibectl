@@ -175,6 +175,9 @@ jobs:
       - name: Trunk build
         working-directory: v1bectl_web
         run: |
+          # No `shell:` key means `bash -e` WITHOUT pipefail, so without this
+          # a failing trunk piped through `tee` exits 0 and the build goes green.
+          set -o pipefail
           trunk -v build --release --offline 2>&1 | tee trunk-build.log
           if grep -qi "downloading" trunk-build.log; then
             echo "::error::trunk downloaded a tool instead of using the pinned, pre-installed one" >&2
