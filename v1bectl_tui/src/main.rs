@@ -596,13 +596,24 @@ fn handle_api_response(app: &mut App, response: ApiResponse) {
             app.add_event(&format!("📡 Loaded {total_count} devices"));
         }
         // Matched by id (#10). A server from before that doesn't say whose
-        // state it is, and its answer is dropped below: guessing by type put
-        // it on the first device of that type, so with two lights, light B's
-        // state landed on light A's row.
+        // state it is: guessing by type put it on the first device of that
+        // type, so with two lights, light B's state landed on light A's row.
         ApiResponse::DeviceState {
             device_id: Some(device_id),
             state,
         } => app.update_device_state(&device_id, state),
+        // Still dropped (there's nothing to match it against), but say so
+        // now instead of vanishing without a trace (#54). `GetDeviceState`
+        // isn't sent by the TUI today, so this is unreached in practice;
+        // it's reachable from a server-initiated `DeviceState` answer to
+        // another request, or if `GetDeviceState` is ever wired up.
+        ApiResponse::DeviceState {
+            device_id: None, ..
+        } => {
+            app.add_event(
+                "⚠️ Dropped a DeviceState answer with no device_id (server predates #10)",
+            );
+        }
         ApiResponse::LightUpdated { new_state: _ } => {
             app.status_message = "💡 Light updated!".to_string();
             app.add_event("💡 Light state changed");
@@ -1671,6 +1682,99 @@ mod tests {
             rows(&app),
             [(false, false), (true, true)],
             "an answer that doesn't name its device changes nothing"
+        );
+    }
+
+    /// #54: an answer with no `device_id` (from a server before #10) is
+    /// still dropped rather than guessed, but it no longer vanishes without
+    /// a trace: it's now logged to the event feed.
+    #[test]
+    fn a_device_state_answer_with_no_device_id_is_logged_not_silently_dropped() {
+        let mut app = App::with_favorites(String::new(), PathBuf::new(), Vec::new());
+        app.devices = [light("a", false)]
+            .into_iter()
+            .map(|device| AppDevice {
+                info: device.device_info,
+                state: device.state,
+                last_updated: Instant::now(),
+            })
+            .collect();
+
+        handle_api_response(
+            &mut app,
+            ApiResponse::DeviceState {
+                device_id: None,
+                state: light("a", true).state,
+            },
+        );
+
+        assert_eq!(
+            app.devices[0].state,
+            light("a", false).state,
+            "still dropped, not guessed"
+        );
+        assert!(
+            app.events.last().is_some_and(|event| event.contains('⚠')),
+            "should log the dropped answer, got {:?}",
+            app.events
+        );
+    }
+
+    /// #54: like the CLI's own copy, the TUI's `ApiResponse::DeviceState`
+    /// decodes `device_id` as `#[serde(default)] Option<String>`. A typo in
+    /// that field name would decode every answer as `None`, and it would
+    /// silently take the drop-and-log path above for every answer, forever,
+    /// with every other test still green. This mirrors the server's
+    /// *current* `ApiResponse::DeviceState` shape exactly (a plain,
+    /// non-`Option` `device_id: String`; see
+    /// `lib/v1bectl_api/src/axum_server.rs`), and decodes it end-to-end
+    /// through the TUI's own `ApiMessage` envelope, the way `run_app`
+    /// receives one over the wire.
+    #[test]
+    fn a_server_shaped_device_state_answer_decodes_with_its_device_id() {
+        #[derive(Serialize)]
+        enum ServerShapedResponse {
+            DeviceState {
+                device_id: String,
+                state: DeviceStateValue,
+            },
+        }
+
+        let payload = {
+            let mut buf = Vec::new();
+            ciborium::into_writer(
+                &ServerShapedResponse::DeviceState {
+                    device_id: "b".to_string(),
+                    state: light("b", true).state,
+                },
+                &mut buf,
+            )
+            .unwrap();
+            buf
+        };
+
+        let mut bytes = Vec::new();
+        ciborium::into_writer(
+            &ApiMessage {
+                correlation_id: "corr-1".to_string(),
+                message_type: ApiMessageType::Response,
+                payload,
+            },
+            &mut bytes,
+        )
+        .unwrap();
+
+        let envelope: ApiMessage =
+            ciborium::from_reader(bytes.as_slice()).expect("envelope decodes");
+        let response: ApiResponse =
+            ciborium::from_reader(envelope.payload.as_slice()).expect("payload decodes");
+
+        assert!(
+            matches!(
+                &response,
+                ApiResponse::DeviceState { device_id: Some(id), .. } if id == "b"
+            ),
+            "{response:?}"
         );
     }
 }
