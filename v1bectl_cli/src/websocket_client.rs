@@ -62,7 +62,11 @@ enum ApiResponse {
     DeviceInfo {
         device: Box<DeviceInfo>,
     },
+    /// `device_id` is whose state it is (#10). A server from before it
+    /// doesn't send one.
     DeviceState {
+        #[serde(default)]
+        device_id: Option<DeviceId>,
         state: DeviceStateValue,
     },
     LightUpdated {
@@ -122,7 +126,13 @@ impl WebSocketClient {
             .await?;
 
         match response {
-            ApiResponse::DeviceState { state } => Ok(state),
+            ApiResponse::DeviceState {
+                device_id: Some(answered),
+                ..
+            } if answered != device_id => {
+                anyhow::bail!("Server answered with the state of {answered}, not {device_id}");
+            }
+            ApiResponse::DeviceState { state, .. } => Ok(state),
             ApiResponse::Error { code, message } => {
                 anyhow::bail!("Server error {code}: {message}");
             }

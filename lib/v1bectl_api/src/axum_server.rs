@@ -175,7 +175,13 @@ enum ApiResponse {
     DeviceInfo {
         device: Box<DeviceInfo>,
     },
+    /// The answer to `GetDeviceState`: the state of `device_id` (#10). A
+    /// client can tell by the id which device the state belongs to, not
+    /// only by which request it answers. A client that doesn't know the
+    /// field (the web UI's copy, or one built before it) still decodes the
+    /// answer: serde skips fields it doesn't know.
     DeviceState {
+        device_id: String,
         state: DeviceStateValue,
     },
     LightUpdated {
@@ -265,6 +271,35 @@ impl AxumServer {
             self.port
         );
 
+        let app = self.start_app().await?;
+        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
+        info!(
+            "WebSocket-ONLY server listening on 0.0.0.0:{} - NO BOOMER REST! 🚀",
+            self.port
+        );
+
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    /// [`Self::start`], on `listener` rather than on the port given to
+    /// [`Self::new`] (which this ignores). The API round-trip tests bind
+    /// `127.0.0.1:0` and connect to the port the OS picked (#8).
+    pub async fn serve(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+        let app = self.start_app().await?;
+        info!(
+            "WebSocket-ONLY server listening on {} - NO BOOMER REST! 🚀",
+            listener.local_addr()?
+        );
+
+        axum::serve(listener, app).await?;
+        Ok(())
+    }
+
+    /// Start what runs next to the socket (the virtual devices' input
+    /// tracking, and the forwarder that hands bus events to the clients),
+    /// and return the router for the WebSocket API.
+    async fn start_app(&self) -> anyhow::Result<Router> {
         // Start virtual device manager
         self.virtual_device_manager
             .start()
@@ -278,20 +313,11 @@ impl AxumServer {
             Arc::clone(&self.subscribers),
         );
 
-        let app = Router::new()
+        Ok(Router::new()
             // WebSocket ONLY - pure async real-time vibes!! 🔥
             .route("/", get(websocket_handler))
             .layer(ServiceBuilder::new().layer(CorsLayer::permissive()))
-            .with_state(self.clone());
-
-        let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", self.port)).await?;
-        info!(
-            "WebSocket-ONLY server listening on 0.0.0.0:{} - NO BOOMER REST! 🚀",
-            self.port
-        );
-
-        axum::serve(listener, app).await?;
-        Ok(())
+            .with_state(self.clone()))
     }
 
     async fn broadcast_event(&self, event: DeviceEvent) {
@@ -379,6 +405,7 @@ impl AxumServer {
             ApiRequest::GetDeviceState { device_id } => {
                 match self.state_store.get_device(&device_id).await {
                     Some(device_state) => ApiResponse::DeviceState {
+                        device_id,
                         state: device_state.state,
                     },
                     None => ApiResponse::Error {
