@@ -33,12 +33,12 @@ pub fn cyber_slider(props: &CyberSliderProps) -> Html {
 
     // Calculate percentage for CSS custom property
     let percent = if props.max > props.min {
-        ((props.value - props.min) as f32 / (props.max - props.min) as f32 * 100.0) as u32
+        (f32::from(props.value - props.min) / f32::from(props.max - props.min) * 100.0) as u32
     } else {
         0
     };
 
-    let style = format!("--percent: {}%", percent);
+    let style = format!("--percent: {percent}%");
 
     html! {
         <input

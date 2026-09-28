@@ -67,9 +67,8 @@ fn render_element(
         } => {
             let device = resolve_device(device_ref, devices_by_id, devices_by_name);
 
-            let (temperature, humidity) = device
-                .map(|d| extract_sensor_values(&d.state))
-                .unwrap_or((None, None));
+            let (temperature, humidity) =
+                device.map_or((None, None), |d| extract_sensor_values(&d.state));
 
             html! {
                 <SensorDisplay
@@ -90,9 +89,7 @@ fn render_element(
             let device = resolve_device(device_ref, devices_by_id, devices_by_name);
             let device_id = get_device_id(device_ref, device);
 
-            let (is_on, brightness) = device
-                .map(|d| extract_light_values(&d.state))
-                .unwrap_or((false, 0));
+            let (is_on, brightness) = device.map_or((false, 0), |d| extract_light_values(&d.state));
 
             let on_toggle = {
                 let on_request = on_request.clone();
@@ -143,9 +140,7 @@ fn render_element(
             let device = resolve_device(device_ref, devices_by_id, devices_by_name);
             let device_id = get_device_id(device_ref, device);
 
-            let is_on = device
-                .map(|d| extract_outlet_value(&d.state))
-                .unwrap_or(false);
+            let is_on = device.is_some_and(|d| extract_outlet_value(&d.state));
 
             let on_toggle = {
                 let on_request = on_request.clone();

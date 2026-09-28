@@ -26,7 +26,7 @@ pub fn cyber_app() -> Html {
     // 🔥 LOAD SCREEN CONFIG! 💖
     {
         let screens = screens.clone();
-        use_effect_with((), move |_| {
+        use_effect_with((), move |()| {
             wasm_bindgen_futures::spawn_local(async move {
                 // Try to load from /static/screens.kdl first
                 let kdl_content = match Request::get("/static/screens.kdl").send().await {
@@ -49,7 +49,7 @@ pub fn cyber_app() -> Html {
                         screens.set(parsed);
                     }
                     Err(e) => {
-                        log::error!("❌ Failed to parse screens: {}", e);
+                        log::error!("❌ Failed to parse screens: {e}");
                     }
                 }
             });
@@ -80,7 +80,7 @@ pub fn cyber_app() -> Html {
                 total_count,
             }) = response
             {
-                log::info!("🔥 Got {} devices!", total_count);
+                log::info!("🔥 Got {total_count} devices!");
                 devices.set(device_list.clone());
             }
             || ()
@@ -106,7 +106,7 @@ pub fn cyber_app() -> Html {
         let touch_start = touch_start.clone();
         Callback::from(move |e: TouchEvent| {
             if let Some(touch) = e.touches().get(0) {
-                touch_start.set(Some(touch.client_x() as f64));
+                touch_start.set(Some(f64::from(touch.client_x())));
             }
         })
     };
@@ -117,7 +117,7 @@ pub fn cyber_app() -> Html {
         let screens_len = screens.len();
         Callback::from(move |e: TouchEvent| {
             if let (Some(start), Some(touch)) = (*touch_start, e.changed_touches().get(0)) {
-                let end = touch.client_x() as f64;
+                let end = f64::from(touch.client_x());
                 let diff = end - start;
 
                 if diff.abs() > SWIPE_THRESHOLD {
@@ -154,8 +154,7 @@ pub fn cyber_app() -> Html {
     let active_screen = screens.get(*current_screen).cloned();
     let screen_title = active_screen
         .as_ref()
-        .map(|s| s.title.clone())
-        .unwrap_or_else(|| "VIBEC0RE".to_string());
+        .map_or_else(|| "VIBEC0RE".to_string(), |s| s.title.clone());
 
     html! {
         <div class="app"

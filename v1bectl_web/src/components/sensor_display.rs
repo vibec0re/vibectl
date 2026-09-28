@@ -23,7 +23,7 @@ pub fn sensor_display(props: &SensorDisplayProps) -> Html {
                     <div class="sensor-value">
                         <span class="icon">{"🌡️"}</span>
                         <span class="value">
-                            {props.temperature.map(|t| format!("{:.1}", t)).unwrap_or_else(|| "--".to_string())}
+                            {props.temperature.map_or_else(|| "--".to_string(), |t| format!("{t:.1}"))}
                         </span>
                         <span class="unit">{"°C"}</span>
                     </div>
@@ -43,7 +43,7 @@ pub fn sensor_display(props: &SensorDisplayProps) -> Html {
                     <div class="sensor-value">
                         <span class="icon">{"💧"}</span>
                         <span class="value">
-                            {props.humidity.map(|h| format!("{:.0}", h)).unwrap_or_else(|| "--".to_string())}
+                            {props.humidity.map_or_else(|| "--".to_string(), |h| format!("{h:.0}"))}
                         </span>
                         <span class="unit">{"%"}</span>
                     </div>
