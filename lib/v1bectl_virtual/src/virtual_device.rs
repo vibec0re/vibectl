@@ -41,6 +41,18 @@ pub struct VirtualDeviceConfig {
     pub config: serde_json::Value, // Type-specific configuration
 }
 
+/// What a virtual device needs done to take a new state (see
+/// [`VirtualDevice::plan_write`]): its members' new states, and its own.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VirtualWrite {
+    /// The member writes, in the order the manager commits them. A write
+    /// that fails ends the virtual write there, and the ones after it are
+    /// never made.
+    pub members: Vec<(DeviceId, DeviceStateValue)>,
+    /// The device's own state once every member write is committed.
+    pub state: DeviceStateValue,
+}
+
 /// Core trait for all virtual devices - VIBEC0RE MAGIC! 🔥
 #[async_trait]
 pub trait VirtualDevice: Send + Sync {
@@ -53,8 +65,26 @@ pub trait VirtualDevice: Send + Sync {
     /// Get the configuration
     fn config(&self) -> &VirtualDeviceConfig;
 
-    /// Called when virtual device state should change (API request)
-    async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError>;
+    /// What it takes for this device to be set to `new_state` (an API
+    /// request, a button action): the states it fans out to its members,
+    /// and the state it ends up with.
+    ///
+    /// It writes nothing, neither the store nor its own state (#55). The
+    /// manager commits each member write through the sync engine, which
+    /// arms the member's protection window before it writes the store. So
+    /// no pull can find the store ahead of the hub with nothing pending,
+    /// and revert the member. Only once every member write is committed
+    /// does the manager hand the device its new state
+    /// ([`Self::take_state`]). If one fails, the device keeps its old one.
+    async fn plan_write(
+        &self,
+        new_state: DeviceStateValue,
+    ) -> Result<VirtualWrite, VirtualDeviceError>;
+
+    /// Take `state`, the [`VirtualWrite::state`] of a write this device
+    /// planned ([`Self::plan_write`]), now that the manager has committed
+    /// every member write of it.
+    fn take_state(&mut self, state: DeviceStateValue);
 
     /// Take the state this device's inputs give it, as the store holds them
     /// now. The manager calls this once, when it registers the device. So a

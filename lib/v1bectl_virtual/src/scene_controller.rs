@@ -1,5 +1,5 @@
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,27 @@ pub enum TransitionType {
 pub struct VirtualSceneState {
     pub scene_name: String,
     pub is_active: bool,
+}
+
+/// The member states a scene activation has set so far: each device once,
+/// at the last state it set, in the order it first set them.
+#[derive(Default)]
+struct Staged(Vec<(DeviceId, DeviceStateValue)>);
+
+impl Staged {
+    fn get(&self, device_id: &DeviceId) -> Option<&DeviceStateValue> {
+        self.0
+            .iter()
+            .find(|(id, _)| id == device_id)
+            .map(|(_, state)| state)
+    }
+
+    fn set(&mut self, device_id: &DeviceId, state: DeviceStateValue) {
+        match self.0.iter_mut().find(|(id, _)| id == device_id) {
+            Some((_, staged)) => *staged = state,
+            None => self.0.push((device_id.clone(), state)),
+        }
+    }
 }
 
 /// Scene Controller Virtual Device - manages multi-device scenes 🎬
@@ -75,15 +96,27 @@ impl SceneController {
         })
     }
 
-    /// Activate a scene with its configured transition
-    async fn activate_scene(&mut self, scene: &Scene) -> Result<(), VirtualDeviceError> {
+    /// The member writes that activating `scene` takes: where its
+    /// transition leaves each of its devices, in the order it first sets
+    /// them.
+    ///
+    /// The transition runs as it always has, steps and delays included, but
+    /// on the scene's own copy of its devices' states (#55). It writes
+    /// nothing: the manager commits where it ends. Its steps used to go into
+    /// the store, where the manager only ever committed the last ones, and a
+    /// pull in between took them for outside changes. A device the store
+    /// doesn't have ends the transition where writing it used to fail, as
+    /// its last write: the manager's commit of it fails the activation
+    /// there.
+    async fn plan_activation(&self, scene: &Scene) -> Vec<(DeviceId, DeviceStateValue)> {
+        let mut staged = Staged::default();
         match scene.transition_type {
             TransitionType::Instant => {
                 // Set all devices immediately
                 for (device_id, state) in &scene.device_states {
-                    self.state_store
-                        .update_device_state(device_id, state.clone())
-                        .await?;
+                    if !self.stage(&mut staged, device_id, state.clone()).await {
+                        break;
+                    }
                 }
             }
             TransitionType::Fade { duration_ms } => {
@@ -95,14 +128,14 @@ impl SceneController {
                 if steps == 0 {
                     // Just set immediately if duration too short
                     for (device_id, state) in &scene.device_states {
-                        self.state_store
-                            .update_device_state(device_id, state.clone())
-                            .await?;
+                        if !self.stage(&mut staged, device_id, state.clone()).await {
+                            break;
+                        }
                     }
-                    return Ok(());
+                    return staged.0;
                 }
 
-                for step in 0..=steps {
+                'fade: for step in 0..=steps {
                     // `steps` is a fade duration in 100ms increments; not
                     // provably bounded to f32's 23-bit mantissa, but scene
                     // fades are seconds-to-minutes long in practice.
@@ -113,17 +146,19 @@ impl SceneController {
                     let progress = step as f32 / steps as f32;
 
                     for (device_id, target_state) in &scene.device_states {
-                        let current_state =
-                            self.state_store.get_device(device_id).await.map_or_else(
+                        let current_state = match staged.get(device_id) {
+                            Some(state) => state.clone(),
+                            None => self.state_store.get_device(device_id).await.map_or_else(
                                 || Self::get_default_state_for_target(target_state),
                                 |ds| ds.state,
-                            );
+                            ),
+                        };
 
                         let interpolated_state =
                             Self::interpolate_states(&current_state, target_state, progress);
-                        self.state_store
-                            .update_device_state(device_id, interpolated_state)
-                            .await?;
+                        if !self.stage(&mut staged, device_id, interpolated_state).await {
+                            break 'fade;
+                        }
                     }
 
                     if step < steps {
@@ -139,14 +174,27 @@ impl SceneController {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         }
                     }
-                    self.state_store
-                        .update_device_state(device_id, state.clone())
-                        .await?;
+                    if !self.stage(&mut staged, device_id, state.clone()).await {
+                        break;
+                    }
                 }
             }
         }
 
-        Ok(())
+        staged.0
+    }
+
+    /// Stage `state` for `device_id`, where the activation used to write it
+    /// into the store. Returns whether the store has the device: a write to
+    /// one it doesn't have failed, and ended the activation.
+    async fn stage(
+        &self,
+        staged: &mut Staged,
+        device_id: &DeviceId,
+        state: DeviceStateValue,
+    ) -> bool {
+        staged.set(device_id, state);
+        self.state_store.get_device(device_id).await.is_some()
     }
 
     /// Get default state for a target device type
@@ -265,7 +313,13 @@ impl VirtualDevice for SceneController {
         &self.config
     }
 
-    async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError> {
+    /// Its devices where the scene's transition leaves them (see
+    /// `plan_activation`), and the scene active. `none` (or no name)
+    /// deactivates the current scene, and writes no device.
+    async fn plan_write(
+        &self,
+        new_state: DeviceStateValue,
+    ) -> Result<VirtualWrite, VirtualDeviceError> {
         // Parse scene activation from scene state
         let scene_name = match new_state {
             DeviceStateValue::Scene(ref scene_state) => scene_state.scene_name.clone(),
@@ -274,27 +328,42 @@ impl VirtualDevice for SceneController {
 
         if scene_name == "none" || scene_name.is_empty() {
             // Deactivate current scene
-            self.current_scene = None;
-            self.current_state = VirtualSceneState {
-                scene_name: "none".to_string(),
-                is_active: false,
-            };
-            return Ok(());
+            return Ok(VirtualWrite {
+                members: Vec::new(),
+                state: DeviceStateValue::Scene(SceneState {
+                    scene_name: "none".to_string(),
+                    is_active: false,
+                }),
+            });
         }
 
-        if let Some(scene) = self.scenes.get(&scene_name).cloned() {
+        if let Some(scene) = self.scenes.get(&scene_name) {
             // Activate the scene
-            self.activate_scene(&scene).await?;
-            self.current_scene = Some(scene_name.clone());
-            self.current_state = VirtualSceneState {
-                scene_name,
-                is_active: true,
-            };
-            Ok(())
+            Ok(VirtualWrite {
+                members: self.plan_activation(scene).await,
+                state: DeviceStateValue::Scene(SceneState {
+                    scene_name,
+                    is_active: true,
+                }),
+            })
         } else {
             Err(VirtualDeviceError::Config(format!(
                 "Scene not found: {scene_name}"
             )))
+        }
+    }
+
+    fn take_state(&mut self, state: DeviceStateValue) {
+        if let DeviceStateValue::Scene(SceneState {
+            scene_name,
+            is_active,
+        }) = state
+        {
+            self.current_scene = is_active.then(|| scene_name.clone());
+            self.current_state = VirtualSceneState {
+                scene_name,
+                is_active,
+            };
         }
     }
 

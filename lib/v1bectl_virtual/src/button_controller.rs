@@ -1,7 +1,7 @@
 // 🔥 BUTTON CONTROLLER - REACTS TO BUTTON EVENTS! 💖
 
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
 };
 use async_trait::async_trait;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -447,10 +447,18 @@ impl VirtualDevice for ButtonController {
         &self.config
     }
 
-    async fn set_state(&mut self, _new_state: DeviceStateValue) -> Result<(), VirtualDeviceError> {
+    async fn plan_write(
+        &self,
+        _new_state: DeviceStateValue,
+    ) -> Result<VirtualWrite, VirtualDeviceError> {
         // ButtonController doesn't have its own state, it just reacts
-        Ok(())
+        Ok(VirtualWrite {
+            members: Vec::new(),
+            state: self.current_state(),
+        })
     }
+
+    fn take_state(&mut self, _state: DeviceStateValue) {}
 
     fn reactions(&self, event: &DeviceEvent) -> Vec<ButtonAction> {
         if event.device_id != self.button_id {
