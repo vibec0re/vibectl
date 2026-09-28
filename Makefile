@@ -26,7 +26,7 @@ help:
 	@echo "Test:"
 	@echo "  test          - Run native tests (mirrors CI: cargo test --workspace --exclude v1bectl_web)"
 	@echo "  test-dummy    - Alias for test"
-	@echo "  test-web      - Run v1bectl_web lib tests (mirrors CI's web job)"
+	@echo "  test-web      - Run v1bectl_web tests (mirrors CI's web job)"
 	@echo ""
 	@echo "Run:"
 	@echo "  run-server    - Run server (dummy gateway)"
@@ -37,7 +37,7 @@ help:
 	@echo "Other:"
 	@echo "  check         - Run cargo check"
 	@echo "  clippy        - Run clippy lints (mirrors CI's native job)"
-	@echo "  clippy-web    - Run clippy for v1bectl_web on wasm32 (mirrors CI's web job)"
+	@echo "  clippy-web    - Run clippy for v1bectl_web, wasm32 + native lib (mirrors CI's web job)"
 	@echo "  fmt           - Format all code"
 	@echo "  clean         - Clean build artifacts"
 	@echo "  dev-setup     - Set up dev environment"
@@ -119,7 +119,7 @@ test-dummy: test
 # Mirrors CI's web job test step.
 .PHONY: test-web
 test-web:
-	cargo test -p v1bectl_web --lib
+	cargo test -p v1bectl_web
 
 # Run targets
 .PHONY: run-server
@@ -155,10 +155,12 @@ check:
 clippy:
 	cargo clippy --workspace --exclude v1bectl_web --all-targets -- -D warnings
 
-# Mirrors CI's web job clippy step (v1bectl_web only builds clean on wasm32).
+# Mirrors CI's web job clippy steps. The native lib pass catches lints that
+# depend on the pointer width (`large_enum_variant` only fires on 64-bit).
 .PHONY: clippy-web
 clippy-web:
-	cargo clippy -p v1bectl_web --target wasm32-unknown-unknown -- -D warnings
+	cargo clippy -p v1bectl_web --target wasm32-unknown-unknown --all-targets -- -D warnings
+	cargo clippy -p v1bectl_web --lib -- -D warnings
 
 .PHONY: fmt
 fmt:
