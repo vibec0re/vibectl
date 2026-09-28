@@ -22,6 +22,24 @@ const MAX_MDNS_COLLISION_SUFFIX: u32 = 5;
 // instead of stacking the full request timeout N times.
 const HOST_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Render a `reqwest::Error` together with its whole `source()` chain. 🔧
+///
+/// reqwest 0.11 appended the cause to `Display` itself ("error sending
+/// request for url (…): error trying to connect: …"). 0.12 (like hyper 1)
+/// keeps the cause out of `Display`, so a bare `e.to_string()` would shrink
+/// to "error sending request for url (…)" and drop the part that says *why*
+/// (connection refused, TLS failure, the serde error on a bad body, …).
+/// Walking the chain keeps that detail in our logs and `GatewayError`s.
+fn error_chain(err: &reqwest::Error) -> String {
+    let mut chain = vec![err.to_string()];
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        chain.push(cause.to_string());
+        source = cause.source();
+    }
+    chain.join(": ")
+}
+
 /// Dirigera Gateway - connects to actual IKEA Dirigera hub! 🔥
 pub struct DirigeraGateway {
     client: Client,
@@ -307,7 +325,8 @@ impl DirigeraGateway {
                 Err(e) => {
                     debug!(
                         "🔧 Dirigera host candidate {} not responding: {}",
-                        candidate, e
+                        candidate,
+                        error_chain(&e)
                     );
                 }
             }
@@ -480,7 +499,7 @@ impl Gateway for DirigeraGateway {
             .header("Authorization", &format!("Bearer {}", self.access_token))
             .send()
             .await
-            .map_err(|e| GatewayError::NetworkError(e.to_string()))?;
+            .map_err(|e| GatewayError::NetworkError(error_chain(&e)))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -492,7 +511,10 @@ impl Gateway for DirigeraGateway {
         }
 
         let devices: Vec<DirigeraDevice> = response.json().await.map_err(|e| {
-            GatewayError::InternalError(format!("Failed to parse Dirigera response: {e}"))
+            GatewayError::InternalError(format!(
+                "Failed to parse Dirigera response: {}",
+                error_chain(&e)
+            ))
         })?;
 
         info!("🚀 Found {} devices from Dirigera hub!", devices.len());
@@ -533,7 +555,7 @@ impl Gateway for DirigeraGateway {
             .header("Authorization", &format!("Bearer {}", self.access_token))
             .send()
             .await
-            .map_err(|e| GatewayError::NetworkError(e.to_string()))?;
+            .map_err(|e| GatewayError::NetworkError(error_chain(&e)))?;
 
         if response.status() == 404 {
             return Err(GatewayError::DeviceNotFound(device_id.clone()));
@@ -548,7 +570,10 @@ impl Gateway for DirigeraGateway {
         }
 
         let device: DirigeraDevice = response.json().await.map_err(|e| {
-            GatewayError::InternalError(format!("Failed to parse device response: {e}"))
+            GatewayError::InternalError(format!(
+                "Failed to parse device response: {}",
+                error_chain(&e)
+            ))
         })?;
 
         let state = Self::convert_dirigera_state(&device);
@@ -573,14 +598,17 @@ impl Gateway for DirigeraGateway {
             .header("Authorization", &format!("Bearer {}", self.access_token))
             .send()
             .await
-            .map_err(|e| GatewayError::NetworkError(e.to_string()))?;
+            .map_err(|e| GatewayError::NetworkError(error_chain(&e)))?;
 
         if !device_response.status().is_success() {
             return Err(GatewayError::DeviceNotFound(device_id.clone()));
         }
 
         let device: DirigeraDevice = device_response.json().await.map_err(|e| {
-            GatewayError::InternalError(format!("Failed to parse device response: {e}"))
+            GatewayError::InternalError(format!(
+                "Failed to parse device response: {}",
+                error_chain(&e)
+            ))
         })?;
 
         let dirigera_payload = match state {
@@ -672,7 +700,7 @@ impl Gateway for DirigeraGateway {
             .json(&payload_array)
             .send()
             .await
-            .map_err(|e| GatewayError::NetworkError(e.to_string()))?;
+            .map_err(|e| GatewayError::NetworkError(error_chain(&e)))?;
 
         if response.status() == 404 {
             return Err(GatewayError::DeviceNotFound(device_id.clone()));
@@ -751,12 +779,13 @@ impl Gateway for DirigeraGateway {
                 })
             }
             Err(e) => {
-                error!("Failed to reach Dirigera hub: {}", e);
+                let error_msg = error_chain(&e);
+                error!("Failed to reach Dirigera hub: {}", error_msg);
                 Ok(GatewayHealth {
                     reachable: false,
                     response_time_ms: response_time,
                     connected_devices: 0,
-                    last_error: Some(e.to_string()),
+                    last_error: Some(error_msg),
                 })
             }
         }
@@ -988,6 +1017,20 @@ mod tests {
         assert_eq!(
             DirigeraGateway::host_candidates("hub.example.com", 5),
             vec!["hub.example.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn error_chain_keeps_the_cause_that_reqwest_0_12_display_drops() {
+        // A malformed URL fails in the builder, with the url parse error as
+        // `source()`. 0.12's `Display` prints only "builder error".
+        let err = Client::new().get("http://[::1").build().unwrap_err();
+        let top = err.to_string();
+        let rendered = error_chain(&err);
+        assert!(rendered.starts_with(&top), "{rendered}");
+        assert!(
+            rendered.len() > top.len() + 2,
+            "cause missing from {rendered:?}"
         );
     }
 
