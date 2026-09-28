@@ -173,7 +173,6 @@ enum ChangeSource {
 enum ConflictResolution {
     ServerWins,      // Always push server state to gateway
     GatewayWins,     // Always update server with gateway state
-    TimestampWins,   // Compare timestamps, newer wins
     Manual,          // Store conflict for user resolution
 }
 ```
