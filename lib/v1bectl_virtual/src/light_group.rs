@@ -1,5 +1,5 @@
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -153,6 +153,10 @@ pub(crate) fn initial_group_state() -> LightState {
 }
 
 /// Light Group Virtual Device - controls multiple lights as one unit 💡
+///
+/// It reads its members from the store, to derive its own state from them,
+/// but never writes them: a write to it is a [`VirtualWrite`] that the
+/// manager commits (#55).
 pub struct LightGroup {
     config: VirtualDeviceConfig,
     lights: Vec<DeviceId>,
@@ -215,20 +219,6 @@ impl LightGroup {
         }
     }
 
-    /// Apply brightness curves for the group state `group` to all member lights
-    async fn apply_brightness_curves(&self, group: &LightState) -> Result<(), VirtualDeviceError> {
-        for light_id in &self.lights {
-            let device_state = self.member_state(light_id, group);
-
-            // Set physical light state
-            self.state_store
-                .update_device_state(light_id, DeviceStateValue::Light(device_state))
-                .await?;
-        }
-
-        Ok(())
-    }
-
     /// Calculate group state from member light states (see [`re_derive`]):
     /// with no member lit, the group keeps its level.
     async fn calculate_group_state(&mut self) -> Result<(), VirtualDeviceError> {
@@ -262,20 +252,33 @@ impl VirtualDevice for LightGroup {
         &self.config
     }
 
-    async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError> {
-        match new_state {
-            DeviceStateValue::Light(light_state) => {
-                // Apply to all member lights using brightness curves, and
-                // only then take the new state: if a member fails, the group
-                // keeps its old one (the manager then re-derives it from the
-                // members that did change).
-                let light_state = resolve_write(&self.current_state, light_state);
-                self.apply_brightness_curves(&light_state).await?;
-                self.current_state = light_state;
+    /// Each light at its brightness curve's level for the group state the
+    /// write resolves to (`resolve_write`), in the order of its lights.
+    async fn plan_write(
+        &self,
+        new_state: DeviceStateValue,
+    ) -> Result<VirtualWrite, VirtualDeviceError> {
+        let DeviceStateValue::Light(asked) = new_state else {
+            return Err(VirtualDeviceError::InvalidStateType);
+        };
+        let group = resolve_write(&self.current_state, asked);
+        let members = self
+            .lights
+            .iter()
+            .map(|id| {
+                let state = DeviceStateValue::Light(self.member_state(id, &group));
+                (id.clone(), state)
+            })
+            .collect();
+        Ok(VirtualWrite {
+            members,
+            state: DeviceStateValue::Light(group),
+        })
+    }
 
-                Ok(())
-            }
-            _ => Err(VirtualDeviceError::InvalidStateType),
+    fn take_state(&mut self, state: DeviceStateValue) {
+        if let DeviceStateValue::Light(group) = state {
+            self.current_state = group;
         }
     }
 

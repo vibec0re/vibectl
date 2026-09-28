@@ -37,7 +37,8 @@ pub struct VirtualDeviceManager {
     /// commits each member it changes through
     /// `SyncEngine::apply_optimistic_update`, the call a direct write to
     /// that member makes, so the member reaches the gateway. Without one,
-    /// members are only echoed.
+    /// the manager writes the members into the store itself, and echoes
+    /// them.
     sync_engine: Arc<OnceLock<Arc<SyncEngine>>>,
     /// Set once [`Self::start`] has run (see [`Self::add_virtual_device`]).
     tracking: Arc<AtomicBool>,
@@ -136,41 +137,96 @@ impl VirtualDeviceManager {
         Ok(())
     }
 
-    /// Commit one member state that a virtual write already put in the store.
+    /// Commit one member write of a virtual write, or a button action's
+    /// write to a light: `new_state` for `member_id`, which the store holds
+    /// as `old_state`. Nothing has written it anywhere yet (#55).
     ///
     /// A physical member goes through the sync engine when one is attached,
-    /// the way a direct write to it does. That queues the gateway push. With
-    /// optimistic updates on (the default) it also writes the store again
-    /// (same value) and publishes the echo, so it is the member's only
+    /// the way a direct write to it does. That arms the member's protection
+    /// window and queues the gateway push before anything changes the store.
+    /// So no pull can find the store ahead of the hub with nothing pending,
+    /// take that for an outside change and revert it (`GatewayWins`). With
+    /// optimistic updates on (the default) the engine also writes the store
+    /// and publishes the echo, so it is the member's only writer and
     /// publisher.
     ///
-    /// Otherwise the echo is ours: with no engine, for a virtual member (the
-    /// gateway doesn't know it), and with optimistic updates off. In that
-    /// mode a direct write is echoed once a pull confirms it. But the
-    /// fan-out has already put this member's state in the store, so that
+    /// Otherwise the store write and the echo are ours: with no engine, for
+    /// a virtual member (the gateway doesn't know it), and with optimistic
+    /// updates off. In that mode a direct write is echoed once a pull
+    /// confirms it. But a virtual write puts its members in the store right
+    /// away, as it always has (after the engine armed the window), so that
     /// pull finds nothing new and would never echo it.
     async fn commit_member_write(
         &self,
         member_id: &DeviceId,
-        old_state: Option<&DeviceStateValue>,
+        old_state: &DeviceStateValue,
         new_state: &DeviceStateValue,
         member_is_virtual: bool,
-    ) {
+    ) -> Result<(), VirtualDeviceError> {
         if let (Some(engine), false) = (self.sync_engine.get(), member_is_virtual) {
-            match engine
+            if let Err(e) = engine
                 .apply_optimistic_update(member_id, new_state.clone())
                 .await
             {
-                Ok(()) if engine.config().optimistic_updates => return,
-                Ok(()) => {}
-                Err(e) => tracing::warn!(
+                // Its only failure is the store write: the member has left
+                // the store since the caller found it there.
+                tracing::warn!(
                     "❌ Failed to sync member {} of a virtual write: {}",
                     member_id,
                     e
-                ),
+                );
+                return Err(e.downcast::<StateError>().map_or_else(
+                    |_| VirtualDeviceError::DeviceNotFound(member_id.clone()),
+                    VirtualDeviceError::StateStore,
+                ));
+            }
+            if engine.config().optimistic_updates {
+                return Ok(());
             }
         }
-        self.publish_state(member_id, old_state, new_state).await;
+        self.state_store
+            .update_device_state(member_id, new_state.clone())
+            .await?;
+        self.publish_state(member_id, Some(old_state), new_state)
+            .await;
+        Ok(())
+    }
+
+    /// Commit `members`, the member writes of a virtual write, in order,
+    /// each through [`Self::commit_member_write`]. `devices` is what the
+    /// `virtual_devices` lock guards, which the caller holds: a member in
+    /// it is virtual.
+    ///
+    /// A member listed more than once is committed once, where it first
+    /// comes, at the last state it's listed with. One the write leaves as
+    /// it is has nothing to push or echo, and is skipped. The first that
+    /// fails, such as a member the store doesn't have (#2), ends the write:
+    /// the ones before it stay committed, and the ones after it are never
+    /// made.
+    async fn commit_members(
+        &self,
+        devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        members: Vec<(DeviceId, DeviceStateValue)>,
+    ) -> Result<(), VirtualDeviceError> {
+        let mut writes: Vec<(DeviceId, DeviceStateValue)> = Vec::with_capacity(members.len());
+        for (id, state) in members {
+            match writes.iter_mut().find(|(listed, _)| *listed == id) {
+                Some((_, last)) => *last = state,
+                None => writes.push((id, state)),
+            }
+        }
+
+        for (id, state) in writes {
+            let Some(old_state) = self.state_store.get_device(&id).await.map(|d| d.state) else {
+                return Err(StateError::DeviceNotFound(id).into());
+            };
+            if old_state == state {
+                continue;
+            }
+            self.commit_member_write(&id, &old_state, &state, devices.contains_key(&id))
+                .await?;
+        }
+        Ok(())
     }
 
     /// Add a virtual device to the manager. It first takes its state from
@@ -626,27 +682,26 @@ impl VirtualDeviceManager {
         if devices.contains_key(target) {
             return self.write_virtual(&mut devices, target, new_state).await;
         }
-        self.state_store
-            .update_device_state(target, new_state.clone())
-            .await?;
-        self.commit_member_write(target, Some(&current), &new_state, false)
-            .await;
-        Ok(())
+        self.commit_member_write(target, &current, &new_state, false)
+            .await
     }
 
     /// Set virtual device state (called from API)
     ///
     /// Publishes a state echo for the virtual device and for every member
-    /// whose state the write changed. Members are committed through the
-    /// attached sync engine (see [`Self::attach_sync_engine`]), the same way
-    /// a direct write to them is.
+    /// whose state the write changed. The device only says what the write
+    /// takes ([`VirtualDevice::plan_write`]). The manager commits each
+    /// member through the attached sync engine (see
+    /// [`Self::attach_sync_engine`]), the same way a direct write to it is,
+    /// and the engine writes it into the store (#55). Without an engine the
+    /// manager writes the store itself.
     ///
     /// A write can fail part-way (a missing member, as in #2). The members
-    /// it did change are still committed and echoed, and then the error is
-    /// returned. A group keeps its old state on failure, which no longer
-    /// accounts for those members, so input tracking re-derives it from
-    /// them like after any outside change: the group ends up showing what
-    /// happened.
+    /// committed before the failure stay committed and echoed, and then the
+    /// error is returned. A group keeps its old state on failure, which no
+    /// longer accounts for those members, so input tracking re-derives it
+    /// from them like after any outside change: the group ends up showing
+    /// what happened.
     pub async fn set_virtual_device_state(
         &self,
         device_id: &DeviceId,
@@ -669,56 +724,33 @@ impl VirtualDeviceManager {
             return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
         };
 
-        // Snapshot what this write can touch, so we echo exactly what changed.
-        let mut outputs = virtual_device.output_devices();
-        let mut seen = HashSet::new();
-        outputs.retain(|id| seen.insert(id.clone()));
-        let virtual_outputs: HashSet<DeviceId> = outputs
-            .iter()
-            .filter(|id| devices.contains_key(*id))
-            .cloned()
-            .collect();
-        let mut old_outputs = HashMap::new();
-        for id in &outputs {
-            if let Some(device) = self.state_store.get_device(id).await {
-                old_outputs.insert(id.clone(), device.state);
-            }
-        }
+        // What the write takes. Nothing is written yet, not even the store:
+        // the member commits write it, each behind its protection window
+        // (#55). The device writing its members into the store itself, for
+        // the manager to commit after, left a gap a pull could revert them
+        // in.
+        let result = match virtual_device.plan_write(new_state).await {
+            Ok(write) => self
+                .commit_members(devices, write.members)
+                .await
+                .map(|()| write.state),
+            Err(e) => Err(e),
+        };
 
-        // Update virtual device (writes its members into the store)
         let Some(virtual_device) = devices.get_mut(device_id) else {
             return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
         };
-        let result = virtual_device.set_state(new_state).await;
-
-        let mut changed = Vec::new();
-        for id in outputs {
-            let Some(device) = self.state_store.get_device(&id).await else {
-                continue;
-            };
-            let old_state = old_outputs.remove(&id);
-            if old_state.as_ref() != Some(&device.state) {
-                changed.push((id, old_state, device.state));
-            }
-        }
-
-        let current_state = virtual_device.current_state();
-
-        // Whatever the write changed is in the store by now, even if it
-        // failed part-way: commit and echo it.
-        for (id, old_state, state) in &changed {
-            self.commit_member_write(id, old_state.as_ref(), state, virtual_outputs.contains(id))
-                .await;
-        }
-
         match result {
-            Ok(()) => {
-                self.store_state(device_id, current_state, true).await?;
+            Ok(state) => {
+                virtual_device.take_state(state);
+                self.store_state(device_id, virtual_device.current_state(), true)
+                    .await?;
                 Ok(())
             }
             Err(e) => {
-                // The groups keep their state on failure, but a device that
-                // moved before failing must not leave the store behind.
+                // A device keeps its state on failure, but the store must
+                // not be left behind it.
+                let current_state = virtual_device.current_state();
                 if let Err(store_error) = self.store_state(device_id, current_state, false).await {
                     tracing::error!("Failed to update virtual device state: {}", store_error);
                 }
@@ -881,14 +913,14 @@ mod tests {
     use crate::button_controller::TestClock;
     use crate::{
         ButtonController, DummyGateway, LightGroup, LightGroupLinear, SceneController,
-        DEFAULT_GROUP_LEVEL, ECHO_QUIET_PERIOD,
+        VirtualWrite, DEFAULT_GROUP_LEVEL, ECHO_QUIET_PERIOD,
     };
     use std::time::Duration;
     use tokio::sync::broadcast::{self, error::TryRecvError};
     use tokio::sync::watch;
     use v1bectl_sync::{
         recv_lossy, ButtonPressType, Capability, Gateway, GatewayError, GatewayHealth, LightState,
-        SwitchState, SyncConfig, SyncStatus,
+        SceneState, SwitchState, SyncConfig, SyncStatus,
     };
 
     fn light_info(device_id: &str) -> DeviceInfo {
@@ -1342,6 +1374,121 @@ mod tests {
             group_start(),
             "the group's own state must match the store"
         );
+    }
+
+    /// #55: through the sync engine, a write that fails part-way stops at
+    /// the member that fails, as it does without one. The members before it
+    /// are committed through the engine. The missing one, and the ones after
+    /// it, never reach the engine: the manager finds the missing one gone
+    /// before it asks, so it queues no push for a device the store doesn't
+    /// have.
+    #[tokio::test]
+    async fn partial_group_write_through_the_engine_stops_at_the_missing_member() {
+        for optimistic_updates in [true, false] {
+            let (manager, store, bus) = manager_with_group(&["a", "missing", "b"]).await;
+            for id in ["a", "b"] {
+                store.add_device(light_info(id), light(true, 80)).await;
+            }
+            let engine = Arc::new(SyncEngine::new(
+                store.clone(),
+                bus.clone(),
+                Arc::new(DummyGateway::new("basic_home")),
+                Some(SyncConfig {
+                    optimistic_updates,
+                    ..SyncConfig::default()
+                }),
+            ));
+            manager.attach_sync_engine(engine.clone());
+            let mut rx = bus.subscribe();
+
+            let asked = light(true, 20);
+            let result = manager
+                .set_virtual_device_state(&"g".to_string(), asked.clone())
+                .await;
+            assert!(
+                matches!(
+                    &result,
+                    Err(VirtualDeviceError::StateStore(StateError::DeviceNotFound(id)))
+                        if id == "missing"
+                ),
+                "optimistic_updates: {optimistic_updates}: {result:?}"
+            );
+            let events = pump(&manager, &mut rx).await;
+
+            assert_eq!(stored(&store, "a").await, asked);
+            assert_eq!(echoes(&events, "a"), vec![asked.clone()], "a's echo");
+            let status = engine.get_sync_status(&"a".to_string()).await;
+            assert!(
+                matches!(status, Some(SyncStatus::PendingSync { .. })),
+                "a never queued for the gateway: {status:?}"
+            );
+            for id in ["missing", "b"] {
+                let status = engine.get_sync_status(&id.to_string()).await;
+                assert!(status.is_none(), "{id} reached the engine: {status:?}");
+            }
+            assert_eq!(stored(&store, "b").await, light(true, 80), "b was written");
+            assert!(echoes(&events, "b").is_empty(), "unchanged member echoed");
+            // Re-derived from `a` at 20 and `b` at 80.
+            assert_eq!(stored(&store, "g").await, light(true, 50), "group");
+        }
+    }
+
+    /// #55: a scene hands its devices' states to the manager too, and the
+    /// manager commits them through the sync engine: each stored, echoed
+    /// once, and queued for the gateway. Then the scene is active.
+    #[tokio::test]
+    async fn scene_activation_commits_its_devices_through_the_engine() {
+        let store = StateStore::new();
+        for id in ["a", "b"] {
+            store.add_device(light_info(id), off()).await;
+        }
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let engine = attach_engine(&manager, &store, &bus);
+        let on = light(true, 50);
+        let scene = SceneController::new(
+            VirtualDeviceConfig {
+                device_id: "scene".to_string(),
+                device_type: VirtualDeviceType::SceneController,
+                name: "Scene".to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({ "scenes": { "evening": {
+                    "name": "evening",
+                    "device_states": { "a": on, "b": on },
+                    "transition_type": "Instant",
+                } } }),
+            },
+            store.clone(),
+        )
+        .expect("scene");
+        manager
+            .add_virtual_device(Box::new(scene))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+
+        let evening = DeviceStateValue::Scene(SceneState {
+            scene_name: "evening".to_string(),
+            is_active: true,
+        });
+        manager
+            .set_virtual_device_state(&"scene".to_string(), evening.clone())
+            .await
+            .expect("activate");
+        let events = pump(&manager, &mut rx).await;
+
+        for id in ["a", "b"] {
+            assert_eq!(stored(&store, id).await, on, "{id} state");
+            assert_eq!(echoes(&events, id), vec![on.clone()], "{id} echo");
+            let status = engine.get_sync_status(&id.to_string()).await;
+            assert!(
+                matches!(status, Some(SyncStatus::PendingSync { .. })),
+                "{id} never queued for the gateway: {status:?}"
+            );
+        }
+        assert_eq!(stored(&store, "scene").await, evening);
+        assert_eq!(echoes(&events, "scene"), vec![evening], "scene echo");
     }
 
     /// Scene devices and controller targets are outputs, not inputs. A
@@ -2626,9 +2773,17 @@ mod tests {
             &self.config
         }
 
-        async fn set_state(&mut self, _: DeviceStateValue) -> Result<(), VirtualDeviceError> {
-            Ok(())
+        async fn plan_write(
+            &self,
+            _: DeviceStateValue,
+        ) -> Result<VirtualWrite, VirtualDeviceError> {
+            Ok(VirtualWrite {
+                members: Vec::new(),
+                state: self.current_state(),
+            })
         }
+
+        fn take_state(&mut self, _: DeviceStateValue) {}
 
         async fn on_input_changed(
             &mut self,

@@ -2,7 +2,7 @@
 
 use crate::light_group::{fanned_out, initial_group_state, re_derive, resolve_write};
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -11,6 +11,10 @@ use v1bectl_sync::{DeviceId, DeviceState, DeviceStateValue, LightState, StateSto
 
 /// Light Group with Linear Brightness Mapping
 /// Maps input brightness (0-100) to member-specific ranges [min, max]
+///
+/// Like [`crate::LightGroup`], it reads its members from the store but
+/// never writes them: a write to it is a [`VirtualWrite`] that the manager
+/// commits (#55).
 pub struct LightGroupLinear {
     config: VirtualDeviceConfig,
     members: HashMap<String, String>, // name -> device_id
@@ -87,29 +91,6 @@ impl LightGroupLinear {
         }
     }
 
-    /// Apply the mapped brightness for the group state `group` to all member lights
-    async fn apply_brightness_mapping(&self, group: &LightState) -> Result<(), VirtualDeviceError> {
-        for (name, device_id) in &self.members {
-            let device_state = self.member_state(name, group);
-            let member_brightness = device_state.brightness.unwrap_or(0);
-
-            // Update member light state
-            self.state_store
-                .update_device_state(device_id, DeviceStateValue::Light(device_state))
-                .await?;
-
-            tracing::debug!(
-                "🔥 Updated {} ({}) to {}% (group: {}%)",
-                name,
-                device_id,
-                member_brightness,
-                group.brightness.unwrap_or(100)
-            );
-        }
-
-        Ok(())
-    }
-
     /// Calculate group state from member states (inverse mapping, see
     /// [`re_derive`]): with no member lit, the group keeps its level.
     async fn calculate_group_state(&mut self) -> Result<(), VirtualDeviceError> {
@@ -144,20 +125,40 @@ impl VirtualDevice for LightGroupLinear {
         &self.config
     }
 
-    async fn set_state(&mut self, new_state: DeviceStateValue) -> Result<(), VirtualDeviceError> {
-        match new_state {
-            DeviceStateValue::Light(light_state) => {
-                // Apply linear brightness mapping to all members, and only
-                // then take the new state: if a member fails, the group keeps
-                // its old one (the manager then re-derives it from the
-                // members that did change).
-                let light_state = resolve_write(&self.current_state, light_state);
-                self.apply_brightness_mapping(&light_state).await?;
-                self.current_state = light_state;
+    /// Each member at its range's level for the group state the write
+    /// resolves to (`resolve_write`).
+    async fn plan_write(
+        &self,
+        new_state: DeviceStateValue,
+    ) -> Result<VirtualWrite, VirtualDeviceError> {
+        let DeviceStateValue::Light(asked) = new_state else {
+            return Err(VirtualDeviceError::InvalidStateType);
+        };
+        let group = resolve_write(&self.current_state, asked);
+        let members = self
+            .members
+            .iter()
+            .map(|(name, device_id)| {
+                let state = self.member_state(name, &group);
+                tracing::debug!(
+                    "🔥 {} ({}) goes to {}% (group: {}%)",
+                    name,
+                    device_id,
+                    state.brightness.unwrap_or(0),
+                    group.brightness.unwrap_or(100)
+                );
+                (device_id.clone(), DeviceStateValue::Light(state))
+            })
+            .collect();
+        Ok(VirtualWrite {
+            members,
+            state: DeviceStateValue::Light(group),
+        })
+    }
 
-                Ok(())
-            }
-            _ => Err(VirtualDeviceError::InvalidStateType),
+    fn take_state(&mut self, state: DeviceStateValue) {
+        if let DeviceStateValue::Light(group) = state {
+            self.current_state = group;
         }
     }
 
