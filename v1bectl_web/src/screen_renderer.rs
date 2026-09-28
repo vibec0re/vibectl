@@ -53,6 +53,12 @@ fn render_group(
     }
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one match arm per Element variant, each a flat sequence of device lookup + \
+              callback wiring + an html! block; splitting the arms into their own functions \
+              would scatter the render logic for a single element type rather than simplify it"
+)]
 fn render_element(
     element: &Element,
     devices_by_id: &HashMap<String, &DeviceState>,

@@ -836,6 +836,12 @@ async fn send_ping(
 /// server, keepalive pings, tab-return probes, and the watchdog. Returns when
 /// the socket dies, stops answering, or a newer connection takes over. Every
 /// way out closes the socket, and the timers are dropped with this frame.
+#[expect(
+    clippy::too_many_lines,
+    reason = "a single select_biased! loop holding `write`/`liveness`/the timers across each \
+              branch; splitting branches into helper functions would scatter state that needs \
+              to be read and mutated together on every wakeup, risking a subtle ordering bug"
+)]
 async fn pump(
     ctx: &Ctx,
     generation: u64,
