@@ -71,12 +71,19 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Clippy (wasm32)
-        run: cargo clippy -p v1bectl_web --target wasm32-unknown-unknown -- -D warnings
+        run: cargo clippy -p v1bectl_web --target wasm32-unknown-unknown --all-targets -- -D warnings
 
-      # The reconnect state machine and the screen parser are pure, so the lib
-      # tests run natively.
+      # Some lints depend on the pointer width (`large_enum_variant` only
+      # fires on 64-bit), and the tests below build natively, so lint natively
+      # too.
+      - name: Clippy (native)
+        run: cargo clippy -p v1bectl_web --all-targets -- -D warnings
+
+      # The reconnect state machine and the screen parser are pure, so the
+      # tests run natively. The bin only calls `v1bectl_web::run()`, so each
+      # test runs once.
       - name: Test
-        run: cargo test -p v1bectl_web --lib
+        run: cargo test -p v1bectl_web
 
       # trunk fetches the exact sass / wasm-bindgen / wasm-opt versions pinned
       # in v1bectl_web/Trunk.toml. wasm-bindgen has to match Cargo.lock, so

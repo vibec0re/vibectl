@@ -12,9 +12,9 @@
     <meta http-equiv="Expires" content="0">
     <title>VIBEC0RE :: NEST</title>
 
-    <!-- 🔥 Cargo.toml has both a `[lib] cdylib` and a same-named bin (src/main.rs);
-         without this, trunk sees two artifacts named v1bectl_web and refuses to
-         guess. Build the bin. 💖 -->
+    <!-- 🔥 Build the bin (src/main.rs), which links the lib. The lib is a plain
+         rlib, so the bin is the only wasm artifact; naming it keeps trunk from
+         guessing if a cdylib ever comes back. 💖 -->
     <link data-trunk rel="rust" data-bin="v1bectl_web" />
 
     <!-- 🔥 CYBER THEME - NO BOOTSTRAP NEEDED! 💖 -->

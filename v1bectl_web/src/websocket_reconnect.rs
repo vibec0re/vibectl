@@ -21,11 +21,12 @@
 //   socket instead of leaking it: its task sees its fused "closer" fire and its
 //   outbound queue end (#29).
 // - Coming back to the page (#29): a plain tab switch pings an open socket
-//   first and reconnects only if nothing answers within `PROBE_TIMEOUT_MS`. A
-//   page restored from the back/forward cache, or a socket that has been
-//   silent for longer than the watchdog allows (an iOS resume, a sleeping
-//   laptop), reconnects straight away. A wake-up may pre-empt an attempt
-//   that has been connecting for `CONNECT_PREEMPT_MS`.
+//   first and reconnects unless that ping's PONG (matched by correlation id)
+//   is back within `PROBE_TIMEOUT_MS`. A page restored from the back/forward
+//   cache, or a socket that has been silent for longer than the watchdog
+//   allows (an iOS resume, a sleeping laptop), reconnects straight away. A
+//   wake-up may pre-empt an attempt that has been connecting for
+//   `CONNECT_PREEMPT_MS`.
 
 use futures::channel::{mpsc, oneshot};
 use futures::future::Fuse;
@@ -49,6 +50,46 @@ use v1bectl_state::{DeviceEvent, RgbColor};
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Config {
     socket: String,
+}
+
+/// What an attempt dials when no config has loaded yet this session.
+const DEFAULT_SOCKET_URL: &str = "ws://localhost:31337";
+
+/// The socket URL for each attempt. An attempt whose config fetch fails (a
+/// flaky phone network, a web server restarting next to the API server)
+/// reuses the last URL a config fetch returned this session. It only falls
+/// back to `DEFAULT_SOCKET_URL` if no config has ever loaded (#9). Pure, so
+/// it's unit-tested natively.
+#[derive(Debug, Default)]
+struct SocketUrl {
+    last_good: Option<String>,
+}
+
+impl SocketUrl {
+    /// The URL for an attempt whose config fetch returned `loaded` (`None`:
+    /// it failed or timed out).
+    fn resolve(&mut self, loaded: Option<String>) -> String {
+        if let Some(url) = loaded {
+            self.last_good = Some(url.clone());
+            return url;
+        }
+        match &self.last_good {
+            Some(url) => {
+                log::warn!(
+                    "⚠️ Failed to load config, reusing the last good URL {}",
+                    url
+                );
+                url.clone()
+            }
+            None => {
+                log::warn!(
+                    "⚠️ Failed to load config (none loaded yet), using default {}",
+                    DEFAULT_SOCKET_URL
+                );
+                DEFAULT_SOCKET_URL.to_string()
+            }
+        }
+    }
 }
 
 // Load config from static file
@@ -123,8 +164,11 @@ pub enum ApiResponse {
         devices: Vec<DeviceState>,
         total_count: u32,
     },
+    /// Boxed: a `DeviceInfo` is over 250 bytes on 64-bit targets (clippy's
+    /// `large_enum_variant`, which only fires on native builds). The wire
+    /// format is unchanged, since serde encodes a `Box<T>` as a `T`.
     DeviceInfo {
-        device: DeviceInfo,
+        device: Box<DeviceInfo>,
     },
     DeviceState {
         state: serde_json::Value,
@@ -190,7 +234,7 @@ const BACKOFF_MAX_MS: u32 = 30_000;
 /// `visibilitychange` and `pageshow` back to back).
 const CONNECT_PREEMPT_MS: f64 = 2_000.0;
 /// Coming back to a tab with an open socket sends a PING first, and only
-/// reconnects if nothing arrives within this long.
+/// reconnects if that PING's PONG doesn't arrive within this long.
 const PROBE_TIMEOUT_MS: u32 = 2_000;
 
 /// Delay before the next attempt after `failures` consecutive failed
@@ -218,21 +262,22 @@ fn watchdog_expired(now_ms: f64, last_inbound_ms: f64, unanswered_ping_ms: Optio
 /// them. Whether anything has arrived since the last ping is tracked by that
 /// order, not by comparing `Date.now()` stamps, so a ping and a message in the
 /// same millisecond are never ambiguous. Pure, so it's unit-tested natively.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Liveness {
     last_inbound_ms: f64,
     /// When the latest ping was sent, if nothing has arrived since.
     unanswered_ping_ms: Option<f64>,
-    /// A tab-return probe is waiting for the server to answer.
-    probing: bool,
+    /// A tab-return probe is waiting for the PONG to its PING, which carries
+    /// this correlation id.
+    probe: Option<String>,
 }
 
 /// How a socket's task checks its socket when the tab comes back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ProbeStep {
-    /// Send a ping, and reconnect unless something arrives within
-    /// `PROBE_TIMEOUT_MS`.
-    SendPing,
+    /// Send a ping with this correlation id, and reconnect unless its pong
+    /// arrives within `PROBE_TIMEOUT_MS`.
+    SendPing(String),
     /// A probe is already waiting for its answer: leave it be.
     AlreadyProbing,
     /// Nothing has arrived for `WATCHDOG_TIMEOUT_MS`, so the page was frozen or
@@ -246,15 +291,36 @@ impl Liveness {
         Self {
             last_inbound_ms: now_ms,
             unanswered_ping_ms: None,
-            probing: false,
+            probe: None,
         }
     }
 
-    /// Something arrived: the server is alive, which answers any ping or probe.
+    /// Something arrived. For the watchdog that answers any ping. It does not
+    /// answer a probe: see `on_frame`.
     fn on_inbound(&mut self, now_ms: f64) {
         self.last_inbound_ms = now_ms;
         self.unanswered_ping_ms = None;
-        self.probing = false;
+    }
+
+    /// A decoded frame arrived (after `on_inbound` for it). A PONG stops
+    /// here: only the pong to the probe's own ping answers the probe.
+    /// Anything else may have been sitting in the socket's buffers since
+    /// before it went half-open: an event, or the pong to an older keepalive
+    /// ping. Counting that as an answer would keep a dead socket until the
+    /// watchdog gives up on it, 65 s later. Every other frame is handed back
+    /// for the UI. The pump gets its UI frames only through here, so it can't
+    /// skip the probe check without also cutting off the UI.
+    fn on_frame(&mut self, inbound: Inbound) -> Option<Inbound> {
+        let Inbound::Pong { correlation_id } = inbound else {
+            return Some(inbound);
+        };
+        if self.probe.as_deref() == Some(correlation_id.as_str()) {
+            self.probe = None;
+            log::debug!("🏓 PONG to the tab-return PING");
+        } else {
+            log::debug!("🏓 PONG received - connection alive!");
+        }
+        None
     }
 
     fn on_ping_sent(&mut self, now_ms: f64) {
@@ -265,22 +331,26 @@ impl Liveness {
         watchdog_expired(now_ms, self.last_inbound_ms, self.unanswered_ping_ms)
     }
 
-    /// The tab came back: how do we check the socket? `SendPing` marks the
-    /// probe as pending until something arrives.
+    /// The tab came back: how do we check the socket? `SendPing(id)` means:
+    /// send a ping with correlation id `id`. The probe then waits for that
+    /// ping's pong (`on_frame`). The id is minted here and handed out, so the
+    /// ping that goes out can't carry a different id from the one the probe
+    /// waits for (#49 review).
     fn begin_probe(&mut self, now_ms: f64) -> ProbeStep {
-        if self.probing {
+        if self.probe.is_some() {
             return ProbeStep::AlreadyProbing;
         }
         if now_ms - self.last_inbound_ms >= WATCHDOG_TIMEOUT_MS {
             return ProbeStep::Reconnect;
         }
-        self.probing = true;
-        ProbeStep::SendPing
+        let ping_id = new_correlation_id();
+        self.probe = Some(ping_id.clone());
+        ProbeStep::SendPing(ping_id)
     }
 
     /// The probe's `PROBE_TIMEOUT_MS` is up: is it still unanswered?
     fn probe_unanswered(&self) -> bool {
-        self.probing
+        self.probe.is_some()
     }
 }
 
@@ -460,6 +530,8 @@ struct WsState {
     /// Dropping this tells the current attempt's task to close its socket and
     /// exit without reconnecting.
     closer: Option<oneshot::Sender<()>>,
+    /// Where the attempts connect to; outlives every attempt.
+    socket_url: SocketUrl,
 }
 
 impl WsState {
@@ -468,6 +540,7 @@ impl WsState {
             lifecycle: Lifecycle::new(),
             sender: None,
             closer: None,
+            socket_url: SocketUrl::default(),
         }
     }
 
@@ -538,13 +611,20 @@ fn now_ms() -> f64 {
     web_sys::js_sys::Date::now()
 }
 
-/// Wrap a request in the CBOR `ApiMessage` envelope the server expects.
-fn encode_request(request: &ApiRequest) -> Result<Vec<u8>, String> {
+/// A fresh correlation id for an outgoing request. The server echoes it on
+/// its response.
+fn new_correlation_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Wrap a request in the CBOR `ApiMessage` envelope the server expects, under
+/// `correlation_id`.
+fn encode_request(request: &ApiRequest, correlation_id: String) -> Result<Vec<u8>, String> {
     let mut payload = Vec::new();
     ciborium::into_writer(request, &mut payload)
         .map_err(|e| format!("failed to encode request: {}", e))?;
     let api_message = ApiMessage {
-        correlation_id: Uuid::new_v4().to_string(),
+        correlation_id,
         message_type: ApiMessageType::Request,
         payload,
     };
@@ -673,17 +753,18 @@ async fn race_attempt<T>(fut: impl Future<Output = T>, closer: &mut Closer) -> R
 /// until it dies or is superseded. The task owns the socket and its timers,
 /// so they all go away together.
 async fn run_connection(ctx: Ctx, generation: u64, mut closer: Closer) {
-    let ws_url = match race_attempt(load_config(), &mut closer).await {
+    let loaded = match race_attempt(load_config(), &mut closer).await {
         Race::Superseded => return,
-        Race::Done(Some(url)) => url,
-        Race::Done(None) | Race::TimedOut => {
-            log::warn!("⚠️ Failed to load config, using default ws://localhost:31337");
-            "ws://localhost:31337".to_string()
-        }
+        Race::Done(loaded) => loaded,
+        Race::TimedOut => None,
     };
-    if !ctx.is_current(generation) {
-        return;
-    }
+    let ws_url = {
+        let mut state = ctx.state.borrow_mut();
+        if !state.lifecycle.is_current(generation) {
+            return;
+        }
+        state.socket_url.resolve(loaded)
+    };
 
     log::info!("🚀 Connecting to: {}", ws_url);
     let mut ws = match WebSocket::open(&ws_url) {
@@ -757,13 +838,15 @@ enum PumpEnd {
     Unresponsive,
 }
 
-/// Send one ping and note it in `liveness`. A ping that can't be encoded
-/// (it's a unit variant, so it can't really happen) is logged and skipped.
+/// Send one ping with `correlation_id` and note it in `liveness`. A ping that
+/// can't be encoded (it's a unit variant, so it can't really happen) is logged
+/// and skipped.
 async fn send_ping(
     write: &mut SplitSink<WebSocket, Message>,
     liveness: &mut Liveness,
+    correlation_id: String,
 ) -> Result<(), WebSocketError> {
-    match encode_request(&ApiRequest::Ping) {
+    match encode_request(&ApiRequest::Ping, correlation_id) {
         Ok(data) => {
             write.send(Message::Bytes(data)).await?;
             liveness.on_ping_sent(now_ms());
@@ -802,7 +885,14 @@ async fn pump(
                         break PumpEnd::Superseded;
                     }
                     if let Message::Bytes(data) = msg {
-                        handle_message(ctx, &data);
+                        match decode_frame(&data) {
+                            Ok(inbound) => {
+                                if let Some(inbound) = liveness.on_frame(inbound) {
+                                    handle_message(ctx, inbound);
+                                }
+                            }
+                            Err(e) => log::error!("❌ {}", e),
+                        }
                     }
                 }
                 Some(Err(WebSocketError::ConnectionClose(event))) => {
@@ -829,26 +919,28 @@ async fn pump(
                         break PumpEnd::Lost;
                     }
                 }
-                Some(Outbound::Probe) => match liveness.begin_probe(now_ms()) {
-                    ProbeStep::SendPing => {
-                        log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
-                        if let Err(e) = send_ping(&mut write, &mut liveness).await {
-                            log::error!("❌ Failed to send PING: {:?}", e);
-                            break PumpEnd::Lost;
+                Some(Outbound::Probe) => {
+                    match liveness.begin_probe(now_ms()) {
+                        ProbeStep::SendPing(ping_id) => {
+                            log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
+                            if let Err(e) = send_ping(&mut write, &mut liveness, ping_id).await {
+                                log::error!("❌ Failed to send PING: {:?}", e);
+                                break PumpEnd::Lost;
+                            }
+                            probe_timer = TimeoutFuture::new(PROBE_TIMEOUT_MS).fuse();
                         }
-                        probe_timer = TimeoutFuture::new(PROBE_TIMEOUT_MS).fuse();
+                        ProbeStep::AlreadyProbing => {
+                            log::debug!("🏓 Already waiting for an answer to the last probe");
+                        }
+                        ProbeStep::Reconnect => {
+                            log::info!(
+                                "💔 Nothing from the server for {:.0}s - not waiting for a PONG, reconnecting",
+                                (now_ms() - liveness.last_inbound_ms) / 1000.0
+                            );
+                            break PumpEnd::Unresponsive;
+                        }
                     }
-                    ProbeStep::AlreadyProbing => {
-                        log::debug!("🏓 Already waiting for an answer to the last probe");
-                    }
-                    ProbeStep::Reconnect => {
-                        log::info!(
-                            "💔 Nothing from the server for {:.0}s - not waiting for a PONG, reconnecting",
-                            (now_ms() - liveness.last_inbound_ms) / 1000.0
-                        );
-                        break PumpEnd::Unresponsive;
-                    }
-                },
+                }
                 // Our sender was dropped: a newer connection replaced us.
                 None => break PumpEnd::Superseded,
             },
@@ -864,7 +956,7 @@ async fn pump(
             },
             _ = ping_timer.next() => {
                 log::debug!("🏓 Sending PING to keep connection alive!");
-                if let Err(e) = send_ping(&mut write, &mut liveness).await {
+                if let Err(e) = send_ping(&mut write, &mut liveness, new_correlation_id()).await {
                     log::error!("❌ Failed to send PING: {:?}", e);
                     break PumpEnd::Lost;
                 }
@@ -889,56 +981,64 @@ async fn pump(
     end
 }
 
-/// Decode one inbound CBOR frame and hand it to the UI.
-fn handle_message(ctx: &Ctx, data: &[u8]) {
-    let api_msg = match ciborium::from_reader::<ApiMessage, _>(data) {
-        Ok(api_msg) => api_msg,
-        Err(e) => {
-            log::error!("❌ Failed to decode CBOR message: {}", e);
-            return;
-        }
-    };
+/// One inbound frame, decoded.
+#[derive(Debug, PartialEq)]
+enum Inbound {
+    /// The PONG to the ping that carried this correlation id. It goes to the
+    /// socket's task (see `Liveness::on_frame`), not to the UI.
+    Pong { correlation_id: String },
+    /// Any other response, for the UI.
+    Response(ApiResponse),
+    /// A device event, for the UI.
+    Event(DeviceEvent),
+    /// A message type the UI doesn't handle.
+    Other,
+}
 
+/// Decode one inbound CBOR frame. Pure, so it's unit-tested natively.
+fn decode_frame(data: &[u8]) -> Result<Inbound, String> {
+    let api_msg = ciborium::from_reader::<ApiMessage, _>(data)
+        .map_err(|e| format!("Failed to decode CBOR message: {}", e))?;
+    let payload = api_msg.payload.as_slice();
     match api_msg.message_type {
-        ApiMessageType::Response => {
-            match ciborium::from_reader::<ApiResponse, _>(api_msg.payload.as_slice()) {
-                Ok(ApiResponse::Pong) => {
-                    log::debug!("🏓 PONG received - connection alive!");
-                }
-                Ok(response) => {
-                    log::info!("📥 Received response: {:?}", response);
-                    ctx.last_response.set(Some(response));
-                }
-                Err(e) => {
-                    log::error!("❌ Failed to decode response: {}", e);
-                }
-            }
-        }
-        ApiMessageType::Event => {
-            // Handle events - CBOR to JSON for now (TODO: pure CBOR) 🔥
-            log::info!("📢 Got Event message!");
-            match ciborium::from_reader::<DeviceEvent, _>(api_msg.payload.as_slice()) {
-                Ok(device_event) => {
-                    log::info!(
-                        "🔥 DeviceEvent: device_id={}, event_type={:?}",
-                        device_event.device_id,
-                        device_event.event_type
-                    );
+        ApiMessageType::Response => match ciborium::from_reader::<ApiResponse, _>(payload) {
+            Ok(ApiResponse::Pong) => Ok(Inbound::Pong {
+                correlation_id: api_msg.correlation_id,
+            }),
+            Ok(response) => Ok(Inbound::Response(response)),
+            Err(e) => Err(format!("Failed to decode response: {}", e)),
+        },
+        ApiMessageType::Event => ciborium::from_reader::<DeviceEvent, _>(payload)
+            .map(Inbound::Event)
+            .map_err(|e| format!("Failed to decode DeviceEvent: {}", e)),
+        ApiMessageType::Request | ApiMessageType::Error => Ok(Inbound::Other),
+    }
+}
 
-                    // Convert to JSON for UI compatibility (temporary)
-                    match serde_json::to_value(&device_event) {
-                        Ok(event_json) => ctx.last_event.set(Some(event_json)),
-                        Err(e) => {
-                            log::error!("❌ Failed to convert DeviceEvent to JSON: {}", e);
-                        }
-                    }
-                }
+/// Hand one decoded frame to the UI.
+fn handle_message(ctx: &Ctx, inbound: Inbound) {
+    match inbound {
+        Inbound::Response(response) => {
+            log::info!("📥 Received response: {:?}", response);
+            ctx.last_response.set(Some(response));
+        }
+        Inbound::Event(device_event) => {
+            // Handle events - CBOR to JSON for now (TODO: pure CBOR) 🔥
+            log::info!(
+                "🔥 DeviceEvent: device_id={}, event_type={:?}",
+                device_event.device_id,
+                device_event.event_type
+            );
+
+            // Convert to JSON for UI compatibility (temporary)
+            match serde_json::to_value(&device_event) {
+                Ok(event_json) => ctx.last_event.set(Some(event_json)),
                 Err(e) => {
-                    log::error!("❌ Failed to decode DeviceEvent: {}", e);
+                    log::error!("❌ Failed to convert DeviceEvent to JSON: {}", e);
                 }
             }
         }
-        _ => {}
+        Inbound::Pong { .. } | Inbound::Other => {}
     }
 }
 
@@ -1007,7 +1107,7 @@ pub fn use_websocket() -> UseWebSocketHandle {
             let state = state.clone();
 
             spawn_local(async move {
-                let data = match encode_request(&request) {
+                let data = match encode_request(&request, new_correlation_id()) {
                     Ok(data) => data,
                     Err(e) => {
                         log::error!("❌ {}", e);
@@ -1138,24 +1238,82 @@ mod tests {
         assert!(!live.watchdog_expired(later));
     }
 
+    /// Feed `live` one inbound PONG the way the pump does: a real frame,
+    /// through `decode_frame` and then `on_frame`. Returns whether it
+    /// answered the probe.
+    fn pong(live: &mut Liveness, now_ms: f64, correlation_id: &str) -> bool {
+        let was_waiting = live.probe_unanswered();
+        live.on_inbound(now_ms);
+        let inbound = decode_frame(&response_frame(correlation_id, &ApiResponse::Pong))
+            .expect("a PONG frame decodes");
+        assert_eq!(live.on_frame(inbound), None, "a PONG never reaches the UI");
+        was_waiting && !live.probe_unanswered()
+    }
+
+    /// The correlation id a `SendPing` step asks the pump to send.
+    fn probe_ping(step: ProbeStep) -> String {
+        match step {
+            ProbeStep::SendPing(ping_id) => ping_id,
+            other => panic!("expected SendPing, got {other:?}"),
+        }
+    }
+
     #[test]
-    fn tab_return_probe_pings_first_and_any_answer_keeps_the_socket() {
+    fn tab_return_probe_pings_first_and_its_pong_keeps_the_socket() {
         let mut live = Liveness::new(0.0);
         live.on_inbound(10.0 * S);
-        assert_eq!(live.begin_probe(20.0 * S), ProbeStep::SendPing);
+        let probe = probe_ping(live.begin_probe(20.0 * S));
         live.on_ping_sent(20.0 * S);
         assert!(live.probe_unanswered());
-        // The pong (or any other message) beats the probe timer.
-        live.on_inbound(20.05 * S);
+        // The probe's pong beats the probe timer.
+        assert!(pong(&mut live, 20.05 * S, &probe));
         assert!(!live.probe_unanswered());
-        // The next tab switch probes afresh.
-        assert_eq!(live.begin_probe(40.0 * S), ProbeStep::SendPing);
+        // The next tab switch probes afresh, under a new id.
+        assert_ne!(probe_ping(live.begin_probe(40.0 * S)), probe);
+    }
+
+    #[test]
+    fn a_frame_buffered_before_the_probe_does_not_answer_it() {
+        // #36 review: the socket went half-open with frames still in flight,
+        // an event and the pong to an earlier keepalive ping. They show up
+        // after the tab-return probe's ping went out, but they aren't its
+        // answer. Counting them kept the dead socket until the watchdog
+        // dropped it 65 s later.
+        let mut live = Liveness::new(0.0);
+        live.on_ping_sent(30.0 * S); // keepalive, id "keepalive"
+        let probe = probe_ping(live.begin_probe(30.5 * S));
+        live.on_ping_sent(30.5 * S);
+        live.on_inbound(30.51 * S); // the buffered event
+        assert!(!pong(&mut live, 30.52 * S, "keepalive"));
+        // The probe timer fires: still unanswered, so reconnect.
+        assert!(live.probe_unanswered());
+        // The watchdog is unchanged: any inbound frame counts for it.
+        assert!(!live.watchdog_expired(30.52 * S + WATCHDOG_TIMEOUT_MS - 1.0));
+        // Had the probe's own pong come back, that would have answered it.
+        assert!(pong(&mut live, 30.6 * S, &probe));
+        assert!(!live.probe_unanswered());
+        // A late duplicate of it changes nothing.
+        assert!(!pong(&mut live, 30.7 * S, &probe));
+    }
+
+    #[test]
+    fn frames_other_than_a_pong_go_on_to_the_ui() {
+        let mut live = Liveness::new(0.0);
+        let probe = probe_ping(live.begin_probe(1.0 * S));
+        // A response under the probe's id is still not its PONG.
+        let ack = ApiResponse::SubscriptionStarted {
+            subscriber_id: "sub".to_string(),
+        };
+        let inbound = decode_frame(&response_frame(&probe, &ack)).expect("decode");
+        assert_eq!(live.on_frame(inbound), Some(Inbound::Response(ack)));
+        assert!(live.probe_unanswered());
+        assert_eq!(live.on_frame(Inbound::Other), Some(Inbound::Other));
     }
 
     #[test]
     fn tab_return_probe_without_an_answer_reconnects() {
         let mut live = Liveness::new(0.0);
-        assert_eq!(live.begin_probe(5.0 * S), ProbeStep::SendPing);
+        probe_ping(live.begin_probe(5.0 * S));
         live.on_ping_sent(5.0 * S);
         // The probe timer fires and nothing has arrived.
         assert!(live.probe_unanswered());
@@ -1166,9 +1324,13 @@ mod tests {
         // visibilitychange twice in a row: one ping, one deadline.
         let mut live = Liveness::new(0.0);
         assert!(!live.probe_unanswered());
-        assert_eq!(live.begin_probe(1.0 * S), ProbeStep::SendPing);
+        let first = probe_ping(live.begin_probe(1.0 * S));
         assert_eq!(live.begin_probe(1.5 * S), ProbeStep::AlreadyProbing);
         assert!(live.probe_unanswered());
+        // The probe still waits for the first ping's pong: no second ping
+        // went out, so no other pong answers it.
+        assert!(!pong(&mut live, 1.6 * S, "some-other-ping"));
+        assert!(pong(&mut live, 1.7 * S, &first));
     }
 
     #[test]
@@ -1177,11 +1339,8 @@ mod tests {
         // that probably won't come.
         let mut live = Liveness::new(0.0);
         live.on_inbound(100.0 * S);
-        let mut just_in_time = live;
-        assert_eq!(
-            just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0),
-            ProbeStep::SendPing
-        );
+        let mut just_in_time = live.clone();
+        probe_ping(just_in_time.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS - 1.0));
         assert_eq!(
             live.begin_probe(100.0 * S + WATCHDOG_TIMEOUT_MS),
             ProbeStep::Reconnect
@@ -1514,12 +1673,68 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_config_fetch_reuses_the_last_good_url() {
+        // #9: a reconnect whose config fetch failed used to dial
+        // ws://localhost:31337, which is wrong for any page not served from
+        // the server's own host (a phone on the LAN).
+        let mut url = SocketUrl::default();
+        // Nothing has loaded yet: the default is all there is.
+        assert_eq!(url.resolve(None), DEFAULT_SOCKET_URL);
+        let hub = "ws://192.168.1.20:31337";
+        assert_eq!(url.resolve(Some(hub.to_string())), hub);
+        // Failed or timed-out fetches keep dialing the last good URL.
+        assert_eq!(url.resolve(None), hub);
+        assert_eq!(url.resolve(None), hub);
+        // A newer config replaces it.
+        let moved = "wss://nest.example:8443/ws";
+        assert_eq!(url.resolve(Some(moved.to_string())), moved);
+        assert_eq!(url.resolve(None), moved);
+    }
+
+    #[test]
     fn ping_request_round_trips_through_the_envelope() {
-        let data = encode_request(&ApiRequest::Ping).expect("encode");
+        let id = new_correlation_id();
+        assert_ne!(id, new_correlation_id());
+        let data = encode_request(&ApiRequest::Ping, id.clone()).expect("encode");
         let msg: ApiMessage = ciborium::from_reader(data.as_slice()).expect("envelope");
         assert_eq!(msg.message_type, ApiMessageType::Request);
-        assert!(!msg.correlation_id.is_empty());
+        assert_eq!(msg.correlation_id, id);
         let req: ApiRequest = ciborium::from_reader(msg.payload.as_slice()).expect("payload");
         assert!(matches!(req, ApiRequest::Ping));
+    }
+
+    /// A frame the way the server sends a response: `response` in an
+    /// `ApiMessage` that echoes the request's `correlation_id`.
+    fn response_frame(correlation_id: &str, response: &ApiResponse) -> Vec<u8> {
+        let mut payload = Vec::new();
+        ciborium::into_writer(response, &mut payload).expect("payload");
+        let msg = ApiMessage {
+            correlation_id: correlation_id.to_string(),
+            message_type: ApiMessageType::Response,
+            payload,
+        };
+        let mut data = Vec::new();
+        ciborium::into_writer(&msg, &mut data).expect("envelope");
+        data
+    }
+
+    #[test]
+    fn a_pong_frame_decodes_with_the_correlation_id_it_answers() {
+        // The pump matches this id against the probe's ping.
+        assert_eq!(
+            decode_frame(&response_frame("probe-7", &ApiResponse::Pong)),
+            Ok(Inbound::Pong {
+                correlation_id: "probe-7".to_string()
+            })
+        );
+        // Other responses still go to the UI.
+        let ack = ApiResponse::SubscriptionStarted {
+            subscriber_id: "sub".to_string(),
+        };
+        assert_eq!(
+            decode_frame(&response_frame("probe-7", &ack)),
+            Ok(Inbound::Response(ack))
+        );
+        assert!(decode_frame(b"not cbor").is_err());
     }
 }

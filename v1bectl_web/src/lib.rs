@@ -1,11 +1,7 @@
-// 🔥 VIBEC0RE WEBUI - CYBER EDITION! 💖
-//
-// This file owns the crate's whole module tree, so `cargo test -p v1bectl_web
-// --lib` runs every test. The wasm entry point in `main.rs` compiles this same
-// file with `include!` (the lib is `cdylib`-only, which a bin can't link
-// against), so there's exactly one list of modules. Because of the
-// `include!`, keep this file to plain items: no inner attributes or `//!`
-// docs.
+//! 🔥 VIBEC0RE WEBUI - CYBER EDITION! 💖
+//!
+//! The whole web UI. `main.rs` (the wasm entry point trunk builds) only calls
+//! [`run`], so every module and test is compiled once, here.
 
 pub mod components;
 pub mod cyber_app;

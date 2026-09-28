@@ -8,8 +8,10 @@ authors.workspace = true
 repository.workspace = true
 description = "v1bectl web UI (Yew/WASM)"
 
-[lib]
-crate-type = ["cdylib"]
+# No `[lib]` table, so the lib is a plain rlib that `src/main.rs` links. That
+# bin is the wasm entry point trunk builds (`data-bin` in index.html). Nothing
+# uses a cdylib, and one would write the same `v1bectl_web.wasm` as the bin
+# (cargo warns about the output filename collision, cargo#6313).
 
 [dependencies]
 yew = { version = "0.21", features = ["csr"] }
