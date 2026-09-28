@@ -382,6 +382,177 @@ impl VirtualDevice for SceneController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use v1bectl_sync::{Capability, DeviceInfo, DeviceType};
+
+    fn light(is_on: bool, brightness: u8) -> DeviceStateValue {
+        DeviceStateValue::Light(LightState {
+            is_on,
+            brightness: Some(brightness),
+            color_temp: Some(2700),
+            rgb_color: None,
+        })
+    }
+
+    /// A store with lights `ids`, all off.
+    async fn store_with(ids: &[&str]) -> Arc<StateStore> {
+        let store = StateStore::new();
+        for id in ids {
+            let info = DeviceInfo {
+                device_id: (*id).to_string(),
+                name: (*id).to_string(),
+                device_type: DeviceType::Light,
+                capabilities: vec![Capability::OnOff, Capability::Brightness],
+                device_groups: vec![],
+                manufacturer: None,
+                model: None,
+                firmware_version: None,
+                battery_powered: false,
+                reachable: true,
+                last_seen: 0,
+                custom_attributes: HashMap::new(),
+            };
+            store.add_device(info, light(false, 0)).await;
+        }
+        store
+    }
+
+    /// A scene controller whose one scene, `evening`, takes each of
+    /// `devices` to its state with `transition`.
+    fn controller(
+        store: &Arc<StateStore>,
+        devices: &[(&str, DeviceStateValue)],
+        transition: &TransitionType,
+    ) -> SceneController {
+        let device_states: HashMap<DeviceId, DeviceStateValue> = devices
+            .iter()
+            .map(|(id, state)| ((*id).to_string(), state.clone()))
+            .collect();
+        let config = VirtualDeviceConfig {
+            device_id: "scene".to_string(),
+            device_type: VirtualDeviceType::SceneController,
+            name: "Scene".to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({ "scenes": { "evening": {
+                "name": "evening",
+                "device_states": device_states,
+                "transition_type": transition,
+            } } }),
+        };
+        SceneController::new(config, store.clone()).expect("scene")
+    }
+
+    fn evening() -> DeviceStateValue {
+        DeviceStateValue::Scene(SceneState {
+            scene_name: "evening".to_string(),
+            is_active: true,
+        })
+    }
+
+    /// The scene's devices in the order its transition takes them: the
+    /// order of its `device_states`.
+    fn order(controller: &SceneController) -> Vec<DeviceId> {
+        controller.scenes["evening"]
+            .device_states
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// #58: a sequence takes its devices in order, the i-th after the i-th
+    /// delay, and hands them to the manager in that order, each at its
+    /// target, once every delay has passed. (A paused clock: the delays
+    /// pass at once and measure exactly.)
+    #[tokio::test(start_paused = true)]
+    async fn a_sequence_plans_its_devices_in_order_after_their_delays() {
+        let store = store_with(&["a", "b", "c"]).await;
+        let targets = [
+            ("a", light(true, 10)),
+            ("b", light(true, 20)),
+            ("c", light(true, 30)),
+        ];
+        let sequence = TransitionType::Sequence {
+            delays_ms: vec![100, 200, 300],
+        };
+        let controller = controller(&store, &targets, &sequence);
+        let want: Vec<(DeviceId, DeviceStateValue)> = order(&controller)
+            .into_iter()
+            .map(|id| {
+                let (_, target) = targets.iter().find(|(t, _)| *t == id).unwrap();
+                (id, target.clone())
+            })
+            .collect();
+
+        let started = tokio::time::Instant::now();
+        let write = controller.plan_write(evening()).await.expect("plan");
+        assert_eq!(started.elapsed(), Duration::from_millis(600), "delays");
+        assert_eq!(write.members, want, "in the scene's order, at the targets");
+        assert_eq!(write.state, evening());
+    }
+
+    /// #58: a sequence that reaches a device the store doesn't have stops
+    /// there, having slept only through the delays up to it. The missing
+    /// device is its last write, where the manager's commit fails the
+    /// activation; the devices after it are never planned.
+    #[tokio::test(start_paused = true)]
+    async fn a_sequence_stops_at_a_missing_device_after_only_its_delays() {
+        let store = store_with(&["a", "b"]).await;
+        let targets = [
+            ("a", light(true, 10)),
+            ("b", light(true, 20)),
+            ("missing", light(true, 30)),
+        ];
+        let delays_ms = vec![100, 200, 400];
+        let sequence = TransitionType::Sequence {
+            delays_ms: delays_ms.clone(),
+        };
+        let controller = controller(&store, &targets, &sequence);
+        let order = order(&controller);
+        let at = order.iter().position(|id| id == "missing").unwrap();
+        let want: Vec<(DeviceId, DeviceStateValue)> = order[..=at]
+            .iter()
+            .map(|id| {
+                let (_, target) = targets.iter().find(|(t, _)| *t == id.as_str()).unwrap();
+                (id.clone(), target.clone())
+            })
+            .collect();
+
+        let started = tokio::time::Instant::now();
+        let write = controller.plan_write(evening()).await.expect("plan");
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_millis(delays_ms[..=at].iter().sum()),
+            "the delays up to the missing device (at {at} of {order:?})"
+        );
+        assert_eq!(write.members, want, "up to the missing device");
+    }
+
+    /// #58: a fade that reaches a device the store doesn't have stops at
+    /// its first step, before its first delay. Each device it took up to
+    /// there is where the first step puts it: where it is.
+    #[tokio::test(start_paused = true)]
+    async fn a_fade_stops_at_a_missing_device_at_its_first_step() {
+        let store = store_with(&["a"]).await;
+        let targets = [("a", light(true, 80)), ("missing", light(true, 80))];
+        let fade = TransitionType::Fade { duration_ms: 1000 };
+        let controller = controller(&store, &targets, &fade);
+        let order = order(&controller);
+        let at = order.iter().position(|id| id == "missing").unwrap();
+        // `a` at progress 0 is `a` as it is: off. The missing device starts
+        // from off too, at level 0.
+        let want: Vec<(DeviceId, DeviceStateValue)> = order[..=at]
+            .iter()
+            .map(|id| (id.clone(), light(false, 0)))
+            .collect();
+
+        let started = tokio::time::Instant::now();
+        let write = controller.plan_write(evening()).await.expect("plan");
+        assert_eq!(started.elapsed(), Duration::ZERO, "it slept");
+        assert_eq!(
+            write.members, want,
+            "the first step, up to the missing device"
+        );
+    }
 
     #[test]
     fn test_light_state_interpolation() {

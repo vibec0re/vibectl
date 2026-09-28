@@ -1491,6 +1491,176 @@ mod tests {
         assert_eq!(echoes(&events, "scene"), vec![evening], "scene echo");
     }
 
+    /// Scene controller `scene`, with one scene, `evening`, that takes each
+    /// of `devices` to its state with `transition` (a `TransitionType`, as
+    /// its config has it).
+    fn scene(
+        store: &Arc<StateStore>,
+        devices: &[(&str, DeviceStateValue)],
+        transition: &serde_json::Value,
+    ) -> SceneController {
+        let device_states: serde_json::Map<String, serde_json::Value> = devices
+            .iter()
+            .map(|(id, state)| ((*id).to_string(), serde_json::json!(state)))
+            .collect();
+        SceneController::new(
+            VirtualDeviceConfig {
+                device_id: "scene".to_string(),
+                device_type: VirtualDeviceType::SceneController,
+                name: "Scene".to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({ "scenes": { "evening": {
+                    "name": "evening",
+                    "device_states": device_states,
+                    "transition_type": transition,
+                } } }),
+            },
+            store.clone(),
+        )
+        .expect("scene")
+    }
+
+    /// The scene `evening`, active: what activates it.
+    fn evening() -> DeviceStateValue {
+        DeviceStateValue::Scene(SceneState {
+            scene_name: "evening".to_string(),
+            is_active: true,
+        })
+    }
+
+    /// A scene controller's state before any scene is activated.
+    fn no_scene() -> DeviceStateValue {
+        DeviceStateValue::Scene(SceneState {
+            scene_name: "none".to_string(),
+            is_active: false,
+        })
+    }
+
+    /// #58: a fade commits where it ends, each device at its target, once
+    /// its whole duration has passed (ten 100 ms steps for a second). Its
+    /// steps are planned on the scene's own copy of the states (#55), so
+    /// neither the store nor the bus sees one: each device is echoed once,
+    /// at its target, the dimmed one and the one switched on alike.
+    ///
+    /// The clock is paused, so the delays pass at once and measure exactly.
+    #[tokio::test(start_paused = true)]
+    async fn a_fade_ends_at_its_targets_once_its_duration_has_passed() {
+        let store = StateStore::new();
+        store.add_device(light_info("a"), off()).await;
+        store.add_device(light_info("b"), light(true, 90)).await;
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let targets = [("a", light(true, 80)), ("b", light(true, 20))];
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        manager
+            .add_virtual_device(Box::new(scene(&store, &targets, &fade)))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        manager
+            .set_virtual_device_state(&"scene".to_string(), evening())
+            .await
+            .expect("activate");
+        assert_eq!(started.elapsed(), Duration::from_secs(1), "fade time");
+        let events = pump(&manager, &mut rx).await;
+
+        for (id, target) in &targets {
+            assert_eq!(&stored(&store, id).await, target, "{id} ends at its target");
+            assert_eq!(echoes(&events, id), vec![target.clone()], "{id}'s echoes");
+        }
+        assert_eq!(stored(&store, "scene").await, evening());
+        assert_eq!(echoes(&events, "scene"), vec![evening()], "scene echo");
+    }
+
+    /// #58: a sequence commits each of its devices at its target, once all
+    /// of its delays have passed. (The order it takes them in, each after
+    /// its own delay, is `scene_controller`'s test.)
+    #[tokio::test(start_paused = true)]
+    async fn a_sequence_ends_at_its_targets_once_its_delays_have_passed() {
+        let store = StateStore::new();
+        for id in ["a", "b", "c"] {
+            store.add_device(light_info(id), off()).await;
+        }
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let targets = [
+            ("a", light(true, 10)),
+            ("b", light(true, 20)),
+            ("c", light(true, 30)),
+        ];
+        let sequence = serde_json::json!({ "Sequence": { "delays_ms": [100, 200, 300] } });
+        manager
+            .add_virtual_device(Box::new(scene(&store, &targets, &sequence)))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        manager
+            .set_virtual_device_state(&"scene".to_string(), evening())
+            .await
+            .expect("activate");
+        assert_eq!(started.elapsed(), Duration::from_millis(600), "delays");
+        let events = pump(&manager, &mut rx).await;
+
+        for (id, target) in &targets {
+            assert_eq!(&stored(&store, id).await, target, "{id} ends at its target");
+            assert_eq!(echoes(&events, id), vec![target.clone()], "{id}'s echoes");
+        }
+        assert_eq!(stored(&store, "scene").await, evening());
+        assert_eq!(echoes(&events, "scene"), vec![evening()], "scene echo");
+    }
+
+    /// #58: a fade over a device the store doesn't have fails at its first
+    /// step, without sleeping through the rest, with the error a group's
+    /// missing member gets. What the first step set the other device to is
+    /// where it already was, so nothing is committed or echoed, and the
+    /// scene isn't active.
+    #[tokio::test(start_paused = true)]
+    async fn a_fade_over_a_missing_device_fails_at_its_first_step_without_sleeping() {
+        let store = StateStore::new();
+        store.add_device(light_info("a"), off()).await;
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        let targets = [("a", light(true, 80)), ("missing", light(true, 80))];
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        manager
+            .add_virtual_device(Box::new(scene(&store, &targets, &fade)))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let result = manager
+            .set_virtual_device_state(&"scene".to_string(), evening())
+            .await;
+        assert_eq!(started.elapsed(), Duration::ZERO, "it slept");
+        assert!(
+            matches!(
+                &result,
+                Err(VirtualDeviceError::StateStore(StateError::DeviceNotFound(id)))
+                    if id == "missing"
+            ),
+            "{result:?}"
+        );
+        let events = pump(&manager, &mut rx).await;
+
+        assert!(events.is_empty(), "nothing to echo: {events:?}");
+        assert_eq!(stored(&store, "a").await, off());
+        assert_eq!(stored(&store, "scene").await, no_scene());
+        assert_eq!(
+            manager
+                .get_virtual_device_state(&"scene".to_string())
+                .await
+                .unwrap(),
+            no_scene(),
+            "the scene's own state must match the store"
+        );
+    }
+
     /// Scene devices and controller targets are outputs, not inputs. A
     /// missing one is reported just like a missing group member (#14 review,
     /// nit).
