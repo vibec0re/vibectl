@@ -183,7 +183,8 @@ async fn handle_get_device_state(
 ///
 /// A virtual device (a light group) is refused: its writes fan out to its
 /// members through the virtual device manager, which this server doesn't
-/// have, and the gateway doesn't know it.
+/// have, and the gateway doesn't know it. So is a device that isn't a
+/// light.
 async fn handle_set_light_state(
     message: Message,
     state_store: &Arc<StateStore>,
@@ -223,6 +224,12 @@ async fn handle_set_light_state(
             message.correlation_id,
             "Virtual devices can't be written over the TCP API",
         );
+    }
+    // As the WebSocket API: only a light takes a light state (#50 review).
+    // An outlet or a sensor would get a `Light` state in the store, and the
+    // hub a PATCH of light attributes.
+    if !matches!(device.state, DeviceStateValue::Light(_)) {
+        return create_error_response(message.correlation_id, "Device is not a light");
     }
 
     // Update state: queued for the gateway, and protected until it lands.
@@ -355,6 +362,43 @@ mod tests {
 
         engine.stop().await;
         runner.await.expect("engine task").expect("engine");
+    }
+
+    /// A device that isn't a light is refused, as the WebSocket API refuses
+    /// it (#50 review): an outlet and a sensor keep their state, and nothing
+    /// is queued for the gateway.
+    #[tokio::test]
+    async fn a_light_write_to_something_else_is_refused() {
+        let (_gateway, store, engine) = home().await;
+        let written = LightState {
+            is_on: true,
+            brightness: Some(42),
+            color_temp: None,
+            rgb_color: None,
+        };
+        for id in ["outlet_tv", "temperature_living_room"] {
+            let id = id.to_string();
+            let before = store.get_device(&id).await.expect("in the store").state;
+            assert!(!matches!(before, DeviceStateValue::Light(_)), "{id}");
+
+            let response = process_request(set_light_request(&id, &written), &store, &engine).await;
+            assert!(
+                matches!(response.message_type, MessageType::Error),
+                "{id}: {:?}",
+                response.message_type
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&response.payload),
+                "Device is not a light",
+                "{id}"
+            );
+            assert_eq!(
+                store.get_device(&id).await.expect("in the store").state,
+                before,
+                "{id} in the store"
+            );
+            assert!(engine.get_sync_status(&id).await.is_none(), "{id} queued");
+        }
     }
 
     /// A virtual device is refused, not pushed to a gateway that doesn't
