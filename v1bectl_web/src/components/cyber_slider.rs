@@ -32,13 +32,19 @@ pub fn cyber_slider(props: &CyberSliderProps) -> Html {
     };
 
     // Calculate percentage for CSS custom property
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "value is clamped to [min, max] by the slider itself, so the fraction is in \
+                  [0.0, 1.0] and the result fits in [0, 100] before it ever reaches this cast"
+    )]
     let percent = if props.max > props.min {
-        ((props.value - props.min) as f32 / (props.max - props.min) as f32 * 100.0) as u32
+        (f32::from(props.value - props.min) / f32::from(props.max - props.min) * 100.0) as u32
     } else {
         0
     };
 
-    let style = format!("--percent: {}%", percent);
+    let style = format!("--percent: {percent}%");
 
     html! {
         <input

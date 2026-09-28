@@ -47,3 +47,6 @@ features = [
   "HtmlInputElement",
   "VisibilityState",
 ]
+
+[lints]
+workspace = true

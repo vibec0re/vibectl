@@ -73,21 +73,14 @@ impl SocketUrl {
             self.last_good = Some(url.clone());
             return url;
         }
-        match &self.last_good {
-            Some(url) => {
-                log::warn!(
-                    "⚠️ Failed to load config, reusing the last good URL {}",
-                    url
-                );
-                url.clone()
-            }
-            None => {
-                log::warn!(
-                    "⚠️ Failed to load config (none loaded yet), using default {}",
-                    DEFAULT_SOCKET_URL
-                );
-                DEFAULT_SOCKET_URL.to_string()
-            }
+        if let Some(url) = &self.last_good {
+            log::warn!("⚠️ Failed to load config, reusing the last good URL {url}");
+            url.clone()
+        } else {
+            log::warn!(
+                "⚠️ Failed to load config (none loaded yet), using default {DEFAULT_SOCKET_URL}"
+            );
+            DEFAULT_SOCKET_URL.to_string()
         }
     }
 }
@@ -103,7 +96,7 @@ async fn load_config() -> Option<String> {
                         Some(config.socket)
                     }
                     Err(e) => {
-                        log::error!("❌ Failed to parse config: {}", e);
+                        log::error!("❌ Failed to parse config: {e}");
                         None
                     }
                 }
@@ -113,7 +106,7 @@ async fn load_config() -> Option<String> {
             }
         }
         Err(e) => {
-            log::error!("❌ Failed to fetch config: {}", e);
+            log::error!("❌ Failed to fetch config: {e}");
             None
         }
     }
@@ -622,7 +615,7 @@ fn new_correlation_id() -> String {
 fn encode_request(request: &ApiRequest, correlation_id: String) -> Result<Vec<u8>, String> {
     let mut payload = Vec::new();
     ciborium::into_writer(request, &mut payload)
-        .map_err(|e| format!("failed to encode request: {}", e))?;
+        .map_err(|e| format!("failed to encode request: {e}"))?;
     let api_message = ApiMessage {
         correlation_id,
         message_type: ApiMessageType::Request,
@@ -630,7 +623,7 @@ fn encode_request(request: &ApiRequest, correlation_id: String) -> Result<Vec<u8
     };
     let mut data = Vec::new();
     ciborium::into_writer(&api_message, &mut data)
-        .map_err(|e| format!("failed to encode API message: {}", e))?;
+        .map_err(|e| format!("failed to encode API message: {e}"))?;
     Ok(data)
 }
 
@@ -641,16 +634,9 @@ fn connect(ctx: &Ctx) {
 
     match &status {
         ConnectionStatus::Reconnecting(n) => {
-            log::info!(
-                "🔄 Reconnection attempt #{} (connection #{})",
-                n,
-                generation
-            )
+            log::info!("🔄 Reconnection attempt #{n} (connection #{generation})");
         }
-        _ => log::info!(
-            "🔥 Connecting to VIBEC0RE server! (connection #{})",
-            generation
-        ),
+        _ => log::info!("🔥 Connecting to VIBEC0RE server! (connection #{generation})"),
     }
     ctx.status.set(status);
 
@@ -664,10 +650,7 @@ fn connection_lost(ctx: &Ctx, generation: u64, status: ConnectionStatus) {
     let delay = {
         let mut state = ctx.state.borrow_mut();
         let Some(delay) = state.lifecycle.on_closed(generation) else {
-            log::debug!(
-                "🔧 Connection #{} ended after it was superseded - ignoring",
-                generation
-            );
+            log::debug!("🔧 Connection #{generation} ended after it was superseded - ignoring");
             return;
         };
         state.release_socket();
@@ -675,7 +658,7 @@ fn connection_lost(ctx: &Ctx, generation: u64, status: ConnectionStatus) {
     };
 
     ctx.status.set(status);
-    log::info!("⏰ Will reconnect in {}ms", delay);
+    log::info!("⏰ Will reconnect in {delay}ms");
 
     let ctx = ctx.clone();
     spawn_local(async move {
@@ -693,10 +676,10 @@ fn connection_lost(ctx: &Ctx, generation: u64, status: ConnectionStatus) {
 fn wake_up(ctx: &Ctx, wake: Wake, why: &str) {
     let action = ctx.state.borrow_mut().on_wake(wake, now_ms());
     match action {
-        WakeAction::Nothing => log::info!("{} - already connecting, leaving it be", why),
-        WakeAction::Probe => log::info!("{} - pinging before deciding to reconnect 🏓", why),
+        WakeAction::Nothing => log::info!("{why} - already connecting, leaving it be"),
+        WakeAction::Probe => log::info!("{why} - pinging before deciding to reconnect 🏓"),
         WakeAction::Reconnect => {
-            log::info!("{} - forcing reconnect!", why);
+            log::info!("{why} - forcing reconnect!");
             connect(ctx);
         }
     }
@@ -740,7 +723,7 @@ async fn race<T>(
     futures::select_biased! {
         _ = &mut *closer => Race::Superseded,
         out = fut => Race::Done(out),
-        _ = timeout => Race::TimedOut,
+        () = timeout => Race::TimedOut,
     }
 }
 
@@ -766,16 +749,12 @@ async fn run_connection(ctx: Ctx, generation: u64, mut closer: Closer) {
         state.socket_url.resolve(loaded)
     };
 
-    log::info!("🚀 Connecting to: {}", ws_url);
+    log::info!("🚀 Connecting to: {ws_url}");
     let mut ws = match WebSocket::open(&ws_url) {
         Ok(ws) => ws,
         Err(e) => {
-            log::error!("❌ Failed to connect: {:?}", e);
-            connection_lost(
-                &ctx,
-                generation,
-                ConnectionStatus::Error(format!("{:?}", e)),
-            );
+            log::error!("❌ Failed to connect: {e:?}");
+            connection_lost(&ctx, generation, ConnectionStatus::Error(format!("{e:?}")));
             return;
         }
     };
@@ -791,10 +770,7 @@ async fn run_connection(ctx: Ctx, generation: u64, mut closer: Closer) {
     match opened {
         Race::Superseded => return, // dropping `ws` closes it
         Race::TimedOut => {
-            log::warn!(
-                "⏰ WebSocket didn't open within {}ms - giving up on it",
-                CONNECT_TIMEOUT_MS
-            );
+            log::warn!("⏰ WebSocket didn't open within {CONNECT_TIMEOUT_MS}ms - giving up on it");
             connection_lost(&ctx, generation, ConnectionStatus::Disconnected);
             return;
         }
@@ -810,12 +786,12 @@ async fn run_connection(ctx: Ctx, generation: u64, mut closer: Closer) {
     if !ctx.state.borrow_mut().on_open(generation, tx) {
         return;
     }
-    log::info!("✅ WebSocket connection #{} opened!", generation);
+    log::info!("✅ WebSocket connection #{generation} opened!");
     ctx.status.set(ConnectionStatus::Connected);
 
     match pump(&ctx, generation, ws, rx, &mut closer).await {
         PumpEnd::Superseded => {
-            log::info!("🔌 Connection #{} superseded - closed it", generation)
+            log::info!("🔌 Connection #{generation} superseded - closed it");
         }
         PumpEnd::Lost => connection_lost(&ctx, generation, ConnectionStatus::Disconnected),
         // Someone is looking at the page, and the backoff was reset when this
@@ -851,7 +827,7 @@ async fn send_ping(
             write.send(Message::Bytes(data)).await?;
             liveness.on_ping_sent(now_ms());
         }
-        Err(e) => log::error!("❌ Failed to encode PING: {}", e),
+        Err(e) => log::error!("❌ Failed to encode PING: {e}"),
     }
     Ok(())
 }
@@ -860,6 +836,12 @@ async fn send_ping(
 /// server, keepalive pings, tab-return probes, and the watchdog. Returns when
 /// the socket dies, stops answering, or a newer connection takes over. Every
 /// way out closes the socket, and the timers are dropped with this frame.
+#[expect(
+    clippy::too_many_lines,
+    reason = "a single select_biased! loop holding `write`/`liveness`/the timers across each \
+              branch; splitting branches into helper functions would scatter state that needs \
+              to be read and mutated together on every wakeup, risking a subtle ordering bug"
+)]
 async fn pump(
     ctx: &Ctx,
     generation: u64,
@@ -891,7 +873,7 @@ async fn pump(
                                     handle_message(ctx, inbound);
                                 }
                             }
-                            Err(e) => log::error!("❌ {}", e),
+                            Err(e) => log::error!("❌ {e}"),
                         }
                     }
                 }
@@ -904,7 +886,7 @@ async fn pump(
                     break PumpEnd::Lost;
                 }
                 Some(Err(e)) => {
-                    log::error!("❌ WebSocket error: {:?}", e);
+                    log::error!("❌ WebSocket error: {e:?}");
                     break PumpEnd::Lost;
                 }
                 None => {
@@ -915,7 +897,7 @@ async fn pump(
             out = outbound.next() => match out {
                 Some(Outbound::Frame(data)) => {
                     if let Err(e) = write.send(Message::Bytes(data)).await {
-                        log::error!("❌ Failed to send: {:?}", e);
+                        log::error!("❌ Failed to send: {e:?}");
                         break PumpEnd::Lost;
                     }
                 }
@@ -924,7 +906,7 @@ async fn pump(
                         ProbeStep::SendPing(ping_id) => {
                             log::debug!("🏓 Tab is back - PING first, reconnect only if no answer");
                             if let Err(e) = send_ping(&mut write, &mut liveness, ping_id).await {
-                                log::error!("❌ Failed to send PING: {:?}", e);
+                                log::error!("❌ Failed to send PING: {e:?}");
                                 break PumpEnd::Lost;
                             }
                             probe_timer = TimeoutFuture::new(PROBE_TIMEOUT_MS).fuse();
@@ -944,11 +926,10 @@ async fn pump(
                 // Our sender was dropped: a newer connection replaced us.
                 None => break PumpEnd::Superseded,
             },
-            _ = probe_timer => {
+            () = probe_timer => {
                 if liveness.probe_unanswered() {
                     log::warn!(
-                        "💔 No answer to the tab-return PING within {}ms - reconnecting",
-                        PROBE_TIMEOUT_MS
+                        "💔 No answer to the tab-return PING within {PROBE_TIMEOUT_MS}ms - reconnecting"
                     );
                     break PumpEnd::Unresponsive;
                 }
@@ -957,7 +938,7 @@ async fn pump(
             _ = ping_timer.next() => {
                 log::debug!("🏓 Sending PING to keep connection alive!");
                 if let Err(e) = send_ping(&mut write, &mut liveness, new_correlation_id()).await {
-                    log::error!("❌ Failed to send PING: {:?}", e);
+                    log::error!("❌ Failed to send PING: {e:?}");
                     break PumpEnd::Lost;
                 }
             },
@@ -998,7 +979,7 @@ enum Inbound {
 /// Decode one inbound CBOR frame. Pure, so it's unit-tested natively.
 fn decode_frame(data: &[u8]) -> Result<Inbound, String> {
     let api_msg = ciborium::from_reader::<ApiMessage, _>(data)
-        .map_err(|e| format!("Failed to decode CBOR message: {}", e))?;
+        .map_err(|e| format!("Failed to decode CBOR message: {e}"))?;
     let payload = api_msg.payload.as_slice();
     match api_msg.message_type {
         ApiMessageType::Response => match ciborium::from_reader::<ApiResponse, _>(payload) {
@@ -1006,11 +987,11 @@ fn decode_frame(data: &[u8]) -> Result<Inbound, String> {
                 correlation_id: api_msg.correlation_id,
             }),
             Ok(response) => Ok(Inbound::Response(response)),
-            Err(e) => Err(format!("Failed to decode response: {}", e)),
+            Err(e) => Err(format!("Failed to decode response: {e}")),
         },
         ApiMessageType::Event => ciborium::from_reader::<DeviceEvent, _>(payload)
             .map(Inbound::Event)
-            .map_err(|e| format!("Failed to decode DeviceEvent: {}", e)),
+            .map_err(|e| format!("Failed to decode DeviceEvent: {e}")),
         ApiMessageType::Request | ApiMessageType::Error => Ok(Inbound::Other),
     }
 }
@@ -1019,7 +1000,7 @@ fn decode_frame(data: &[u8]) -> Result<Inbound, String> {
 fn handle_message(ctx: &Ctx, inbound: Inbound) {
     match inbound {
         Inbound::Response(response) => {
-            log::info!("📥 Received response: {:?}", response);
+            log::info!("📥 Received response: {response:?}");
             ctx.last_response.set(Some(response));
         }
         Inbound::Event(device_event) => {
@@ -1034,7 +1015,7 @@ fn handle_message(ctx: &Ctx, inbound: Inbound) {
             match serde_json::to_value(&device_event) {
                 Ok(event_json) => ctx.last_event.set(Some(event_json)),
                 Err(e) => {
-                    log::error!("❌ Failed to convert DeviceEvent to JSON: {}", e);
+                    log::error!("❌ Failed to convert DeviceEvent to JSON: {e}");
                 }
             }
         }
@@ -1060,7 +1041,7 @@ pub fn use_websocket() -> UseWebSocketHandle {
     // 🚀 Initial connection; everything after that reconnects by itself.
     {
         let ctx = ctx.clone();
-        use_effect_with((), move |_| {
+        use_effect_with((), move |()| {
             connect(&ctx);
             move || shutdown(&ctx)
         });
@@ -1068,7 +1049,7 @@ pub fn use_websocket() -> UseWebSocketHandle {
 
     // 🔥 iOS WAKE DETECTION - CHECK THE CONNECTION ON RETURN! 💖
     // iOS webapps need both visibilitychange AND pageshow
-    use_effect_with((), move |_| {
+    use_effect_with((), move |()| {
         let window = web_sys::window().expect("window");
         let document = window.document().expect("document");
 
@@ -1110,12 +1091,12 @@ pub fn use_websocket() -> UseWebSocketHandle {
                 let data = match encode_request(&request, new_correlation_id()) {
                     Ok(data) => data,
                     Err(e) => {
-                        log::error!("❌ {}", e);
+                        log::error!("❌ {e}");
                         return;
                     }
                 };
 
-                log::info!("📤 Sending request: {:?}", request);
+                log::info!("📤 Sending request: {request:?}");
 
                 // Send via channel
                 if !state.borrow().queue(Outbound::Frame(data)) {

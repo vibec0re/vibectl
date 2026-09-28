@@ -459,8 +459,8 @@ fn expect_char(
     skip_whitespace(chars);
     match chars.next() {
         Some(c) if c == expected => Ok(()),
-        Some(c) => Err(format!("Expected '{}', got '{}'", expected, c)),
-        None => Err(format!("Expected '{}', got EOF", expected)),
+        Some(c) => Err(format!("Expected '{expected}', got '{c}'")),
+        None => Err(format!("Expected '{expected}', got EOF")),
     }
 }
 
@@ -489,6 +489,7 @@ fn skip_block(chars: &mut std::iter::Peekable<std::str::Chars>) {
 }
 
 // 🔥 DEFAULT CONFIG FOR TESTING! 💖
+#[must_use]
 pub fn default_config() -> &'static str {
     r#"
 screen "home" {
@@ -824,10 +825,10 @@ screen "my-screen" {
 
     #[test]
     fn test_only_comments() {
-        let kdl = r#"
+        let kdl = r"
 // Just a comment
 // Another comment
-"#;
+";
         let screens = parse_screens(kdl).unwrap();
         assert!(screens.is_empty());
     }
