@@ -164,8 +164,11 @@ pub enum ApiResponse {
         devices: Vec<DeviceState>,
         total_count: u32,
     },
+    /// Boxed: a `DeviceInfo` is over 250 bytes on 64-bit targets (clippy's
+    /// `large_enum_variant`, which only fires on native builds). The wire
+    /// format is unchanged, since serde encodes a `Box<T>` as a `T`.
     DeviceInfo {
-        device: DeviceInfo,
+        device: Box<DeviceInfo>,
     },
     DeviceState {
         state: serde_json::Value,
