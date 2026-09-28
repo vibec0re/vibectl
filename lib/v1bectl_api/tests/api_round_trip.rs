@@ -4,7 +4,8 @@
 //! `v1bectl_server dummy` wires it: the dummy `basic_home` hub seeds the
 //! store, a sync engine is attached and running, and the shipped Bedroom
 //! Lights group (`virtual_devices/bedroom_lights.toml`) is registered with
-//! the server's virtual device manager before the server starts. Left out:
+//! the server's virtual device manager before the server starts (and, for
+//! one test, a plain light group next to it). Left out:
 //! the dummy hub's event stream, which the server forwards onto the bus.
 //! It's random (an attribute or reachability event now and then), and
 //! nothing here reads it.
@@ -38,8 +39,8 @@ use v1bectl_sync::{
     SyncEngine,
 };
 use v1bectl_virtual::{
-    load_virtual_devices_from_dir, DummyGateway, LightGroupLinear, VirtualDeviceConfig,
-    VirtualDeviceTomlConfig, VirtualDeviceType,
+    load_virtual_devices_from_dir, DummyGateway, LightGroup, LightGroupLinear, VirtualDevice,
+    VirtualDeviceConfig, VirtualDeviceTomlConfig, VirtualDeviceType,
 };
 
 // ── The wire, as a client sees it ────────────────────────────────────────────
@@ -262,6 +263,19 @@ const MEMBERS_AT_50: [(&str, u8); 3] = [
     ("light_kitchen", 25),
 ];
 
+/// A plain light group (`LightGroup`: brightness curves, not linear ranges)
+/// over two lights of the dummy `basic_home` hub, both off at start.
+const LIGHT_GROUP: &str = "virtual_curved_lights";
+
+/// (member, its brightness curve's breakpoints, its brightness when
+/// [`LIGHT_GROUP`] is on at 60%). A `light_group` in `virtual_devices/`
+/// gets the 1:1 curve for every member. The API's `CreateVirtualDevice`
+/// takes any curve, and the second one shows each member gets its own.
+const CURVED_MEMBERS_AT_60: [(&str, [[u8; 2]; 2], u8); 2] = [
+    ("light_living_room", [[0, 0], [100, 100]], 60),
+    ("light_bedroom", [[0, 0], [100, 50]], 30),
+];
+
 /// A running server, and the store behind it.
 struct Home {
     addr: SocketAddr,
@@ -297,9 +311,39 @@ async fn bedroom_lights(store: &Arc<StateStore>) -> LightGroupLinear {
     LightGroupLinear::new(config, c.members, ranges, Arc::clone(store)).expect("Bedroom Lights")
 }
 
+/// [`LIGHT_GROUP`], built the way `v1bectl_server` and the API's
+/// `CreateVirtualDevice` build a `LightGroup`.
+fn curved_lights(store: &Arc<StateStore>) -> LightGroup {
+    let lights: Vec<&str> = CURVED_MEMBERS_AT_60.iter().map(|(id, ..)| *id).collect();
+    let curves: serde_json::Map<String, serde_json::Value> = CURVED_MEMBERS_AT_60
+        .iter()
+        .map(|(id, breakpoints, _)| {
+            let curve = serde_json::json!({ "breakpoints": breakpoints });
+            ((*id).to_string(), curve)
+        })
+        .collect();
+    let config = VirtualDeviceConfig {
+        device_id: LIGHT_GROUP.to_string(),
+        device_type: VirtualDeviceType::LightGroup,
+        name: "Curved Lights".to_string(),
+        description: None,
+        enabled: true,
+        config: serde_json::json!({ "lights": lights, "brightness_curves": curves }),
+    };
+    LightGroup::new(config, Arc::clone(store)).expect("Curved Lights")
+}
+
 /// The server `v1bectl_server dummy` runs, on an ephemeral port of
 /// `127.0.0.1`.
 async fn serve_dummy_home() -> Home {
+    serve_dummy_home_with(|_| Vec::new()).await
+}
+
+/// [`serve_dummy_home`], with the virtual devices `more` builds over the
+/// store registered too, after Bedroom Lights.
+async fn serve_dummy_home_with(
+    more: impl FnOnce(&Arc<StateStore>) -> Vec<Box<dyn VirtualDevice>>,
+) -> Home {
     let store = StateStore::new();
     let bus = Arc::new(EventBus::new(1000));
     let gateway: Arc<dyn Gateway> = Arc::new(DummyGateway::new("basic_home"));
@@ -319,11 +363,18 @@ async fn serve_dummy_home() -> Home {
 
     let server =
         AxumServer::new(0, Arc::clone(&store), bus, gateway).with_sync_engine(Arc::clone(&engine));
-    server
-        .virtual_device_manager()
+    let manager = server.virtual_device_manager();
+    manager
         .add_virtual_device(Box::new(bedroom_lights(&store).await))
         .await
         .expect("register Bedroom Lights");
+    for device in more(&store) {
+        let device_id = device.device_id().clone();
+        manager
+            .add_virtual_device(device)
+            .await
+            .unwrap_or_else(|e| panic!("register {device_id}: {e}"));
+    }
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("the bound address");
@@ -411,6 +462,45 @@ async fn a_virtual_group_write_comes_back_over_the_socket() {
     assert_eq!(echo, stored(&home.store, GROUP).await, "and the store's");
 
     for (member, brightness) in MEMBERS_AT_50 {
+        let echo = client.echo(member).await;
+        assert_eq!(light_level(&echo), (true, Some(brightness)), "{member}");
+        assert_eq!(echo, stored(&home.store, member).await, "{member}'s echo");
+    }
+}
+
+/// #54, #55: a write to a plain light group comes back over the socket as
+/// well, the way a linear group's does. The group is echoed with the state
+/// the answer announced, and every member with its curve's share of it.
+/// Each member is committed through the sync engine, which writes it into
+/// the store and echoes it; the group only planned the write.
+#[tokio::test]
+async fn a_light_group_write_comes_back_over_the_socket() {
+    let home = serve_dummy_home_with(|store| {
+        let group: Box<dyn VirtualDevice> = Box::new(curved_lights(store));
+        vec![group]
+    })
+    .await;
+    let mut client = Client::connect(home.addr).await;
+
+    let response = client.request(&set_light(LIGHT_GROUP, true, 60)).await;
+    let ApiResponse::LightUpdated { new_state } = response else {
+        panic!("unexpected response: {response:?}");
+    };
+    assert_eq!((new_state.is_on, new_state.brightness), (true, Some(60)));
+
+    let echo = client.echo(LIGHT_GROUP).await;
+    assert_eq!(
+        echo,
+        DeviceStateValue::Light(new_state),
+        "the group's echo must carry the state the answer announced"
+    );
+    assert_eq!(
+        echo,
+        stored(&home.store, LIGHT_GROUP).await,
+        "and the store's"
+    );
+
+    for (member, _, brightness) in CURVED_MEMBERS_AT_60 {
         let echo = client.echo(member).await;
         assert_eq!(light_level(&echo), (true, Some(brightness)), "{member}");
         assert_eq!(echo, stored(&home.store, member).await, "{member}'s echo");
