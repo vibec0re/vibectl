@@ -232,10 +232,13 @@ async fn every_field_maps_onto_the_runtime_config() {
         .await
         .expect("activate");
     assert_eq!(started.elapsed(), Duration::from_millis(1500), "fade time");
-    for (id, want) in [
-        ("lamp", light(true, Some(30), Some(2200))),
-        ("tv", outlet(false)),
-    ] {
+    // The outlet keeps the readings the scene doesn't name (#64).
+    let tv_off = DeviceStateValue::Outlet(OutletState {
+        is_on: false,
+        power_consumption: Some(45.5),
+        total_energy: Some(123.4),
+    });
+    for (id, want) in [("lamp", light(true, Some(30), Some(2200))), ("tv", tv_off)] {
         let state = store.get_device(&id.to_string()).await.expect(id).state;
         assert_eq!(state, want, "{id}");
     }

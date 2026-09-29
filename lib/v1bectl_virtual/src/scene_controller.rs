@@ -19,6 +19,9 @@ const FADE_STEP: Duration = Duration::from_millis(100);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scene {
     pub name: String,
+    /// Each device's target. What one leaves out (a light's `brightness`,
+    /// its colour) keeps the device's value when the scene is activated: a
+    /// scene only changes what it names (#64).
     pub device_states: HashMap<DeviceId, DeviceStateValue>,
     pub transition_type: TransitionType,
 }
@@ -326,6 +329,10 @@ impl SceneController {
     /// doesn't have ends the transition where writing it used to fail, as
     /// its last write: the manager's commit of it fails the activation
     /// there.
+    ///
+    /// Each target is merged with the device as the store has it (see
+    /// [`merged`]), so a scene only changes what it names (#64): as it sets
+    /// the device, or, for a fade, where the fade starts it.
     async fn plan_activation(
         store: &StateStore,
         scene: &Scene,
@@ -334,8 +341,8 @@ impl SceneController {
         match scene.transition_type {
             TransitionType::Instant => {
                 // Set all devices immediately
-                for (device_id, state) in &scene.device_states {
-                    if !Self::stage(store, &mut staged, device_id, state.clone()).await {
+                for (device_id, target) in &scene.device_states {
+                    if !Self::stage_target(store, &mut staged, device_id, target).await {
                         break;
                     }
                 }
@@ -347,14 +354,18 @@ impl SceneController {
 
                 if steps == 0 {
                     // Just set immediately if duration too short
-                    for (device_id, state) in &scene.device_states {
-                        if !Self::stage(store, &mut staged, device_id, state.clone()).await {
+                    for (device_id, target) in &scene.device_states {
+                        if !Self::stage_target(store, &mut staged, device_id, target).await {
                             break;
                         }
                     }
                     return staged.0;
                 }
 
+                // Each device's target, merged with where the fade starts
+                // it, at its first step. So the fade and its end agree on
+                // what the scene leaves out: it stays where it is.
+                let mut targets = Staged::default();
                 'fade: for step in 0..=steps {
                     // `steps` is a fade duration in 100ms increments; not
                     // provably bounded to f32's 23-bit mantissa, but scene
@@ -366,16 +377,29 @@ impl SceneController {
                     let progress = step as f32 / steps as f32;
 
                     for (device_id, target_state) in &scene.device_states {
-                        let current_state = match staged.get(device_id) {
-                            Some(state) => state.clone(),
-                            None => store.get_device(device_id).await.map_or_else(
-                                || Self::get_default_state_for_target(target_state),
-                                |ds| ds.state,
-                            ),
-                        };
+                        let started = staged.get(device_id).cloned();
+                        let (current_state, target) =
+                            match started.zip(targets.get(device_id).cloned()) {
+                                Some(fading) => fading,
+                                None => match store.get_device(device_id).await {
+                                    // Where it starts: the device as the
+                                    // store has it.
+                                    Some(device) => {
+                                        let target = merged(target_state, &device.state);
+                                        targets.set(device_id, target.clone());
+                                        (device.state, target)
+                                    }
+                                    // Not in the store: this step is its
+                                    // last write.
+                                    None => (
+                                        Self::get_default_state_for_target(target_state),
+                                        target_state.clone(),
+                                    ),
+                                },
+                            };
 
                         let interpolated_state =
-                            Self::interpolate_states(&current_state, target_state, progress);
+                            Self::interpolate_states(&current_state, &target, progress);
                         if !Self::stage(store, &mut staged, device_id, interpolated_state).await {
                             break 'fade;
                         }
@@ -388,13 +412,13 @@ impl SceneController {
             }
             TransitionType::Sequence { ref delays_ms } => {
                 // Activate devices in sequence with specified delays
-                for (i, (device_id, state)) in scene.device_states.iter().enumerate() {
+                for (i, (device_id, target)) in scene.device_states.iter().enumerate() {
                     if let Some(&delay_ms) = delays_ms.get(i) {
                         if delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         }
                     }
-                    if !Self::stage(store, &mut staged, device_id, state.clone()).await {
+                    if !Self::stage_target(store, &mut staged, device_id, target).await {
                         break;
                     }
                 }
@@ -402,6 +426,26 @@ impl SceneController {
         }
 
         staged.0
+    }
+
+    /// Stage `target` for `device_id`, merged with the device as the store
+    /// has it now (see [`merged`]), where the activation used to write it
+    /// into the store. Returns whether the store has the device: a write to
+    /// one it doesn't have failed, and ended the activation. That one is
+    /// staged at the scene's target as it is, for the manager's commit of
+    /// it to fail at, as before.
+    async fn stage_target(
+        store: &StateStore,
+        staged: &mut Staged,
+        device_id: &DeviceId,
+        target: &DeviceStateValue,
+    ) -> bool {
+        let current = store.get_device(device_id).await;
+        let state = current
+            .as_ref()
+            .map_or_else(|| target.clone(), |device| merged(target, &device.state));
+        staged.set(device_id, state);
+        current.is_some()
     }
 
     /// Stage `state` for `device_id`, where the activation used to write it
@@ -516,6 +560,80 @@ impl SceneController {
             }
         }
         devices.into_iter().collect()
+    }
+}
+
+/// `target`, the state a scene sets a device to, as activating the scene
+/// writes it over `current`, the device as the store has it (#64):
+/// - In the shape the store holds the device in (see [`in_store_shape`]),
+///   so its gateway can push it. A Dirigera hub's outlet is a light there.
+/// - With what the target leaves out kept from `current`, so a scene only
+///   changes what it names: a light's `brightness` and its colour, and an
+///   outlet's readings. A light shows one colour: a target that names
+///   `color_temp` or `rgb_color` sets both, and one that names neither
+///   keeps both.
+///
+/// A field a target left out used to be written as none, with the rest of
+/// the device's state: the store showed a light with no brightness for the
+/// sync engine's protection window and up to one pull after it, until the
+/// hub's own value came back as a second update.
+fn merged(target: &DeviceStateValue, current: &DeviceStateValue) -> DeviceStateValue {
+    match (in_store_shape(target, Some(current)), current) {
+        (DeviceStateValue::Light(target), DeviceStateValue::Light(current)) => {
+            let (color_temp, rgb_color) =
+                if target.color_temp.is_some() || target.rgb_color.is_some() {
+                    (target.color_temp, target.rgb_color)
+                } else {
+                    (current.color_temp, current.rgb_color.clone())
+                };
+            DeviceStateValue::Light(LightState {
+                is_on: target.is_on,
+                brightness: target.brightness.or(current.brightness),
+                color_temp,
+                rgb_color,
+            })
+        }
+        (DeviceStateValue::Outlet(target), DeviceStateValue::Outlet(current)) => {
+            DeviceStateValue::Outlet(OutletState {
+                is_on: target.is_on,
+                power_consumption: target.power_consumption.or(current.power_consumption),
+                total_energy: target.total_energy.or(current.total_energy),
+            })
+        }
+        (shaped, _) => shaped,
+    }
+}
+
+/// `target` in the shape the store holds its device in, `current`, so the
+/// device's gateway can push it, and the store keeps the kind of state it
+/// holds for it:
+/// - A light the store holds as an outlet is an outlet, on or off only.
+/// - An outlet the store holds as a light is a light that is only on or
+///   off. That is how a Dirigera hub's outlets are read, and the only kind
+///   of state its gateway writes to one.
+/// - Anything else is taken as it is, as is a target for a device the
+///   store doesn't have.
+fn in_store_shape(
+    target: &DeviceStateValue,
+    current: Option<&DeviceStateValue>,
+) -> DeviceStateValue {
+    match (target, current) {
+        (DeviceStateValue::Light(light), Some(DeviceStateValue::Outlet(_))) => {
+            DeviceStateValue::Outlet(OutletState {
+                is_on: light.is_on,
+                power_consumption: None,
+                total_energy: None,
+            })
+        }
+        (DeviceStateValue::Outlet(outlet), Some(DeviceStateValue::Light(_))) => {
+            DeviceStateValue::Light(LightState {
+                is_on: outlet.is_on,
+                brightness: None,
+                color_temp: None,
+                rgb_color: None,
+            })
+        }
+        _ => target.clone(),
     }
 }
 
@@ -716,7 +834,7 @@ impl VirtualDevice for SceneController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use v1bectl_sync::{Capability, DeviceInfo, DeviceType};
+    use v1bectl_sync::{Capability, DeviceInfo, DeviceType, RgbColor};
 
     fn light(is_on: bool, brightness: u8) -> DeviceStateValue {
         DeviceStateValue::Light(LightState {
@@ -934,6 +1052,139 @@ mod tests {
             write.members, want,
             "the first step, up to the missing device"
         );
+    }
+
+    fn lamp(
+        is_on: bool,
+        brightness: Option<u8>,
+        color_temp: Option<u16>,
+        rgb_color: Option<RgbColor>,
+    ) -> DeviceStateValue {
+        DeviceStateValue::Light(LightState {
+            is_on,
+            brightness,
+            color_temp,
+            rgb_color,
+        })
+    }
+
+    fn outlet(is_on: bool, power_consumption: Option<f32>) -> DeviceStateValue {
+        DeviceStateValue::Outlet(OutletState {
+            is_on,
+            power_consumption,
+            total_energy: power_consumption.map(|watts| watts * 2.0),
+        })
+    }
+
+    /// #64: a target keeps what it leaves out from the device as the store
+    /// has it, in the shape the store has it in. A light's colour is one
+    /// thing: naming either kind sets both.
+    #[test]
+    fn a_target_keeps_what_it_leaves_out() {
+        let red = || Some(RgbColor { r: 255, g: 0, b: 0 });
+        for (case, current, target, want) in [
+            (
+                "only is_on",
+                lamp(false, Some(70), Some(2700), None),
+                lamp(true, None, None, None),
+                lamp(true, Some(70), Some(2700), None),
+            ),
+            (
+                "a brightness",
+                lamp(false, Some(70), Some(2700), None),
+                lamp(true, Some(30), None, None),
+                lamp(true, Some(30), Some(2700), None),
+            ),
+            (
+                "a colour temperature over an RGB colour",
+                lamp(false, Some(70), None, red()),
+                lamp(true, None, Some(4000), None),
+                lamp(true, Some(70), Some(4000), None),
+            ),
+            (
+                "an RGB colour over a colour temperature",
+                lamp(false, Some(70), Some(2700), None),
+                lamp(true, None, None, red()),
+                lamp(true, Some(70), None, red()),
+            ),
+            (
+                "no colour, over an RGB colour",
+                lamp(false, Some(70), None, red()),
+                lamp(true, None, None, None),
+                lamp(true, Some(70), None, red()),
+            ),
+            (
+                "everything",
+                lamp(false, Some(70), Some(2700), None),
+                lamp(true, Some(30), Some(2200), None),
+                lamp(true, Some(30), Some(2200), None),
+            ),
+            (
+                "an outlet keeps its readings",
+                outlet(true, Some(45.5)),
+                outlet(false, None),
+                outlet(false, Some(45.5)),
+            ),
+            (
+                "an outlet the store holds as a light (a Dirigera hub's)",
+                lamp(false, None, None, None),
+                outlet(true, None),
+                lamp(true, None, None, None),
+            ),
+            (
+                "an outlet over a light the store has a level for",
+                lamp(false, Some(70), Some(2700), None),
+                outlet(true, None),
+                lamp(true, Some(70), Some(2700), None),
+            ),
+            (
+                "a light the store holds as an outlet",
+                outlet(true, Some(45.5)),
+                lamp(false, Some(30), Some(2200), None),
+                outlet(false, Some(45.5)),
+            ),
+        ] {
+            assert_eq!(merged(&target, &current), want, "{case}");
+        }
+    }
+
+    /// #64: a fade whose target leaves a field out keeps it where the fade
+    /// starts it, at every step, and ends at the target merged with that
+    /// start: the fade and its end agree.
+    #[tokio::test(start_paused = true)]
+    async fn a_fade_keeps_what_its_target_leaves_out() {
+        let store = store_with(&["a"]).await;
+        store
+            .update_device_state(&"a".to_string(), lamp(false, Some(70), Some(2200), None))
+            .await
+            .expect("a");
+        let fade = TransitionType::Fade { duration_ms: 1000 };
+        let controller = controller(&store, &[("a", lamp(true, None, None, None))], &fade);
+
+        let started = tokio::time::Instant::now();
+        let write = controller.plan_write(evening()).await.expect("plan");
+        assert_eq!(started.elapsed(), Duration::from_secs(1), "fade time");
+        assert_eq!(
+            write.members,
+            vec![("a".to_string(), lamp(true, Some(70), Some(2200), None))]
+        );
+
+        // Every step: interpolating from where it starts to the merged
+        // target keeps the level and the colour.
+        let start = lamp(false, Some(70), Some(2200), None);
+        let target = merged(&lamp(true, None, None, None), &start);
+        for progress in [0.0, 0.3, 0.5, 1.0] {
+            let DeviceStateValue::Light(step) =
+                SceneController::interpolate_states(&start, &target, progress)
+            else {
+                panic!("a light");
+            };
+            assert_eq!(
+                (step.brightness, step.color_temp),
+                (Some(70), Some(2200)),
+                "{progress}"
+            );
+        }
     }
 
     #[test]

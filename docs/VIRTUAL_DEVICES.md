@@ -353,25 +353,34 @@ impl VirtualDevice for SceneController {
 // goes to the manager, to commit. Its steps used to go into the store, where
 // a pull took them for outside changes. (A light the store doesn't have ends
 // the transition there, and the manager's commit of it fails the activation.)
+//
+// 🎯 Each target is merged with the light as the store has it (#64): what
+// the target leaves out keeps the light's value, so a scene only changes what
+// it names. See "A scene only changes what it names" below.
 async fn plan_transition(store: &StateStore, scene: &Scene) -> Vec<(DeviceId, DeviceStateValue)> {
     let mut staged = Staged::default();
     match &scene.transition_type {
         TransitionType::Instant => {
-            for (device_id, state) in &scene.device_states {
-                staged.set(device_id, state.clone());
+            for (device_id, target) in &scene.device_states {
+                staged.set(device_id, merged(target, &stored(store, device_id).await));
             }
         }
         TransitionType::Fade { duration_ms } => {
             let steps = duration_ms / 100; // 100ms steps (under one step: instant)
+            let mut targets = Staged::default(); // merged with where the fade starts
             for step in 0..=steps {
                 let progress = step as f32 / steps as f32;
-                for (device_id, target_state) in &scene.device_states {
-                    let current_state = match staged.get(device_id) {
-                        Some(state) => state.clone(),
+                for (device_id, target) in &scene.device_states {
+                    let (current_state, target) = match staged.get(device_id) {
+                        Some(state) => (state.clone(), targets.get(device_id).clone()),
                         // where it starts: the light as the store has it
-                        None => store.get_device(device_id).await.map_or_else(|| default_for(target_state), |d| d.state),
+                        None => {
+                            let start = stored(store, device_id).await;
+                            targets.set(device_id, merged(target, &start));
+                            (start, targets.get(device_id).clone())
+                        }
                     };
-                    staged.set(device_id, interpolate_states(&current_state, target_state, progress));
+                    staged.set(device_id, interpolate_states(&current_state, &target, progress));
                 }
                 if step < steps {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -379,17 +388,44 @@ async fn plan_transition(store: &StateStore, scene: &Scene) -> Vec<(DeviceId, De
             }
         }
         TransitionType::Sequence { delays_ms } => {
-            for (i, (device_id, state)) in scene.device_states.iter().enumerate() {
+            for (i, (device_id, target)) in scene.device_states.iter().enumerate() {
                 if let Some(delay_ms) = delays_ms.get(i) {
                     tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
                 }
-                staged.set(device_id, state.clone());
+                staged.set(device_id, merged(target, &stored(store, device_id).await));
             }
         }
     }
     staged.into_members() // each light once, at its last state
 }
 ```
+
+#### 🎯 A scene only changes what it names (#64)
+
+A target may leave fields out: a TOML light with only `is_on`, or a runtime
+`LightState` with `brightness: None`. Activating the scene merges each
+target with the device as the store has it (`merged` in
+`lib/v1bectl_virtual/src/scene_controller.rs`):
+
+- A light keeps its `brightness` if the target has none, and its colour if
+  the target names neither `color_temp` nor `rgb_color`. A light shows one
+  colour, so a target that names either sets both.
+- An outlet keeps its readings (`power_consumption`, `total_energy`).
+- The target takes the shape the store holds the device in: an outlet the
+  store holds as a light (a Dirigera hub's) is written as a light that is
+  only on or off, and a light the store holds as an outlet as an outlet.
+- A fade merges each target with where it starts the device, so what the
+  target leaves out stays where it is at every step, and the fade ends at the
+  merged target. A sequence merges each device as it reaches it.
+- A device the store doesn't have is staged as the target says, and the
+  manager's commit fails at it, as before.
+
+Before #64, a field a target left out was written as none, as part of the
+device's whole state. Nothing fought the hub over it (one PATCH, which the
+Dirigera gateway sends without the missing fields), but the store showed the
+light with no brightness for the sync engine's whole protection window (5 s)
+and up to one pull (2 s) after it, and then the hub's own value came back as
+a second update.
 
 ### 3. Conditional Automation
 **Purpose**: React to sensor changes and time events with complex logic
@@ -683,8 +719,9 @@ runtime config the API's `CreateVirtualDevice` takes:
 
 The file can't express a transition per scene, or a `Sequence` with its
 delays (see 🚦 above for both). A light field it leaves out (`brightness`,
-`color_temp`) is unset in the target, as in a scene the API creates: a
-scene writes the device's whole state.
+`color_temp`) is unset in the target, as in a scene the API creates, and
+keeps the device's value when the scene is activated: a scene only changes
+what it names (see 🎯 above, #64).
 
 When the server loads the file, it checks it the way it checks the other
 types:
