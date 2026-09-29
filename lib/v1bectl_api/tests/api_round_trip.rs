@@ -78,6 +78,10 @@ enum ApiRequest {
     CreateVirtualDevice {
         config: VirtualDeviceConfig,
     },
+    ActivateScene {
+        device_id: String,
+        scene_name: String,
+    },
     Ping,
 }
 
@@ -93,6 +97,10 @@ enum ApiResponse {
     },
     VirtualDeviceCreated {
         device_id: String,
+    },
+    SceneActivated {
+        device_id: String,
+        scene_name: String,
     },
     Pong,
     Error {
@@ -251,6 +259,29 @@ impl Client {
         state_echo(&event).unwrap_or_else(|| {
             panic!("the first event for {device_id} isn't a state echo: {event:?}")
         })
+    }
+
+    /// [`Self::echo`], past the other events for `device_id` (its
+    /// `DeviceAdded`, for a device created through the socket).
+    async fn state_echo_of(&mut self, device_id: &str) -> DeviceStateValue {
+        timeout(PATIENCE, async {
+            loop {
+                if let Some(at) = self.events.iter().position(|e| e.device_id == device_id) {
+                    let event = self.events.remove(at).expect("found above");
+                    if let Some(state) = state_echo(&event) {
+                        return state;
+                    }
+                    continue;
+                }
+                let message = self.next_message().await;
+                match message.message_type {
+                    ApiMessageType::Event => self.events.push_back(decode(&message.payload)),
+                    _ => panic!("unexpected message: {message:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{device_id} was never echoed over the socket"))
     }
 }
 
@@ -645,4 +676,67 @@ async fn a_scene_controller_the_toml_checks_reject_is_not_created() {
             .is_none(),
         "{CONTROLLER} was registered"
     );
+}
+
+/// #58: a scene controller created through the API before the light group
+/// its scene sets is created, as a client may send them. Neither is
+/// refused, and setting the scene reaches the group's lights through the
+/// group: each comes back over the socket at its curve's share of the
+/// scene's 60, and so does the group. A virtual target is resolved when the
+/// scene is set, not when it's created.
+#[tokio::test]
+async fn a_scene_created_before_the_group_it_sets_reaches_its_lights() {
+    const CONTROLLER: &str = "scene_over_a_group";
+    let home = serve_dummy_home().await;
+    let mut client = Client::connect(home.addr).await;
+
+    let at_60 = DeviceStateValue::Light(LightState {
+        is_on: true,
+        brightness: Some(60),
+        color_temp: None,
+        rgb_color: None,
+    });
+    let scenes = VirtualDeviceConfig {
+        device_id: CONTROLLER.to_string(),
+        device_type: VirtualDeviceType::SceneController,
+        name: "Scene Over A Group".to_string(),
+        description: None,
+        enabled: true,
+        config: serde_json::json!({ "scenes": { "movie": {
+            "name": "movie",
+            "device_states": { LIGHT_GROUP: at_60 },
+            "transition_type": "Instant",
+        } } }),
+    };
+    let group = curved_lights(&home.store).config().clone();
+    for config in [scenes, group] {
+        let device_id = config.device_id.clone();
+        let response = client
+            .request(&ApiRequest::CreateVirtualDevice { config })
+            .await;
+        assert!(
+            matches!(&response, ApiResponse::VirtualDeviceCreated { device_id: created } if *created == device_id),
+            "{device_id}: {response:?}"
+        );
+    }
+
+    let response = client
+        .request(&ApiRequest::ActivateScene {
+            device_id: CONTROLLER.to_string(),
+            scene_name: "movie".to_string(),
+        })
+        .await;
+    assert!(
+        matches!(&response, ApiResponse::SceneActivated { device_id, scene_name }
+            if device_id == CONTROLLER && scene_name == "movie"),
+        "{response:?}"
+    );
+    for (member, _, brightness) in CURVED_MEMBERS_AT_60 {
+        let echo = client.state_echo_of(member).await;
+        assert_eq!(light_level(&echo), (true, Some(brightness)), "{member}");
+        assert_eq!(echo, stored(&home.store, member).await, "{member}'s echo");
+    }
+    let echo = client.state_echo_of(LIGHT_GROUP).await;
+    assert_eq!(light_level(&echo), (true, Some(60)), "the group");
+    assert_eq!(echo, stored(&home.store, LIGHT_GROUP).await, "its echo");
 }

@@ -1,0 +1,18 @@
+# 💡 A VIRTUAL DEVICE A WILDCARD COULD MATCH - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. This group's id starts with `light_`, and its file sorts
+# before `b_all_lights.toml`, whose `light_*` wildcard must still match only
+# the physical lights: a virtual member is named, never matched (#58).
+
+type = "light_group_linear"
+device_id = "light_virtual_pair"
+name = "A Virtual Pair"
+
+[members]
+one = "light_bedroom"
+two = "light_kitchen"
+
+[brightness]
+one = [0, 100]
+two = [0, 100]

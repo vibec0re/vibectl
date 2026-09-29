@@ -12,7 +12,7 @@ use v1bectl_sync::{
     OutletState, SceneState, SensorState, StateStore, SwitchState,
 };
 use v1bectl_virtual::{
-    Scene, SceneController, SceneControllerConfig, TransitionType, VirtualDevice,
+    LightGroup, Scene, SceneController, SceneControllerConfig, TransitionType, VirtualDevice,
     VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceManager, VirtualDeviceTomlConfig,
     VirtualDeviceType,
 };
@@ -663,4 +663,107 @@ async fn a_toml_controllers_runtime_config_passes_the_api_checks() {
         .await
         .expect("create");
     assert_eq!(warnings, Vec::<String>::new());
+}
+
+// ---------------------------------------------------------------------
+// #58: a target that's a virtual device is resolved when the scene is
+// activated, whichever of the two was loaded (or created) first
+// ---------------------------------------------------------------------
+
+/// Registers, through a manager over `store`, what a scene can aim at
+/// that's virtual: a light group `grp` over `lamp`, and another scene
+/// controller, `other`.
+async fn register_virtual_targets(store: &Arc<StateStore>) {
+    let manager = VirtualDeviceManager::new(Arc::clone(store), Arc::new(EventBus::new(100)));
+    let group = LightGroup::new(
+        VirtualDeviceConfig {
+            device_id: "grp".to_string(),
+            device_type: VirtualDeviceType::LightGroup,
+            name: "Group".to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({
+                "lights": ["lamp"],
+                "brightness_curves": { "lamp": { "breakpoints": [[0, 0], [100, 100]] } },
+            }),
+        },
+        Arc::clone(store),
+    )
+    .expect("group");
+    manager
+        .add_virtual_device(Box::new(group))
+        .await
+        .expect("register grp");
+    let other = SceneControllerConfig {
+        device_id: "other".to_string(),
+        ..parse(&scene(
+            "x",
+            &[("lamp", "{ type = \"light\", is_on = true }")],
+        ))
+    };
+    let (other, _) = SceneController::from_toml(&other, Arc::clone(store))
+        .await
+        .expect("other");
+    manager
+        .add_virtual_device(Box::new(other))
+        .await
+        .expect("register other");
+}
+
+/// #63 review, finding 2 (#58): a scene aimed at virtual devices is checked
+/// and mapped the same whether they're loaded before it or after, from TOML
+/// and through the API. A light group given an outlet's state (`grp`), and
+/// another scene controller given a light's (`other`), are neither
+/// rejected nor reshaped by what the store holds for them. `other` used to
+/// be rejected ("a scene controller") only if its file happened to load
+/// first, and `grp`'s target became a light, or stayed an outlet, by the
+/// same order. Both are resolved when the scene is activated (setting
+/// `other` then fails, with nothing committed: see the manager's tests).
+#[tokio::test]
+async fn a_scene_aimed_at_virtual_devices_is_made_the_same_whichever_loads_first() {
+    let body = scene(
+        "movie",
+        &[
+            ("grp", "{ type = \"outlet\", is_on = true }"),
+            (
+                "other",
+                "{ type = \"light\", is_on = true, brightness = 40 }",
+            ),
+        ],
+    );
+    let targets = [
+        ("grp", outlet(true)),
+        ("other", light(true, Some(40), None)),
+    ];
+    let api_scenes = serde_json::json!({ "movie": api_scene("movie", &targets) });
+
+    let mut made = Vec::new();
+    for loaded_first in [false, true] {
+        let case = format!("virtual targets loaded first: {loaded_first}");
+        let store = store().await;
+        if loaded_first {
+            register_virtual_targets(&store).await;
+        }
+        let (toml, toml_warnings) = SceneController::from_toml(&parse(&body), Arc::clone(&store))
+            .await
+            .unwrap_or_else(|e| panic!("{case}: from TOML: {e}"));
+        let config = VirtualDeviceConfig {
+            device_id: "scenes".to_string(),
+            device_type: VirtualDeviceType::SceneController,
+            name: "Scenes".to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({ "scenes": api_scenes.clone() }),
+        };
+        let (api, api_warnings) = SceneController::create(config, Arc::clone(&store))
+            .await
+            .unwrap_or_else(|e| panic!("{case}: through the API: {e}"));
+        assert_eq!(toml_warnings, Vec::<String>::new(), "{case}");
+        assert_eq!(api_warnings, Vec::<String>::new(), "{case}");
+        let movie = runtime_scene(&toml, "movie");
+        assert_eq!(movie.device_states["grp"], outlet(true), "{case}: grp");
+        let api_movie = runtime_scene(&api, "movie");
+        made.push((toml.config().config.clone(), api_movie.device_states));
+    }
+    assert_eq!(made[0], made[1], "made differently by the load order");
 }

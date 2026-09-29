@@ -1,0 +1,20 @@
+# 💡 LINEAR LIGHT GROUP A SCENE SETS - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. `a_movie_scenes.toml` sorts before this file, so its
+# scene loads before this group.
+#
+# Its members are the dummy `basic_home` scenario's. At 30 % the group puts
+# `light_living_room` at 86 (80-100) and `light_kitchen` at 15 (0-50).
+
+type = "light_group_linear"
+device_id = "group_nested"
+name = "Nested Group"
+
+[members]
+top = "light_living_room"
+low = "light_kitchen"
+
+[brightness]
+top = [80, 100]
+low = [0, 50]

@@ -37,6 +37,13 @@ struct Server {
 }
 
 async fn server() -> Server {
+    server_over("virtual_devices").await
+}
+
+/// The server over the dummy `basic_home`, set up as `run_server` sets it
+/// up, with `tests/fixtures/{fixtures}` loaded where it loads
+/// `virtual_devices/`.
+async fn server_over(fixtures: &str) -> Server {
     let store = StateStore::new();
     let bus = Arc::new(EventBus::new(1000));
     let gateway: Arc<dyn Gateway> = Arc::new(DummyGateway::new("basic_home"));
@@ -58,7 +65,9 @@ async fn server() -> Server {
     let manager = axum_server.virtual_device_manager();
     let events = bus.subscribe();
 
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/virtual_devices");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(fixtures);
     load_virtual_devices(&fixtures, &store, &manager).await;
     Server {
         store,
@@ -110,36 +119,7 @@ fn active(scene: &str) -> DeviceStateValue {
 /// controllers' above, so its light group's members don't collide with
 /// theirs.
 async fn light_group_server() -> Server {
-    let store = StateStore::new();
-    let bus = Arc::new(EventBus::new(1000));
-    let gateway: Arc<dyn Gateway> = Arc::new(DummyGateway::new("basic_home"));
-    for info in gateway.discover_devices().await.expect("discover") {
-        let state = gateway
-            .get_device_state(&info.device_id)
-            .await
-            .expect("initial state");
-        store.add_device(info, state).await;
-    }
-    let engine = Arc::new(SyncEngine::new(
-        store.clone(),
-        bus.clone(),
-        gateway.clone(),
-        None,
-    ));
-    let axum_server =
-        AxumServer::new(0, store.clone(), bus.clone(), gateway).with_sync_engine(engine.clone());
-    let manager = axum_server.virtual_device_manager();
-    let events = bus.subscribe();
-
-    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/virtual_devices_light_group");
-    load_virtual_devices(&fixtures, &store, &manager).await;
-    Server {
-        store,
-        engine,
-        manager,
-        events,
-    }
+    server_over("virtual_devices_light_group").await
 }
 
 /// A scene controller's state before any of its scenes is set.
@@ -372,4 +352,91 @@ async fn a_toml_light_groups_brightness_curve_is_used() {
         light(true, Some(100), Some(2700)),
         "light_kitchen has no curve, so it falls back to 1:1"
     );
+}
+
+/// #58: `virtual_devices_nested/`, where the scene controller's file
+/// (`a_movie_scenes.toml`) sorts before the file of the light group its
+/// scene sets (`b_living_group.toml`). The scene loads first, and isn't
+/// rejected or reshaped for a target that isn't there yet: both are
+/// registered, and nothing is dangling. Setting `movie` then reaches the
+/// group's lights, through the group: each at the level its range maps 30
+/// to, echoed once and queued for the gateway. The group reports 30. It
+/// used to take the scene's state in the store while no light moved.
+#[tokio::test(start_paused = true)]
+async fn a_toml_scene_that_loads_before_the_group_it_sets_reaches_its_lights() {
+    const SCENES: &str = "scene_nested";
+    const GROUP: &str = "group_nested";
+    let mut server = server_over("virtual_devices_nested").await;
+    let announced: Vec<String> = server
+        .drain()
+        .into_iter()
+        .filter(|e| matches!(e.event_type, EventType::DeviceAdded { .. }))
+        .map(|e| e.device_id)
+        .filter(|id| [SCENES, GROUP].contains(&id.as_str()))
+        .collect();
+    assert_eq!(announced, [SCENES, GROUP], "the scene loads first");
+    assert_eq!(server.manager.dangling_references().await, Vec::new());
+    let bedroom_light = server.stored("light_bedroom").await;
+
+    let elapsed = server.activate(SCENES, "movie").await;
+    assert_eq!(elapsed, Duration::ZERO, "movie waited");
+    let events = server.drain();
+
+    for (id, level) in [("light_living_room", 86), ("light_kitchen", 15)] {
+        let target = light(true, Some(level), Some(2700));
+        assert_eq!(server.stored(id).await, target, "{id}");
+        assert_eq!(echoes(&events, id), vec![target], "{id}'s echo");
+        let status = server.engine.get_sync_status(&id.to_string()).await;
+        assert!(
+            matches!(status, Some(SyncStatus::PendingSync { .. })),
+            "{id} never queued for the gateway: {status:?}"
+        );
+    }
+    let group = light(true, Some(30), Some(2700));
+    assert_eq!(server.stored(GROUP).await, group, "the group");
+    assert_eq!(echoes(&events, GROUP), vec![group], "the group's echo");
+    assert_eq!(echoes(&events, SCENES), vec![active("movie")]);
+    let status = server.engine.get_sync_status(&GROUP.to_string()).await;
+    assert!(status.is_none(), "the group was queued for the gateway");
+    assert_eq!(server.stored("light_bedroom").await, bedroom_light);
+}
+
+/// #58: a `light_group`'s `*` wildcard matches only physical devices. In
+/// `virtual_devices_wildcard/`, the linear group `light_virtual_pair` loads
+/// (and is in the store) before `all_lights`, whose `light_*` would match
+/// its id. It used to join the group, as a member the write would now fan
+/// out through, and only if its file happened to load first. A virtual
+/// member is named, never matched.
+#[tokio::test(start_paused = true)]
+async fn a_toml_light_groups_wildcard_matches_no_virtual_device() {
+    const VIRTUAL: &str = "light_virtual_pair";
+    let server = server_over("virtual_devices_wildcard").await;
+    assert!(
+        server
+            .store
+            .get_device(&VIRTUAL.to_string())
+            .await
+            .is_some(),
+        "{VIRTUAL} loaded"
+    );
+
+    let config = server
+        .manager
+        .get_virtual_device_config(&"all_lights".to_string())
+        .await
+        .expect("all_lights loaded");
+    let mut members: Vec<String> =
+        serde_json::from_value(config.config["lights"].clone()).expect("its lights");
+    members.sort();
+    let mut lights: Vec<String> = server
+        .store
+        .list_devices()
+        .await
+        .into_iter()
+        .map(|device| device.device_info.device_id)
+        .filter(|id| id.starts_with("light_") && id != VIRTUAL)
+        .collect();
+    lights.sort();
+    assert!(!lights.is_empty(), "the dummy has lights");
+    assert_eq!(members, lights, "light_* matched a virtual device");
 }

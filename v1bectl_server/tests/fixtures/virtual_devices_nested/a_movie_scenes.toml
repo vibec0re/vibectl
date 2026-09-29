@@ -1,0 +1,24 @@
+# 🎬 SCENE CONTROLLER OVER A LIGHT GROUP - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. This file sorts before `b_living_group.toml`, so the
+# scene loads before the light group it sets: a virtual target is resolved
+# when the scene is activated, not when it loads (#58).
+#
+# `movie` sets the whole group to 30 %, and the group fans that out to its
+# lights (the dummy `basic_home` scenario's). It names only the level.
+
+type = "scene_controller"
+device_id = "scene_nested"
+name = "Nested Scenes"
+
+[[scenes]]
+name = "movie"
+display_name = "Movie Night"
+
+[[scenes.devices]]
+device_id = "group_nested"
+state = { type = "light", is_on = true, brightness = 30 }
+
+[settings]
+transition_duration = 0
