@@ -5,7 +5,7 @@ use crate::virtual_device::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use v1bectl_sync::{
@@ -102,6 +102,9 @@ pub struct SceneController {
 }
 
 impl SceneController {
+    /// A scene controller from `config`, its runtime config, unchecked. The
+    /// API creates one with [`Self::create`], and the server loads one from
+    /// TOML with [`Self::from_toml`]: both check the config first.
     pub fn new(
         config: VirtualDeviceConfig,
         state_store: Arc<StateStore>,
@@ -137,6 +140,51 @@ impl SceneController {
         })
     }
 
+    /// A scene controller from its runtime config, as the API's
+    /// `CreateVirtualDevice` sends it, checked the way [`Self::from_toml`]
+    /// checks a TOML one, by the same checks (`check_scenes`), so both
+    /// reject the same configs with the same messages (#64). With a line
+    /// for each thing it only warns about, for the caller to log.
+    ///
+    /// On top of those, each scene must be listed under its own `name`. A
+    /// scene is activated by the name it's listed under, so one listed
+    /// under another would show one name and answer to another. (A TOML
+    /// scene always is.)
+    ///
+    /// Two scenes listed under one name, or a device listed twice in one
+    /// scene, can't reach it: the API decodes a request's config into maps,
+    /// which keep only the last of each.
+    pub async fn create(
+        config: VirtualDeviceConfig,
+        state_store: Arc<StateStore>,
+    ) -> Result<(Self, Vec<String>), VirtualDeviceError> {
+        let controller = Self::new(config, state_store)?;
+        let warnings = {
+            let mut listed: Vec<(&String, &Scene)> = controller
+                .scenes
+                .iter()
+                .map(|(listed_as, scene)| (listed_as, scene.as_ref()))
+                .collect();
+            listed.sort_by_key(|(listed_as, _)| *listed_as);
+            let scenes: Vec<SceneTargets> = listed
+                .iter()
+                .map(|(_, scene)| SceneTargets::of(scene))
+                .collect();
+            let warnings = check_scenes(&scenes, &controller.state_store).await?;
+            if let Some((listed_as, scene)) = listed
+                .iter()
+                .find(|(listed_as, scene)| **listed_as != scene.name)
+            {
+                return Err(VirtualDeviceError::Config(format!(
+                    "scene {listed_as:?} is named {:?}: a scene is activated by the name it's listed under, so the two must be the same",
+                    scene.name
+                )));
+            }
+            warnings
+        };
+        Ok((controller, warnings))
+    }
+
     /// A scene controller from its TOML config (`type = "scene_controller"`
     /// in `virtual_devices/*.toml`), as the server loads one (#10), with a
     /// line for each part of that config it can't honour, for the loader to
@@ -146,8 +194,8 @@ impl SceneController {
     /// `CreateVirtualDevice` sends:
     /// - Each `[[scenes]]` is a scene of its `name`. Its `display_name` is
     ///   kept in the config, but nothing at runtime reads it.
-    /// - Each of its `devices` is a target, in the shape the store holds
-    ///   that device in (see `toml_target`).
+    /// - Each of its `devices` is a target (see `toml_state`), in the shape
+    ///   the store holds that device in (see `in_store_shape`).
     /// - `settings.transition_duration` is every scene's transition (see
     ///   `toml_transition`): a fade over it, or instant for 0. The TOML
     ///   has no transition per scene, and no sequence.
@@ -155,11 +203,13 @@ impl SceneController {
     ///   nothing activates a default scene. Activating it on load would
     ///   switch the lights on every restart of the server.
     ///
-    /// It fails on a config that is ambiguous or can't work: two scenes of
-    /// one name, a scene named `none` or with no name (a write of either
-    /// deactivates the current scene, so it could never be activated), a
-    /// device twice in one scene, a brightness over 100, or a device the
-    /// store holds as something a scene can't set (a switch, a sensor).
+    /// Its scenes are checked as the API's are ([`Self::create`]), by the
+    /// same checks (`check_scenes`), before any is mapped. It fails on a
+    /// config that is ambiguous or can't work: two scenes of one name, a
+    /// scene named `none` or with no name (a write of either deactivates
+    /// the current scene, so it could never be activated), a device twice
+    /// in one scene, a brightness over 100, or a device the store holds as
+    /// something a scene can't set (a switch, a sensor).
     ///
     /// A device the store doesn't have is no error, as for the other
     /// virtual devices: it may be a virtual device that loads later. The
@@ -172,51 +222,31 @@ impl SceneController {
     ) -> Result<(Self, Vec<String>), VirtualDeviceError> {
         let mut warnings = Vec::new();
         let transition = toml_transition(toml.settings.transition_duration, &mut warnings);
-        if toml.scenes.is_empty() {
-            warnings.push("it has no scenes: there is nothing to activate".to_string());
-        }
+
+        let checked: Vec<SceneTargets> = toml
+            .scenes
+            .iter()
+            .map(|scene| SceneTargets {
+                name: &scene.name,
+                targets: scene
+                    .devices
+                    .iter()
+                    .map(|device| (&device.device_id, toml_state(&device.state)))
+                    .collect(),
+            })
+            .collect();
+        warnings.extend(check_scenes(&checked, &state_store).await?);
 
         let mut scenes = serde_json::Map::new();
-        for scene in &toml.scenes {
+        for (scene, checked) in toml.scenes.iter().zip(&checked) {
             let name = &scene.name;
-            if name.is_empty() || name == "none" {
-                return Err(VirtualDeviceError::Config(format!(
-                    "a scene can't be named {name:?}: activating `none` or no name deactivates the current scene"
-                )));
-            }
-            if scenes.contains_key(name) {
-                return Err(VirtualDeviceError::Config(format!(
-                    "two scenes are named {name}"
-                )));
-            }
-            if scene.devices.is_empty() {
-                warnings.push(format!(
-                    "scene {name} sets no devices: activating it only marks it active"
-                ));
-            }
-
             let mut device_states = HashMap::new();
-            for device in &scene.devices {
-                let current = state_store
-                    .get_device(&device.device_id)
-                    .await
-                    .map(|d| d.state);
-                let target = toml_target(
-                    name,
-                    &device.device_id,
-                    &device.state,
-                    current.as_ref(),
-                    &mut warnings,
-                )?;
-                if device_states
-                    .insert(device.device_id.clone(), target)
-                    .is_some()
-                {
-                    return Err(VirtualDeviceError::Config(format!(
-                        "scene {name} sets {} twice",
-                        device.device_id
-                    )));
-                }
+            for (device_id, target) in &checked.targets {
+                let current = state_store.get_device(device_id).await.map(|d| d.state);
+                device_states.insert(
+                    (*device_id).clone(),
+                    in_store_shape(target, current.as_ref()),
+                );
             }
 
             let runtime = Scene {
@@ -666,72 +696,165 @@ fn toml_transition(duration_ms: u32, warnings: &mut Vec<String>) -> TransitionTy
     }
 }
 
-/// The state TOML scene `scene` sets `device_id` to, `state`, as a scene
-/// writes it: in the shape the store holds the device in, `current`.
-///
-/// So a scene writes what the device's gateway can push, and doesn't
-/// change the kind of state the store holds for it:
-/// - A light is a light. `rgb_color` isn't in the TOML, and is unset.
-/// - An outlet is an outlet if the store holds it as one, as the dummy
-///   does, and a light that is only on or off if it holds it as a light.
-///   That is how a Dirigera hub's outlets are read, and the only kind of
-///   state its gateway writes to one.
-/// - A light the store holds as an outlet is on or off only. Its
-///   `brightness` and `color_temp` are dropped, with a warning.
-/// - A device the store holds as anything else (a switch, a sensor) fails:
-///   a scene can't set it.
-/// - A device the store doesn't have is taken at its word.
-fn toml_target(
-    scene: &str,
-    device_id: &DeviceId,
-    state: &SceneDeviceState,
-    current: Option<&DeviceStateValue>,
-    warnings: &mut Vec<String>,
-) -> Result<DeviceStateValue, VirtualDeviceError> {
-    let (is_on, brightness, color_temp) = match *state {
+/// The state a TOML scene target, `state`, sets its device to, as the TOML
+/// says it: a light, with `rgb_color` unset (the TOML has none), or an
+/// outlet. [`SceneController::from_toml`] writes it in the shape the store
+/// holds the device in (see [`in_store_shape`]).
+fn toml_state(state: &SceneDeviceState) -> DeviceStateValue {
+    match *state {
         SceneDeviceState::Light {
             is_on,
             brightness,
             color_temp,
-        } => (is_on, brightness, color_temp),
-        SceneDeviceState::Outlet { is_on } => (is_on, None, None),
+        } => DeviceStateValue::Light(LightState {
+            is_on,
+            brightness,
+            color_temp,
+            rgb_color: None,
+        }),
+        SceneDeviceState::Outlet { is_on } => DeviceStateValue::Outlet(OutletState {
+            is_on,
+            power_consumption: None,
+            total_energy: None,
+        }),
+    }
+}
+
+/// One scene of a scene controller's config, as [`check_scenes`] checks
+/// it: its name, and each device it sets with its target, in the order the
+/// config lists them, repeats and all.
+struct SceneTargets<'a> {
+    name: &'a str,
+    targets: Vec<(&'a DeviceId, DeviceStateValue)>,
+}
+
+impl<'a> SceneTargets<'a> {
+    /// `scene` of a runtime config, its devices in order of their ids.
+    fn of(scene: &'a Scene) -> Self {
+        let mut targets: Vec<(&DeviceId, DeviceStateValue)> = scene
+            .device_states
+            .iter()
+            .map(|(device_id, target)| (device_id, target.clone()))
+            .collect();
+        targets.sort_by_key(|(device_id, _)| *device_id);
+        Self {
+            name: &scene.name,
+            targets,
+        }
+    }
+}
+
+/// The checks a scene controller's scenes pass before it's created, from
+/// TOML ([`SceneController::from_toml`]) or through the API
+/// ([`SceneController::create`]), so both reject the same configs with the
+/// same messages (#64). Returns a line for each thing it only warns about.
+///
+/// It fails on a config that is ambiguous or can't work:
+/// - two scenes of one name;
+/// - a scene named `none` or with no name: a write of either deactivates
+///   the current scene, so it could never be activated;
+/// - a device twice in one scene;
+/// - a brightness over 100;
+/// - a device the store holds as something a scene can't set (a switch, a
+///   sensor), or a target that isn't a light's or an outlet's state.
+///
+/// It warns about a config with no scenes, a scene with no devices, and a
+/// light's brightness or colour for a device the store holds as an outlet:
+/// only whether it's on is set (see [`in_store_shape`]).
+///
+/// A device the store doesn't have is no error, as for the other virtual
+/// devices: it may be a virtual device that loads later.
+async fn check_scenes(
+    scenes: &[SceneTargets<'_>],
+    store: &StateStore,
+) -> Result<Vec<String>, VirtualDeviceError> {
+    let mut warnings = Vec::new();
+    if scenes.is_empty() {
+        warnings.push("it has no scenes: there is nothing to activate".to_string());
+    }
+
+    let mut names = HashSet::new();
+    for scene in scenes {
+        let name = scene.name;
+        if name.is_empty() || name == "none" {
+            return Err(VirtualDeviceError::Config(format!(
+                "a scene can't be named {name:?}: activating `none` or no name deactivates the current scene"
+            )));
+        }
+        if !names.insert(name) {
+            return Err(VirtualDeviceError::Config(format!(
+                "two scenes are named {name}"
+            )));
+        }
+        if scene.targets.is_empty() {
+            warnings.push(format!(
+                "scene {name} sets no devices: activating it only marks it active"
+            ));
+        }
+
+        let mut devices = HashSet::new();
+        for (device_id, target) in &scene.targets {
+            check_target(name, device_id, target, store, &mut warnings).await?;
+            if !devices.insert(*device_id) {
+                return Err(VirtualDeviceError::Config(format!(
+                    "scene {name} sets {device_id} twice"
+                )));
+            }
+        }
+    }
+    Ok(warnings)
+}
+
+/// [`check_scenes`] for `target`, the state scene `scene` sets `device_id`
+/// to.
+async fn check_target(
+    scene: &str,
+    device_id: &DeviceId,
+    target: &DeviceStateValue,
+    store: &StateStore,
+    warnings: &mut Vec<String>,
+) -> Result<(), VirtualDeviceError> {
+    let (brightness, names_colour) = match target {
+        DeviceStateValue::Light(light) => (
+            light.brightness,
+            light.color_temp.is_some() || light.rgb_color.is_some(),
+        ),
+        DeviceStateValue::Outlet(_) => (None, false),
+        DeviceStateValue::Empty => {
+            return Err(VirtualDeviceError::Config(format!(
+                "scene {scene} sets {device_id} to no state: a scene sets only lights and outlets"
+            )));
+        }
+        other => {
+            return Err(VirtualDeviceError::Config(format!(
+                "scene {scene} sets {device_id} to the state of a {}: a scene sets only lights and outlets",
+                state_kind(other)
+            )));
+        }
     };
     if let Some(level) = brightness.filter(|&level| level > 100) {
         return Err(VirtualDeviceError::Config(format!(
             "scene {scene} sets {device_id} to brightness {level}, over 100"
         )));
     }
-    let light = DeviceStateValue::Light(LightState {
-        is_on,
-        brightness,
-        color_temp,
-        rgb_color: None,
-    });
-    let outlet = DeviceStateValue::Outlet(OutletState {
-        is_on,
-        power_consumption: None,
-        total_energy: None,
-    });
 
-    match current {
-        Some(DeviceStateValue::Light(_)) => Ok(light),
+    match store.get_device(device_id).await.map(|device| device.state) {
+        None | Some(DeviceStateValue::Light(_)) => {}
         Some(DeviceStateValue::Outlet(_)) => {
-            if brightness.is_some() || color_temp.is_some() {
+            if brightness.is_some() || names_colour {
                 warnings.push(format!(
-                    "scene {scene}: {device_id} is an outlet, so only whether it's on is set (not its brightness or color_temp)"
+                    "scene {scene}: {device_id} is an outlet, so only whether it's on is set (not its brightness or colour)"
                 ));
             }
-            Ok(outlet)
         }
-        Some(other) => Err(VirtualDeviceError::Config(format!(
-            "scene {scene} sets {device_id}, a {}: a scene sets only lights and outlets",
-            state_kind(other)
-        ))),
-        None => Ok(match state {
-            SceneDeviceState::Light { .. } => light,
-            SceneDeviceState::Outlet { .. } => outlet,
-        }),
+        Some(other) => {
+            return Err(VirtualDeviceError::Config(format!(
+                "scene {scene} sets {device_id}, a {}: a scene sets only lights and outlets",
+                state_kind(&other)
+            )));
+        }
     }
+    Ok(())
 }
 
 /// What kind of device holds `state`, for an error message.

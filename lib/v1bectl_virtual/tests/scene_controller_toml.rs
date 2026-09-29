@@ -13,7 +13,8 @@ use v1bectl_sync::{
 };
 use v1bectl_virtual::{
     Scene, SceneController, SceneControllerConfig, TransitionType, VirtualDevice,
-    VirtualDeviceError, VirtualDeviceManager, VirtualDeviceTomlConfig, VirtualDeviceType,
+    VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceManager, VirtualDeviceTomlConfig,
+    VirtualDeviceType,
 };
 
 fn light(is_on: bool, brightness: Option<u8>, color_temp: Option<u16>) -> DeviceStateValue {
@@ -445,4 +446,221 @@ async fn an_unknown_device_is_flagged_like_the_other_kinds_do() {
         .await
         .expect_err("a scene with a device the store doesn't have");
     assert!(error.to_string().contains("ghost"), "{error}");
+}
+
+// ---------------------------------------------------------------------
+// #64: the API's scene controllers are checked by the same checks
+// ---------------------------------------------------------------------
+
+/// A scene of a runtime config, as the API's `CreateVirtualDevice` sends
+/// it: `name`, setting each of `targets`, instantly.
+fn api_scene(name: &str, targets: &[(&str, DeviceStateValue)]) -> serde_json::Value {
+    let device_states: HashMap<DeviceId, DeviceStateValue> = targets
+        .iter()
+        .map(|(id, state)| ((*id).to_string(), state.clone()))
+        .collect();
+    serde_json::to_value(Scene {
+        name: name.to_string(),
+        device_states,
+        transition_type: TransitionType::Instant,
+    })
+    .expect("a scene")
+}
+
+/// Scene controller `scenes` from a runtime config with `scenes`, each
+/// `(the name it's listed under, the scene)`, created the way the API's
+/// `CreateVirtualDevice` creates one.
+async fn create(
+    scenes: &[(&str, serde_json::Value)],
+) -> Result<(SceneController, Vec<String>), VirtualDeviceError> {
+    let scenes: serde_json::Map<String, serde_json::Value> = scenes
+        .iter()
+        .map(|(listed_as, scene)| ((*listed_as).to_string(), scene.clone()))
+        .collect();
+    let config = VirtualDeviceConfig {
+        device_id: "scenes".to_string(),
+        device_type: VirtualDeviceType::SceneController,
+        name: "Scenes".to_string(),
+        description: None,
+        enabled: true,
+        config: serde_json::json!({ "scenes": scenes }),
+    };
+    SceneController::create(config, store().await).await
+}
+
+/// The message a config that must fail failed with.
+fn rejected(
+    made: Result<(SceneController, Vec<String>), VirtualDeviceError>,
+    case: &str,
+) -> String {
+    match made {
+        Err(VirtualDeviceError::Config(message)) => message,
+        Err(e) => panic!("{case}: failed with {e}"),
+        Ok(_) => panic!("{case}: created"),
+    }
+}
+
+/// Each config the TOML path rejects, the API path rejects too, with the
+/// same message. A device twice in one scene isn't among them: the API
+/// can't express it, as a scene's devices are a map (the API decodes a
+/// request's config into one, which keeps only the last of each).
+#[tokio::test]
+async fn the_api_rejects_what_toml_rejects_with_the_same_message() {
+    let on = "{ type = \"light\", is_on = true }";
+    let lit = light(true, None, None);
+    for (case, toml, api, error) in [
+        (
+            "two scenes of one name",
+            [scene("evening", &[("lamp", on)]), scene("evening", &[])].concat(),
+            vec![
+                ("evening", api_scene("evening", &[("lamp", lit.clone())])),
+                ("evening2", api_scene("evening", &[])),
+            ],
+            "two scenes are named evening",
+        ),
+        (
+            "a scene named none",
+            scene("none", &[("lamp", on)]),
+            vec![("none", api_scene("none", &[("lamp", lit.clone())]))],
+            "can't be named \"none\"",
+        ),
+        (
+            "a scene with no name",
+            scene("", &[("lamp", on)]),
+            vec![("", api_scene("", &[("lamp", lit.clone())]))],
+            "can't be named \"\"",
+        ),
+        (
+            "a brightness over 100",
+            scene(
+                "s",
+                &[(
+                    "lamp",
+                    "{ type = \"light\", is_on = true, brightness = 101 }",
+                )],
+            ),
+            vec![(
+                "s",
+                api_scene("s", &[("lamp", light(true, Some(101), None))]),
+            )],
+            "brightness 101, over 100",
+        ),
+        (
+            "a switch",
+            scene("s", &[("remote", on)]),
+            vec![("s", api_scene("s", &[("remote", lit.clone())]))],
+            "remote, a switch",
+        ),
+        (
+            "a sensor",
+            scene("s", &[("thermo", on)]),
+            vec![("s", api_scene("s", &[("thermo", lit.clone())]))],
+            "thermo, a sensor",
+        ),
+    ] {
+        let from_toml = rejected(from_toml(&toml).await, &format!("{case}, TOML"));
+        assert!(from_toml.contains(error), "{case}: {from_toml:?}");
+        let from_api = rejected(create(&api).await, &format!("{case}, API"));
+        assert_eq!(from_api, from_toml, "{case}");
+    }
+}
+
+/// What only the API can express, and can't work, it rejects too: a scene
+/// listed under another name than its own (it would show one and answer
+/// to the other; one listed under `none` could never be activated), and a
+/// target that isn't a light's or an outlet's state.
+#[tokio::test]
+async fn the_api_rejects_what_only_it_can_express() {
+    let lit = light(true, None, None);
+    let pressed = DeviceStateValue::Switch(SwitchState {
+        is_pressed: true,
+        last_pressed: None,
+        battery_level: None,
+    });
+    for (case, api, error) in [
+        (
+            "listed under another name",
+            vec![("a", api_scene("b", &[("lamp", lit.clone())]))],
+            "scene \"a\" is named \"b\"",
+        ),
+        (
+            "listed under none",
+            vec![("none", api_scene("evening", &[("lamp", lit.clone())]))],
+            "scene \"none\" is named \"evening\"",
+        ),
+        (
+            "a switch's state",
+            vec![("s", api_scene("s", &[("lamp", pressed)]))],
+            "scene s sets lamp to the state of a switch",
+        ),
+        (
+            "no state",
+            vec![("s", api_scene("s", &[("lamp", DeviceStateValue::Empty)]))],
+            "scene s sets lamp to no state",
+        ),
+    ] {
+        let message = rejected(create(&api).await, case);
+        assert!(message.contains(error), "{case}: {message:?}");
+    }
+}
+
+/// What the TOML path only warns about, the API path warns about too, with
+/// the same lines, and creates the controller: warnings stay warnings.
+#[tokio::test]
+async fn the_api_warns_about_what_toml_warns_about() {
+    for (case, toml, api) in [
+        ("no scenes", "scenes = []\n".to_string(), vec![]),
+        (
+            "a scene with no devices",
+            scene("idle", &[]),
+            vec![("idle", api_scene("idle", &[]))],
+        ),
+        (
+            "a light's level for an outlet",
+            scene(
+                "s",
+                &[(
+                    "tv",
+                    "{ type = \"light\", is_on = true, brightness = 50, color_temp = 3000 }",
+                )],
+            ),
+            vec![(
+                "s",
+                api_scene("s", &[("tv", light(true, Some(50), Some(3000)))]),
+            )],
+        ),
+    ] {
+        let (_, from_toml) = from_toml(&toml).await.expect(case);
+        assert_eq!(from_toml.len(), 1, "{case}: {from_toml:?}");
+        let (_, from_api) = create(&api).await.expect(case);
+        assert_eq!(from_api, from_toml, "{case}");
+    }
+}
+
+/// The runtime config a TOML scene controller maps onto passes the API's
+/// checks as it is.
+#[tokio::test]
+async fn a_toml_controllers_runtime_config_passes_the_api_checks() {
+    let body = [
+        scene(
+            "evening",
+            &[
+                (
+                    "lamp",
+                    "{ type = \"light\", is_on = true, brightness = 30, color_temp = 2200 }",
+                ),
+                ("tv", "{ type = \"outlet\", is_on = false }"),
+                ("hub_outlet", "{ type = \"outlet\", is_on = true }"),
+                ("ghost", "{ type = \"light\", is_on = true }"),
+            ],
+        ),
+        scene("night", &[("lamp", "{ type = \"light\", is_on = false }")]),
+    ]
+    .concat();
+    let (controller, warnings) = from_toml(&body).await.expect("from_toml");
+    assert_eq!(warnings, Vec::<String>::new());
+    let (_, warnings) = SceneController::create(controller.config().clone(), store().await)
+        .await
+        .expect("create");
+    assert_eq!(warnings, Vec::<String>::new());
 }

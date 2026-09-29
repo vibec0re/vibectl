@@ -87,7 +87,11 @@ async fn controller(made: Made, transition_ms: u32, rig: &Rig) -> SceneControlle
                 enabled: true,
                 config: serde_json::json!({ "scenes": { SCENE: scene } }),
             };
-            SceneController::new(config, Arc::clone(&rig.store)).expect("scene controller")
+            let (controller, warnings) = SceneController::create(config, Arc::clone(&rig.store))
+                .await
+                .expect("create");
+            assert_eq!(warnings, Vec::<String>::new());
+            controller
         }
     }
 }

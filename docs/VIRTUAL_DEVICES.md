@@ -739,6 +739,18 @@ types:
   warns about each one still missing (`dangling_references`), and setting a
   scene with one fails at that device.
 
+✅ **The API checks a scene controller the same way (#64).** Its
+`CreateVirtualDevice` builds one with `SceneController::create`, which runs
+the same checks as `from_toml` (`check_scenes`), so both reject the same
+configs with the same messages; the API answers `CREATE_FAILED` with it, and
+logs the warnings. The TOML-only warnings (`default_scene`,
+`transition_duration`) have no runtime counterpart. On top of that, the API
+rejects what only it can express: a scene listed under another name than its
+own `name` (it would show one and be set by the other), and a target that
+isn't a light's or an outlet's state. Two scenes under one name, or a device
+twice in one scene, can't reach it: the request's config is decoded into
+maps, which keep only the last of each.
+
 `v1bectl_server/src/tests.rs` loads two such files
 (`v1bectl_server/tests/fixtures/virtual_devices/`) the way the server does,
 and sets their scenes against the dummy hub: an instant one and a 2 s fade.
