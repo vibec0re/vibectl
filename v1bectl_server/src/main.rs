@@ -103,11 +103,17 @@ async fn load_virtual_devices(
                         let mut resolved_members = Vec::new();
                         for pattern in &cfg.members {
                             if pattern.contains('*') {
-                                // Wildcard pattern - match all devices
+                                // Wildcard pattern - match all physical devices. Not
+                                // the virtual ones: which of those are in the store
+                                // yet depends on the order the files load in, and a
+                                // virtual member is written through its own plan
+                                // (#58). Name one to nest it.
                                 let prefix = pattern.trim_end_matches('*');
                                 let all_devices = state_store.list_devices().await;
                                 for device in all_devices {
-                                    if device.device_info.device_id.starts_with(prefix) {
+                                    if device.device_info.device_id.starts_with(prefix)
+                                        && !v1bectl_virtual::is_virtual(&device.device_info)
+                                    {
                                         // Check if not excluded
                                         let is_excluded = cfg.settings.exclude.iter().any(|ex| {
                                             if ex.contains('*') {

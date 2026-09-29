@@ -1,7 +1,7 @@
 use crate::config::{SceneControllerConfig, SceneDeviceState};
 use crate::virtual_device::{
-    DetachedPlan, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
-    VirtualWrite,
+    is_virtual, DetachedPlan, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError,
+    VirtualDeviceType, VirtualWrite,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -144,7 +144,10 @@ impl SceneController {
     /// `CreateVirtualDevice` sends it, checked the way [`Self::from_toml`]
     /// checks a TOML one, by the same checks (`check_scenes`), so both
     /// reject the same configs with the same messages (#64). With a line
-    /// for each thing it only warns about, for the caller to log.
+    /// for each thing it only warns about, for the caller to log. As there,
+    /// a target that's a virtual device is resolved when the scene is
+    /// activated, so it makes no difference whether the API created it
+    /// before the scene or after (#58).
     ///
     /// On top of those, each scene must be listed under its own `name`. A
     /// scene is activated by the name it's listed under, so one listed
@@ -195,7 +198,9 @@ impl SceneController {
     /// - Each `[[scenes]]` is a scene of its `name`. Its `display_name` is
     ///   kept in the config, but nothing at runtime reads it.
     /// - Each of its `devices` is a target (see `toml_state`), in the shape
-    ///   the store holds that device in (see `in_store_shape`).
+    ///   the store holds that device in (see `in_store_shape`), if it's a
+    ///   physical one. A target that's a virtual device is kept as the TOML
+    ///   says it, and resolved when the scene is activated (#58).
     /// - `settings.transition_duration` is every scene's transition (see
     ///   `toml_transition`): a fade over it, or instant for 0. The TOML
     ///   has no transition per scene, and no sequence.
@@ -208,14 +213,19 @@ impl SceneController {
     /// config that is ambiguous or can't work: two scenes of one name, a
     /// scene named `none` or with no name (a write of either deactivates
     /// the current scene, so it could never be activated), a device twice
-    /// in one scene, a brightness over 100, or a device the store holds as
-    /// something a scene can't set (a switch, a sensor).
+    /// in one scene, a brightness over 100, or a physical device the store
+    /// holds as something a scene can't set (a switch, a sensor).
     ///
     /// A device the store doesn't have is no error, as for the other
     /// virtual devices: it may be a virtual device that loads later. The
     /// manager warns about each one still missing once all are loaded (see
     /// [`crate::VirtualDeviceManager::dangling_references`]), and activating
-    /// a scene that sets one fails at it.
+    /// a scene that sets one fails at it. A virtual device that's already
+    /// loaded counts the same (see `physical_state`), so the files' load
+    /// order changes nothing: a scene that sets a light group works
+    /// whichever loads first, and one that sets something only a light can
+    /// be set to, but isn't a light (another scene controller), fails when
+    /// it's activated, with nothing committed (#58).
     pub async fn from_toml(
         toml: &SceneControllerConfig,
         state_store: Arc<StateStore>,
@@ -242,7 +252,7 @@ impl SceneController {
             let name = &scene.name;
             let mut device_states = HashMap::new();
             for (device_id, target) in &checked.targets {
-                let current = state_store.get_device(device_id).await.map(|d| d.state);
+                let current = physical_state(&state_store, device_id).await;
                 device_states.insert(
                     (*device_id).clone(),
                     in_store_shape(target, current.as_ref()),
@@ -794,15 +804,20 @@ impl<'a> SceneTargets<'a> {
 ///   the current scene, so it could never be activated;
 /// - a device twice in one scene;
 /// - a brightness over 100;
-/// - a device the store holds as something a scene can't set (a switch, a
-///   sensor), or a target that isn't a light's or an outlet's state.
+/// - a physical device the store holds as something a scene can't set (a
+///   switch, a sensor), or a target that isn't a light's or an outlet's
+///   state.
 ///
 /// It warns about a config with no scenes, a scene with no devices, and a
-/// light's brightness or colour for a device the store holds as an outlet:
-/// only whether it's on is set (see [`in_store_shape`]).
+/// light's brightness or colour for a physical device the store holds as an
+/// outlet: only whether it's on is set (see [`in_store_shape`]).
 ///
 /// A device the store doesn't have is no error, as for the other virtual
-/// devices: it may be a virtual device that loads later.
+/// devices: it may be a virtual device that loads later. A virtual device
+/// the store already has counts as one it doesn't (see [`physical_state`]):
+/// whether the store has it depends on whether it was loaded, or created
+/// through the API, before the scene or after. It's resolved when the scene
+/// is activated (#58).
 async fn check_scenes(
     scenes: &[SceneTargets<'_>],
     store: &StateStore,
@@ -877,7 +892,7 @@ async fn check_target(
         )));
     }
 
-    match store.get_device(device_id).await.map(|device| device.state) {
+    match physical_state(store, device_id).await {
         None | Some(DeviceStateValue::Light(_)) => {}
         Some(DeviceStateValue::Outlet(_)) => {
             if brightness.is_some() || names_colour {
@@ -894,6 +909,23 @@ async fn check_target(
         }
     }
     Ok(())
+}
+
+/// The state the store holds for `device_id`, if it's a physical device's.
+/// That's all a scene's checks ([`check_target`]) and its TOML mapping
+/// ([`SceneController::from_toml`]) go by. A virtual device (a light group,
+/// another controller) counts as one the store doesn't have: it's resolved
+/// when the scene is activated, where the manager writes it through its own
+/// plan (#58). The virtual devices load from `virtual_devices/*.toml` in
+/// whatever order the files come in, so going by the ones already loaded
+/// would accept a scene or reject it, and shape its targets, by that order
+/// (#63 review, finding 2).
+async fn physical_state(store: &StateStore, device_id: &DeviceId) -> Option<DeviceStateValue> {
+    store
+        .get_device(device_id)
+        .await
+        .filter(|device| !is_virtual(&device.device_info))
+        .map(|device| device.state)
 }
 
 /// What kind of device holds `state`, for an error message.
