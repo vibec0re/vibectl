@@ -29,8 +29,9 @@ trait VirtualDevice: Send + Sync {
     // its lock. Default: None (plan with `plan_write`, under the lock).
     fn plan_write_detached(&self, new_state: &DeviceStateValue) -> Option<DetachedPlan> { None }
 
-    // Every device a write of `new_state` may write: the manager locks them
-    // (and this device) for the write's whole duration. Default: outputs.
+    // Every device a write of `new_state` may write: the manager queues the
+    // write on them (and this device) for its whole duration. Default:
+    // outputs. Must not list too few (a debug build asserts it).
     fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> { self.output_devices() }
 
     // The manager committed every member write of a plan: take its state.
@@ -122,28 +123,44 @@ plan from `plan_write_detached`, as a future that owns its scene and the
 store, so the manager runs it **without** its `virtual_devices` lock and
 takes that lock only to commit where the transition ends.
 
-What keeps writes in order is a 🔐 **lock per device**. Every manager write
-(a group write, a scene activation, a button action, a removal) takes the
-locks of the devices it writes, its own and every member's
-(`writes_to`), before it plans and until it has committed, a fade's delays
-included. So:
+What keeps writes in order is a 🚦 **write queue**. Every manager write (a
+group write, a scene activation, a button action, an add or a removal) joins
+it in the order it asks, with the devices it writes: its own and every
+member's (`writes_to`). It goes once every write that joined before it and
+shares a device with it is over, **whether that one is running or still
+waiting itself**, and it stays in the queue until it has committed, a
+fade's delays included. So:
 
 - **A write that overlaps a transition** (it shares a light with it, or it's
   to the same scene controller) waits for the transition's commit, and lands
   after it. The newest write ends up showing, exactly as when every write
   queued on the manager's lock: an "all off" pressed 3 s into a 10 s sunset
   fade turns the lights off once the fade has committed, and they stay off.
-- **A write that doesn't overlap** goes ahead at once. A one-second fade no
-  longer holds up every other virtual write, input tracking and button press
-  for its whole second. 🔓
+- **Writes that overlap each other land in the order they asked**, even
+  through a write that's still waiting. Press "all on" (a big group, which
+  waits for the fade), then switch one of its lamps off: the lamp switches
+  off after "all on", and stays off.
+- **A write that overlaps nothing in flight** goes ahead at once. A
+  one-second fade no longer holds up every other virtual write for its whole
+  second. 🔓
+- **A write dropped part-way** (a client that went away) leaves the queue at
+  once, commits nothing, and never holds up the writes behind it.
 - A direct write to a light through the API never went through the manager,
   so it lands at once, and a fade over that light overwrites it when it
   commits, as it always did.
 
-The locks are taken in one order (sorted by device id), all before the
-`virtual_devices` lock, and nothing waits for one while it holds that lock,
-so writes can't deadlock. Idle locks are dropped, so the map only holds the
-devices being written right now.
+A write waits only for writes that asked before it, and it waits before it
+takes the `virtual_devices` lock, which nothing holds while it waits in the
+queue. So writes can't deadlock. The queue only ever holds the writes in
+flight: each one leaves it when it's over, however it ends. If a device a
+waiting write names was added or removed ahead of it, the write joins again
+at the back with the devices as they are now.
+
+Input tracking and resync don't queue, so they don't wait for a fade
+themselves. But tracking runs a button press's actions in turn, and a press
+that overlaps a fade waits for it. Until the fade commits, the presses and
+group re-derivations behind that press wait too. That's how it was before
+#58, when tracking waited for every fade.
 
 Cancelling a fade when a newer write to its lights comes in, instead of
 making that write wait, would be a possible later improvement. It changes
@@ -309,7 +326,7 @@ impl VirtualDevice for SceneController {
         }))
     }
 
-    // 🔐 Only the asked-for scene's lights: a write to a light of another
+    // 🚦 Only the asked-for scene's lights: a write to a light of another
     // scene of this controller doesn't wait for this one's fade
     fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
         match new_state {
