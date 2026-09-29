@@ -8,6 +8,7 @@ pub mod light_group_linear; // 🔥 LINEAR BRIGHTNESS MAPPING! 💖
 pub mod manager;
 pub mod scene_controller;
 pub mod virtual_device; // 🔥 TOML CONFIG SUPPORT! 💖
+mod write_queue; // 🚦 THE MANAGER'S WRITE QUEUE (#58)
 
 pub use button_controller::*;
 pub use config::*;

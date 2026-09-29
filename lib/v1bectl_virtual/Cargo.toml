@@ -23,6 +23,9 @@ toml = "0.8"  # 🔥 FOR PARSING VIRTUAL DEVICE CONFIGS! 💖
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
+# ⏱️ A paused clock (`tokio::time::pause`) for the scene transition tests:
+# a fade's delays pass in virtual time, exactly and at once.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

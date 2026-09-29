@@ -2,6 +2,8 @@ use crate::button_controller::ButtonAction;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use v1bectl_sync::{
     Capability, DeviceEvent, DeviceId, DeviceInfo, DeviceState, DeviceStateValue, DeviceType,
     StateError,
@@ -53,6 +55,12 @@ pub struct VirtualWrite {
     pub state: DeviceStateValue,
 }
 
+/// A write's plan that owns everything it needs, so it runs without
+/// borrowing its device, and so without the manager's lock (see
+/// [`VirtualDevice::plan_write_detached`]).
+pub type DetachedPlan =
+    Pin<Box<dyn Future<Output = Result<VirtualWrite, VirtualDeviceError>> + Send>>;
+
 /// Core trait for all virtual devices - VIBEC0RE MAGIC! 🔥
 #[async_trait]
 pub trait VirtualDevice: Send + Sync {
@@ -80,6 +88,50 @@ pub trait VirtualDevice: Send + Sync {
         &self,
         new_state: DeviceStateValue,
     ) -> Result<VirtualWrite, VirtualDeviceError>;
+
+    /// [`Self::plan_write`], for a write whose plan takes time: a scene's
+    /// fade or sequence, which waits between its steps. It comes as a
+    /// future that owns what it needs, so the manager runs it without its
+    /// `virtual_devices` lock, and takes that lock only to commit the
+    /// [`VirtualWrite`] it ends with (#58). So a transition doesn't hold up
+    /// the virtual writes it has nothing to do with, input tracking, resync
+    /// or button presses while it waits. A write that shares a device with
+    /// it (see [`Self::writes_to`]) still waits for its commit, as before:
+    /// see `VirtualDeviceManager::set_virtual_device_state`.
+    ///
+    /// Only the call itself sees the device (under the manager's lock). The
+    /// plan it returns runs later, when the device may have changed, so it
+    /// must not depend on the device's state: a scene's transition depends
+    /// only on its scene and the store.
+    ///
+    /// The default, `None`, is for a write whose plan is quick. The manager
+    /// then plans it with [`Self::plan_write`] and commits it under one
+    /// hold of its lock, so no other write lands in between. A group needs
+    /// that: its plan starts from its own state (a plain `on` restores its
+    /// level, #16).
+    fn plan_write_detached(&self, new_state: &DeviceStateValue) -> Option<DetachedPlan> {
+        let _ = new_state;
+        None
+    }
+
+    /// The devices a write of `new_state` to this device can write: every
+    /// member its plan may list. The manager queues the write on them, and
+    /// on this device, from before it plans the write to after it commits
+    /// it, a scene's delays included (#58). So a write that shares any of
+    /// them with one in flight waits for it, and one that shares none
+    /// doesn't.
+    ///
+    /// It may list more than the write needs, which only serializes more.
+    /// It must not list less: a debug build asserts that a plan stays
+    /// within it. The default is [`Self::output_devices`]: a group writes
+    /// its members. A scene controller writes only the devices of the
+    /// scene it's asked for. (A button action queues on its target's
+    /// [`Self::output_devices`] instead, since the state it writes isn't
+    /// known until its turn comes. So list nothing outside those.)
+    fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
+        let _ = new_state;
+        self.output_devices()
+    }
 
     /// Take `state`, the [`VirtualWrite::state`] of a write this device
     /// planned ([`Self::plan_write`]), now that the manager has committed
