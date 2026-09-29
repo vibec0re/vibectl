@@ -153,8 +153,12 @@ A write waits only for writes that asked before it, and it waits before it
 takes the `virtual_devices` lock, which nothing holds while it waits in the
 queue. So writes can't deadlock. The queue only ever holds the writes in
 flight: each one leaves it when it's over, however it ends. If a device a
-waiting write names was added or removed ahead of it, the write joins again
-at the back with the devices as they are now.
+waiting write names was *replaced* ahead of it (removed and re-added under
+the same id, as a config reload does — a removal alone only drops devices
+from what a write names, already covered, so it never forces this), the
+write joins again at the back with the devices as they are now. It loses its
+place, even on a device it already held, so an older write can end up
+landing last; keeping its place would risk a deadlock instead.
 
 Input tracking and resync don't queue, so they don't wait for a fade
 themselves. But tracking runs a button press's actions in turn, and a press
@@ -517,54 +521,146 @@ manager commits them. It never writes a light, or the store, itself. 🛡️
 
 ## Configuration System
 
-### Virtual Device Definition Format
-```rust
-#[derive(Serialize, Deserialize)]
-struct VirtualDeviceConfig {
-    device_id: DeviceId,
-    device_type: VirtualDeviceType,
-    name: String,
-    description: Option<String>,
-    enabled: bool,
-    config: serde_json::Value, // Type-specific configuration
-}
+The server loads every `*.toml` file under `virtual_devices/` at startup
+(`v1bectl_virtual::load_virtual_devices_from_dir`, in
+`lib/v1bectl_virtual/src/config.rs`): each file holds one
+`VirtualDeviceTomlConfig`, tagged by its `type` field. A file that fails to
+parse is logged and skipped; the rest still load. Parsing a file is only
+half the story — building the registered device from it is
+`v1bectl_server`'s job, one `match` arm per `type`
+(`v1bectl_server/src/main.rs`), and the notes below say where that arm falls
+short of what the file says.
 
-// Example configurations
-// Light Group
-{
-  "device_id": "living_room_group",
-  "device_type": "LightGroup",
-  "name": "Living Room Lights",
-  "enabled": true,
-  "config": {
-    "lights": ["light_1", "light_2", "light_3"],
-    "brightness_curves": {
-      "light_1": {"breakpoints": [[0, 0], [25, 50], [100, 100]]},
-      "light_2": {"breakpoints": [[0, 0], [25, 0], [50, 100]]},
-      "light_3": {"breakpoints": [[0, 0], [75, 0], [100, 100]]}
-    }
-  }
-}
+Four `type`s exist today (`config.rs`):
 
-// Scene Controller
-{
-  "device_id": "evening_scene",
-  "device_type": "SceneController", 
-  "name": "Evening Scene",
-  "enabled": true,
-  "config": {
-    "scenes": {
-      "cozy": {
-        "device_states": {
-          "light_1": {"is_on": true, "brightness": 30, "color_temp": 2700},
-          "light_2": {"is_on": false}
-        },
-        "transition_type": {"Fade": {"duration": "2s"}}
-      }
-    }
-  }
-}
+### `light_group_linear`
+
+A 1:1 mapping from a group level to each member's own range. This is the
+type the shipped example uses (`virtual_devices/bedroom_lights.toml`):
+
+```toml
+type = "light_group_linear"
+device_id = "virtual_bedroom_lights"
+name = "Bedroom Lights"
+
+[members]
+top = "light_bedroom"
+main = "light_living_room"
+bed = "light_kitchen"
+
+# name -> [min, max]: the group's 0..100 maps onto this member's range.
+[brightness]
+top = [80, 100]
+main = [40, 90]
+bed = [0, 50]
+
+[settings]
+transition_time = 200
 ```
+
+`members` maps a name to a device id, and `brightness` maps the same name to
+its `[min, max]` range (`LightGroupLinearConfig`). `settings.transition_time`
+(ms) defaults to 500 if left out. This type is fully wired: `v1bectl_server`
+builds a `LightGroupLinear` straight from `members` and `brightness`
+(`lib/v1bectl_virtual/tests/dummy_scenario.rs` drives the shipped file
+against the dummy hub).
+
+### `button_controller`
+
+Binds one physical button to actions on a light or group. The shipped
+example (`virtual_devices/button_ctrl.toml`):
+
+```toml
+type = "button_controller"
+device_id = "ctrl_lightgroup_bed"
+name = "Bedroom Lights Controller"
+button = "switch_hallway"
+
+# [command, target, amount]: toggle, on, off, inc, dec, set.
+press_on = ["toggle", "virtual_bedroom_lights"]
+press_double = ["set", "virtual_bedroom_lights", 100]
+press_on_long = ["inc", "virtual_bedroom_lights", 10]
+```
+
+`press_off` defaults to `[]` (nothing on release, as a toggle needs it);
+`press_off_long` and `press_double` are optional too
+(`ButtonControllerConfig`). Also fully wired, and driven against the dummy
+hub the same way.
+
+### `light_group`
+
+The curve-based group type (`LightGroupConfig`):
+
+```toml
+type = "light_group"
+device_id = "living_room_lights"
+name = "Living Room Lights"
+members = ["light_1", "light_2", "light_3"]
+
+[brightness_curves.light_1]
+min = 0
+max = 100
+
+[brightness_curves.light_2]
+min = 20
+max = 90
+
+[settings]
+aggregation = "average"   # average, min, max or any
+transition_time = 500
+exclude = []
+```
+
+A member may end in `*` to match every device id with that prefix;
+`settings.exclude` (patterns or plain ids) then drops any of those back out
+before the group is built. As of this writing, though, `v1bectl_server` only
+forwards the resolved `members` to the `LightGroup` it builds: it derives its
+own 1:1 brightness curves for each member rather than using
+`brightness_curves` from the file, and doesn't forward `settings` at all
+(beyond using `exclude` for the wildcard match itself). Prefer
+`light_group_linear` above for curves that actually take effect.
+
+### `scene_controller`
+
+Named scenes of device states, each with its own transition
+(`SceneControllerConfig`):
+
+```toml
+type = "scene_controller"
+device_id = "evening_scene"
+name = "Evening Scene"
+
+[[scenes]]
+name = "cozy"
+display_name = "Cozy"
+
+[[scenes.devices]]
+device_id = "light_1"
+[scenes.devices.state]
+type = "light"
+is_on = true
+brightness = 30
+color_temp = 2700
+
+[[scenes.devices]]
+device_id = "outlet_1"
+[scenes.devices.state]
+type = "outlet"
+is_on = true
+
+[settings]
+transition_duration = 2000
+default_scene = "cozy"
+```
+
+Each scene device has a `device_id` and a tagged `state`: `type = "light"`
+(`is_on`, optional `brightness`, optional `color_temp`) or `type = "outlet"`
+(`is_on`). The loader parses this shape fine, but `v1bectl_server` doesn't
+build a `SceneController` from it yet — that `match` arm is still a TODO
+("Scene controllers not yet implemented!" in
+`v1bectl_server/src/main.rs`). The `SceneController` type itself, and its
+fade and sequence transitions, are real and tested (see 🚦 above); only the
+TOML wiring for it is missing.
 
 ## API Integration
 
