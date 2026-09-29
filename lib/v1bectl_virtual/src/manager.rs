@@ -638,7 +638,8 @@ impl VirtualDeviceManager {
             if virtual_device.accounts_for(device_id, &input.state) {
                 // The input is where this device's own state puts it: the
                 // echo of its own write, or a change it already reflects.
-                // Re-deriving anyway is lossy (linear ranges).
+                // Re-deriving anyway gains nothing, and a lossy re-derive
+                // would move the device (see `accounts_for`).
                 continue;
             }
 

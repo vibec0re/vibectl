@@ -116,10 +116,12 @@ pub(crate) fn resolve_write(current: &LightState, asked: LightState) -> LightSta
     }
 }
 
-/// Re-derive the group state `group` from `on_levels`, the levels of its
-/// members that are on: on if any of them is lit, at the average level of
-/// those that are. With none lit it only goes off and keeps its level
-/// (#16). Re-deriving it to 0 would make the next plain `on` light nothing.
+/// Re-derive the group state `group` from `on_levels`, a level for each of
+/// its members that's on: the group level its range or curve inverts its
+/// own level to ([`invert`], #10, #66). On if any of them is lit, at the
+/// average of those levels. With none lit it only goes off and keeps its
+/// level (#16). Re-deriving it to 0 would make the next plain `on` light
+/// nothing.
 ///
 /// A member that's on at level 0 isn't lit (#34 review, nit 3). The TUI's
 /// `-` can leave a light there. Counting it made a group whose members were

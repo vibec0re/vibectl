@@ -165,15 +165,21 @@ pub trait VirtualDevice: Send + Sync {
     /// The manager then skips [`Self::on_input_changed`] for it.
     ///
     /// This is how a group tells the echo of its own write from a real
-    /// outside change. It matters because re-deriving a group from its
-    /// members can be lossy (a linear group set to 50 reads back as 60).
+    /// outside change. Both light group types read back the level they were
+    /// set to from members their own write put where they are: each member
+    /// counts at the group level its range or curve inverts its level to
+    /// (#10, #66). So for them the skip mostly saves a re-derive. It still
+    /// matters for a device whose re-derive is lossy, and for a light group
+    /// set to a level so low that its fan-out lights none of its members:
+    /// re-derived from them, it would go off.
     ///
-    /// After a re-derive, a group's state is usually one its members don't
-    /// hold (an average), so it accounts for none of them. Every later
-    /// event of a member then re-derives it again, until a write fans a
-    /// state out to them. That's harmless: the members haven't moved, so
-    /// the re-derive lands on the same state, and the manager echoes nothing
-    /// for an unchanged one (#22 re-review: a 50-event storm, no echo).
+    /// After a re-derive, a group's state is usually one that doesn't put
+    /// every member where it is (one was dimmed at the wall), so it doesn't
+    /// account for all of them. Every later event of such a member then
+    /// re-derives it again, until a write fans a state out to them. That's
+    /// harmless: the members haven't moved, so the re-derive lands on the
+    /// same state, and the manager echoes nothing for an unchanged one (#22
+    /// re-review: a 50-event storm, no echo).
     ///
     /// The default, `false`, re-derives on every input change.
     fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
