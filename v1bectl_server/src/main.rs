@@ -188,13 +188,14 @@ async fn load_virtual_devices(
                         }
 
                         // ⚠️ SETTINGS LightGroup CAN'T HONOUR — NO SILENT DROPS (#62)!
-                        // It always averages the levels of the members that are on
+                        // It averages over the members that are on (each at
+                        // the group level its curve inverts it to)
                         // (`re_derive`), and writes them instantly: `aggregation`
                         // only matches that when it's left at its default, and
                         // `transition_time` never does.
                         if cfg.settings.aggregation != "average" {
                             warn!(
-                                "⚠️ Light group {}: settings.aggregation = {:?} isn't applied — LightGroup always averages the levels of the members that are on",
+                                "⚠️ Light group {}: settings.aggregation = {:?} isn't applied — LightGroup averages over the members that are on (each at the group level its curve inverts it to)",
                                 cfg.device_id, cfg.settings.aggregation
                             );
                         }

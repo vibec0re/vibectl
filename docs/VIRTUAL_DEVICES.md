@@ -433,6 +433,26 @@ dimming the first to 20 reads (20 + 50 + 50) / 3 = 40 (the raw average read
 36). `lib/v1bectl_virtual/tests/light_group_levels.rs` drives that case end
 to end, and `linear_group_levels.rs` the shipped Bedroom Lights.
 
+**A falling curve** (`min > max` in the TOML, or a curve whose breakpoints
+simply go down) moves the group the *other* way when that member is turned
+up at the wall. `min = 80, max = 20` becomes the breakpoints `[[0, 80],
+[100, 20]]`: group 0 puts the member at 80, group 100 at 20. A group at 30
+puts it at 62; turning that member up at the wall, to 74, reads the group
+*down* to 10, not up, because the curve inverts a higher device level to a
+lower group one. Nothing else changes: it's still the level whose fan-out
+puts the member where it now is (#71).
+
+**After a restart**, a dip or plateau curve reads back the *highest* group
+level that fits the members' current brightness, not necessarily the one
+that put them there. Nothing survives a restart to tell the candidate
+levels apart (#16's start-at-100 default is all a freshly-loaded group has
+to invert towards), and the highest candidate is the one nearest it. The
+dip `[[0, 100], [50, 20], [100, 100]]` set to 30 puts its member at 52,
+which is also where group 70 would put it (the curve dips to 20 at 50, then
+climbs back through 52 on its way to 100 for groups above that). After a
+restart, the group starts on that member at 52 and reads 70, not the 30 it
+was set to (#71).
+
 ### 2. Scene Controller
 **Purpose**: Activate predefined multi-device scenes with smooth transitions
 
@@ -453,7 +473,8 @@ struct Scene {
 enum TransitionType {
     Instant,
     Fade { duration_ms: u64 },        // in 100 ms steps
-    Sequence { delays_ms: Vec<u64> }, // the i-th delay before the i-th device
+    Sequence { delays_ms: Vec<u64> }, // the i-th delay before the i-th device,
+                                       // devices sorted by device id (#58)
 }
 
 impl VirtualDevice for SceneController {
@@ -547,7 +568,13 @@ async fn plan_transition(store: &StateStore, scene: &Scene) -> Vec<(DeviceId, De
             }
         }
         TransitionType::Sequence { delays_ms } => {
-            for (i, (device_id, target)) in scene.device_states.iter().enumerate() {
+            // The i-th delay pairs with the i-th device of `scene.targets()`
+            // (#58): sorted by device id, not the order it was declared in.
+            // `device_states` is a `HashMap`, whose own order isn't kept
+            // (TOML can't express a sequence, and the API's JSON object
+            // decodes into a map), so device id order is the only one a
+            // sequence can rely on.
+            for (i, (device_id, target)) in scene.targets().into_iter().enumerate() {
                 if let Some(delay_ms) = delays_ms.get(i) {
                     tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
                 }
