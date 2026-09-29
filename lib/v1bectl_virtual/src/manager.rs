@@ -1,6 +1,7 @@
 use crate::button_controller::ButtonAction;
 use crate::virtual_device::{
-    VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
+    is_virtual, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
+    VirtualWrite,
 };
 use crate::write_queue::{WriteQueue, WriteTurn};
 use std::collections::{HashMap, HashSet};
@@ -29,6 +30,12 @@ use v1bectl_sync::{
 /// doesn't hold up what it has nothing to do with. A write that shares a
 /// device with it still waits for it, through the write queue every write
 /// joins first (see [`Self::set_virtual_device_state`]).
+///
+/// A member of a write can be a virtual device itself: a scene that sets a
+/// light group, a group in a group, a button action on a group of groups.
+/// The write then fans out through that member's own plan, down to its
+/// physical members, in the same hold of the lock (#58, see
+/// [`Self::set_virtual_device_state`]).
 pub struct VirtualDeviceManager {
     /// All virtual devices indexed by device ID
     virtual_devices: Arc<RwLock<HashMap<DeviceId, Box<dyn VirtualDevice>>>>,
@@ -82,6 +89,56 @@ fn state_event(
     }
 }
 
+/// How many levels of virtual devices a write fans out through, below the
+/// device it's to (#58): a scene (the device written) that sets a group of
+/// groups reaches the outer group at level 1 and the inner ones at level 2.
+/// A write that would go deeper fails before anything is committed
+/// ([`VirtualDeviceError::TooDeep`]). A cycle is caught at any depth
+/// ([`VirtualDeviceError::Cycle`]).
+pub const MAX_NESTING: usize = 4;
+
+/// A write planned all the way down through its virtual members (see
+/// [`VirtualDeviceManager::expand`]): one plan in which each device the
+/// write reaches appears once, with the one state it's written to.
+struct Expansion {
+    /// The device written.
+    root: DeviceId,
+    /// Each virtual device the write reaches, the device written included.
+    planned: HashMap<DeviceId, Planned>,
+    /// The physical writes, each device once, in the order they're
+    /// committed.
+    physical: Vec<(DeviceId, DeviceStateValue)>,
+    /// The virtual devices, in the order they take their new states: each
+    /// after every virtual device its plan lists. The device written is
+    /// last.
+    order: Vec<DeviceId>,
+}
+
+/// A virtual device's part of an [`Expansion`].
+struct Planned {
+    /// Its own state, once the members it writes are committed.
+    state: DeviceStateValue,
+    /// The members its plan lists, each once, in the plan's order.
+    members: Vec<DeviceId>,
+    /// Those of them a more direct path of the write sets instead (see
+    /// [`VirtualDeviceManager::expand`]): this device's plan doesn't write
+    /// them.
+    overridden: Vec<DeviceId>,
+    /// The device whose plan set it: `None` for the device written.
+    parent: Option<DeviceId>,
+}
+
+impl Expansion {
+    /// Every device it writes, at every level. (Not the device written.)
+    fn writes(&self) -> Vec<&DeviceId> {
+        self.planned
+            .keys()
+            .filter(|id| **id != self.root)
+            .chain(self.physical.iter().map(|(id, _)| id))
+            .collect()
+    }
+}
+
 fn warn_dangling(virtual_id: &DeviceId, device_id: &DeviceId) {
     tracing::warn!(
         "⚠️ Virtual device {} references unknown device {}",
@@ -127,26 +184,28 @@ impl VirtualDeviceManager {
 
     /// Store `state` as virtual device `device_id`'s and echo it. If the
     /// store already holds exactly that, do neither, unless `even_unchanged`.
+    /// Returns whether the store held something else before.
     async fn store_state(
         &self,
         device_id: &DeviceId,
         state: DeviceStateValue,
         even_unchanged: bool,
-    ) -> Result<(), StateError> {
+    ) -> Result<bool, StateError> {
         let old_state = self
             .state_store
             .get_device(device_id)
             .await
             .map(|d| d.state);
-        if !even_unchanged && old_state.as_ref() == Some(&state) {
-            return Ok(());
+        let moved = old_state.as_ref() != Some(&state);
+        if !even_unchanged && !moved {
+            return Ok(false);
         }
         self.state_store
             .update_device_state(device_id, state.clone())
             .await?;
         self.publish_state(device_id, old_state.as_ref(), &state)
             .await;
-        Ok(())
+        Ok(moved)
     }
 
     /// Queue a write on the devices `keys` names (see
@@ -193,48 +252,120 @@ impl VirtualDeviceManager {
         }
     }
 
-    /// The devices a write of `new_state` to `device_id` queues on: itself,
-    /// and every member it may write ([`VirtualDevice::writes_to`]).
+    /// The devices a write to `device_id` queues on: itself, every member
+    /// it may write, and every device it may reach through those that are
+    /// virtual, all the way down (#58). `devices` is what the
+    /// `virtual_devices` lock guards.
+    ///
+    /// - The members of `device_id` itself: [`VirtualDevice::writes_to`]
+    ///   for `new_state`, or its [`VirtualDevice::output_devices`] if the
+    ///   state isn't known until the write's turn comes (a button action).
+    /// - The members of a virtual member: its
+    ///   [`VirtualDevice::output_devices`], since the state it's given isn't
+    ///   known until its parent plans the write. The same for theirs.
+    ///
+    /// So a write joins the queue with its whole transitive device set up
+    /// front, every virtual device and every physical light it can touch
+    /// through them. That's what keeps two writes that overlap anywhere in
+    /// the expansion in the order they asked: a scene that sets a group
+    /// waits for a fade of one of the group's lights, and a later write to
+    /// that light alone waits for the scene. A cycle only ends the walk
+    /// here (each device is listed once); the write itself fails on it
+    /// (see [`Self::expand`]).
     fn write_keys(
         devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
         device_id: &DeviceId,
-        new_state: &DeviceStateValue,
+        new_state: Option<&DeviceStateValue>,
     ) -> Vec<DeviceId> {
-        let mut keys = devices
+        let mut keys = vec![device_id.clone()];
+        let mut seen: HashSet<DeviceId> = keys.iter().cloned().collect();
+        let mut next = devices
             .get(device_id)
-            .map(|device| device.writes_to(new_state))
+            .map(|device| match new_state {
+                Some(state) => device.writes_to(state),
+                None => device.output_devices(),
+            })
             .unwrap_or_default();
-        keys.push(device_id.clone());
+        while let Some(id) = next.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if let Some(member) = devices.get(&id) {
+                next.extend(member.output_devices());
+            }
+            keys.push(id);
+        }
         keys
     }
 
-    /// Commit one member write of a virtual write, or a button action's
-    /// write to a light: `new_state` for `member_id`, which the store holds
-    /// as `old_state`. Nothing has written it anywhere yet (#55).
+    /// If registering `device_id` with `outputs` would make the virtual
+    /// devices in `devices` nest in a cycle, that cycle: the path from
+    /// `device_id`, through members, back to it. `devices` is what the
+    /// `virtual_devices` lock guards. A device of that id already in it is
+    /// the one being replaced, so its own outputs don't count.
+    fn cycle_through(
+        devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        device_id: &DeviceId,
+        outputs: &[DeviceId],
+    ) -> Option<Vec<DeviceId>> {
+        fn leads_back(
+            devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
+            device_id: &DeviceId,
+            id: &DeviceId,
+            path: &mut Vec<DeviceId>,
+            seen: &mut HashSet<DeviceId>,
+        ) -> bool {
+            path.push(id.clone());
+            if id == device_id {
+                return true;
+            }
+            if seen.insert(id.clone()) {
+                let outputs = devices.get(id).map(|d| d.output_devices());
+                for output in outputs.iter().flatten() {
+                    if leads_back(devices, device_id, output, path, seen) {
+                        return true;
+                    }
+                }
+            }
+            path.pop();
+            false
+        }
+
+        let mut path = vec![device_id.clone()];
+        let mut seen = HashSet::new();
+        outputs
+            .iter()
+            .any(|output| leads_back(devices, device_id, output, &mut path, &mut seen))
+            .then_some(path)
+    }
+
+    /// Commit one physical member write of a virtual write, or a button
+    /// action's write to a light: `new_state` for `member_id`, which the
+    /// store holds as `old_state`. Nothing has written it anywhere yet
+    /// (#55). (A virtual member isn't written here: it's written through
+    /// its own plan, see [`Self::expand`].)
     ///
-    /// A physical member goes through the sync engine when one is attached,
-    /// the way a direct write to it does. That arms the member's protection
-    /// window and queues the gateway push before anything changes the store.
-    /// So no pull can find the store ahead of the hub with nothing pending,
-    /// take that for an outside change and revert it (`GatewayWins`). With
+    /// It goes through the sync engine when one is attached, the way a
+    /// direct write to it does. That arms the member's protection window
+    /// and queues the gateway push before anything changes the store. So no
+    /// pull can find the store ahead of the hub with nothing pending, take
+    /// that for an outside change and revert it (`GatewayWins`). With
     /// optimistic updates on (the default) the engine also writes the store
     /// and publishes the echo, so it is the member's only writer and
     /// publisher.
     ///
-    /// Otherwise the store write and the echo are ours: with no engine, for
-    /// a virtual member (the gateway doesn't know it), and with optimistic
-    /// updates off. In that mode a direct write is echoed once a pull
-    /// confirms it. But a virtual write puts its members in the store right
-    /// away, as it always has (after the engine armed the window), so that
-    /// pull finds nothing new and would never echo it.
+    /// Otherwise the store write and the echo are ours: with no engine, and
+    /// with optimistic updates off. In that mode a direct write is echoed
+    /// once a pull confirms it. But a virtual write puts its members in the
+    /// store right away, as it always has (after the engine armed the
+    /// window), so that pull finds nothing new and would never echo it.
     async fn commit_member_write(
         &self,
         member_id: &DeviceId,
         old_state: &DeviceStateValue,
         new_state: &DeviceStateValue,
-        member_is_virtual: bool,
     ) -> Result<(), VirtualDeviceError> {
-        if let (Some(engine), false) = (self.sync_engine.get(), member_is_virtual) {
+        if let Some(engine) = self.sync_engine.get() {
             if let Err(e) = engine
                 .apply_optimistic_update(member_id, new_state.clone())
                 .await
@@ -263,22 +394,9 @@ impl VirtualDeviceManager {
         Ok(())
     }
 
-    /// Commit `members`, the member writes of a virtual write, in order,
-    /// each through [`Self::commit_member_write`]. `devices` is what the
-    /// `virtual_devices` lock guards, which the caller holds: a member in
-    /// it is virtual.
-    ///
-    /// A member listed more than once is committed once, where it first
-    /// comes, at the last state it's listed with. One the write leaves as
-    /// it is has nothing to push or echo, and is skipped. The first that
-    /// fails, such as a member the store doesn't have (#2), ends the write:
-    /// the ones before it stay committed, and the ones after it are never
-    /// made.
-    async fn commit_members(
-        &self,
-        devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
-        members: Vec<(DeviceId, DeviceStateValue)>,
-    ) -> Result<(), VirtualDeviceError> {
+    /// `members` with each device once, where it first comes, at the last
+    /// state it's listed with.
+    fn once_each(members: Vec<(DeviceId, DeviceStateValue)>) -> Vec<(DeviceId, DeviceStateValue)> {
         let mut writes: Vec<(DeviceId, DeviceStateValue)> = Vec::with_capacity(members.len());
         for (id, state) in members {
             match writes.iter_mut().find(|(listed, _)| *listed == id) {
@@ -286,18 +404,333 @@ impl VirtualDeviceManager {
                 None => writes.push((id, state)),
             }
         }
+        writes
+    }
 
-        for (id, state) in writes {
-            let Some(old_state) = self.state_store.get_device(&id).await.map(|d| d.state) else {
-                return Err(StateError::DeviceNotFound(id).into());
+    /// Plan `write`, the write `root` planned, all the way down through its
+    /// virtual members (#58): one plan in which each device the write
+    /// reaches appears once, with one state. `devices` is what the
+    /// `virtual_devices` lock guards, which the caller holds.
+    ///
+    /// It goes level by level: `root`'s members (level 1), then the members
+    /// of those that are virtual (level 2), and so on.
+    ///
+    /// - A member the manager doesn't have is physical, and written as
+    ///   listed.
+    /// - A virtual member plans its part of the write, once:
+    ///   [`VirtualDevice::plan_write`] with the state listed for it, from
+    ///   its state before the write, in the same hold of the lock. Its plan
+    ///   is the next level's.
+    /// - **Each device is written once, by the most direct path to it.** A
+    ///   device a plan lists that an earlier level reached already is that
+    ///   plan's *overridden* member: a scene that sets group `g` to 30 and
+    ///   `g`'s lamp `l` to 5 puts `l` at 5, whatever order its devices come
+    ///   in, and `g` only writes its other lights. Between two paths of the
+    ///   same length (a light in two groups of a scene, a group in two
+    ///   groups of a group), the one through the device whose id sorts
+    ///   first wins. So the outcome never depends on the order a plan lists
+    ///   its members in, which for a scene or a linear group comes from a
+    ///   `HashMap`.
+    /// - A member listed twice in one plan counts once, at the last state
+    ///   it's listed with.
+    ///
+    /// It fails before anything is committed: on a virtual member more than
+    /// [`MAX_NESTING`] levels below `root` ([`VirtualDeviceError::TooDeep`]),
+    /// on one whose plan fails ([`VirtualDeviceError::Member`]), and on
+    /// virtual devices whose plans list each other in a cycle
+    /// ([`VirtualDeviceError::Cycle`]).
+    async fn expand(
+        devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        root: &DeviceId,
+        write: VirtualWrite,
+    ) -> Result<Expansion, VirtualDeviceError> {
+        let mut planned: HashMap<DeviceId, Planned> = HashMap::new();
+        // Each physical device reached: the device whose plan writes it,
+        // and its state.
+        let mut physical: HashMap<DeviceId, (DeviceId, DeviceStateValue)> = HashMap::new();
+        // The member writes of each virtual device planned, not yet reached.
+        let mut pending: HashMap<DeviceId, Vec<(DeviceId, DeviceStateValue)>> = HashMap::new();
+        planned.insert(
+            root.clone(),
+            Planned {
+                state: write.state,
+                members: Vec::new(),
+                overridden: Vec::new(),
+                parent: None,
+            },
+        );
+        pending.insert(root.clone(), Self::once_each(write.members));
+
+        // The virtual devices planned at the level above `depth`.
+        let mut level = vec![root.clone()];
+        let mut depth = 0;
+        while !level.is_empty() {
+            depth += 1;
+            // Two paths of the same length: through the first id wins.
+            level.sort();
+            let mut next = Vec::new();
+            for parent in level {
+                for (id, state) in pending.remove(&parent).unwrap_or_default() {
+                    let reached = planned.contains_key(&id) || physical.contains_key(&id);
+                    if let Some(listing) = planned.get_mut(&parent) {
+                        listing.members.push(id.clone());
+                        if reached {
+                            listing.overridden.push(id);
+                            continue;
+                        }
+                    }
+                    let Some(member) = devices.get(&id) else {
+                        physical.insert(id, (parent.clone(), state));
+                        continue;
+                    };
+                    if depth > MAX_NESTING {
+                        let mut path = Self::path_to(&planned, &parent);
+                        path.push(id);
+                        return Err(VirtualDeviceError::TooDeep {
+                            path,
+                            max: MAX_NESTING,
+                        });
+                    }
+                    let write =
+                        member
+                            .plan_write(state)
+                            .await
+                            .map_err(|e| VirtualDeviceError::Member {
+                                device_id: id.clone(),
+                                error: Box::new(e),
+                            })?;
+                    planned.insert(
+                        id.clone(),
+                        Planned {
+                            state: write.state,
+                            members: Vec::new(),
+                            overridden: Vec::new(),
+                            parent: Some(parent.clone()),
+                        },
+                    );
+                    pending.insert(id.clone(), Self::once_each(write.members));
+                    next.push(id);
+                }
+            }
+            level = next;
+        }
+
+        let order = Self::take_order(&planned, root)?;
+        let mut ordered = Vec::with_capacity(physical.len());
+        Self::physical_order(&planned, &mut physical, root, &mut ordered);
+        Ok(Expansion {
+            root: root.clone(),
+            planned,
+            physical: ordered,
+            order,
+        })
+    }
+
+    /// The path from the device written down to `id`, a virtual device in
+    /// `planned`, through the plans that set each one.
+    fn path_to(planned: &HashMap<DeviceId, Planned>, id: &DeviceId) -> Vec<DeviceId> {
+        let mut path = vec![id.clone()];
+        let mut at = id;
+        while let Some(parent) = planned.get(at).and_then(|part| part.parent.as_ref()) {
+            path.push(parent.clone());
+            at = parent;
+        }
+        path.reverse();
+        path
+    }
+
+    /// The virtual devices in `planned` in the order they take their new
+    /// states: each after every virtual device its plan lists, the ones it
+    /// writes and the ones a more direct path writes alike, so each sees its
+    /// members where the write leaves them. `root`, the device written, is
+    /// last. Fails on plans that list each other in a cycle, with the path
+    /// from `root` round it.
+    fn take_order(
+        planned: &HashMap<DeviceId, Planned>,
+        root: &DeviceId,
+    ) -> Result<Vec<DeviceId>, VirtualDeviceError> {
+        fn visit(
+            planned: &HashMap<DeviceId, Planned>,
+            id: &DeviceId,
+            path: &mut Vec<DeviceId>,
+            order: &mut Vec<DeviceId>,
+        ) -> Result<(), VirtualDeviceError> {
+            path.push(id.clone());
+            let members = planned.get(id).map_or(&[][..], |part| &part.members);
+            for member in members {
+                if !planned.contains_key(member) || order.contains(member) {
+                    continue;
+                }
+                if path.contains(member) {
+                    let mut cycle = path.clone();
+                    cycle.push(member.clone());
+                    return Err(VirtualDeviceError::Cycle(cycle));
+                }
+                visit(planned, member, path, order)?;
+            }
+            path.pop();
+            order.push(id.clone());
+            Ok(())
+        }
+
+        let mut order = Vec::with_capacity(planned.len());
+        visit(planned, root, &mut Vec::new(), &mut order)?;
+        Ok(order)
+    }
+
+    /// Move the physical writes of `id`'s plan, and of every virtual device
+    /// it writes in turn, from `physical` to `out`, in the order the plans
+    /// list them: the order they're committed in.
+    fn physical_order(
+        planned: &HashMap<DeviceId, Planned>,
+        physical: &mut HashMap<DeviceId, (DeviceId, DeviceStateValue)>,
+        id: &DeviceId,
+        out: &mut Vec<(DeviceId, DeviceStateValue)>,
+    ) {
+        let members = planned.get(id).map_or(&[][..], |part| &part.members);
+        for member in members {
+            if planned
+                .get(member)
+                .is_some_and(|inner| inner.parent.as_ref() == Some(id))
+            {
+                Self::physical_order(planned, physical, member, out);
+            } else if physical.get(member).is_some_and(|(writer, _)| writer == id) {
+                if let Some((_, state)) = physical.remove(member) {
+                    out.push((member.clone(), state));
+                }
+            }
+        }
+    }
+
+    /// Commit `expansion` (see [`Self::expand`]). `devices` is what the
+    /// `virtual_devices` lock guards, which the caller holds.
+    ///
+    /// 1. Each physical write goes through [`Self::commit_physical`], in
+    ///    the order the plans list them. The first that fails, such as one
+    ///    the store doesn't have (#2), ends the write there: the ones before
+    ///    it stay committed, and the ones after it are never made.
+    /// 2. Then each virtual device, members before the devices that list
+    ///    them, the device written last. One whose members are all
+    ///    committed takes its new state ([`VirtualDevice::take_state`], so a
+    ///    group's set level moves too). If its new state doesn't account for
+    ///    one of its inputs as the write left it (see
+    ///    [`VirtualDevice::accounts_for`]), because a more direct path set
+    ///    it, or it re-derived itself just before, it re-derives from it
+    ///    ([`VirtualDevice::on_input_changed`]), as input tracking would
+    ///    once it got to the echoes: a group whose lamp a scene set on its
+    ///    own shows its lights as they are. Then it's stored and echoed,
+    ///    once: an inner device only if the write changed it, the device
+    ///    written always, as it always was. One whose members didn't all get
+    ///    committed keeps its old state (the store is kept level with it),
+    ///    and input tracking re-derives it from the ones that did change.
+    ///
+    /// Everything is in its final state before any virtual device takes
+    /// its own, so input tracking finds each one already accounting for
+    /// what the write did: its members' echoes don't re-derive it.
+    async fn commit_expansion(
+        &self,
+        devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        expansion: Expansion,
+    ) -> Result<(), VirtualDeviceError> {
+        let Expansion {
+            root,
+            mut planned,
+            physical,
+            order,
+        } = expansion;
+        let mut failed = None;
+        // The physical members committed, and the virtual ones that took
+        // their new state.
+        let mut done: HashSet<DeviceId> = HashSet::new();
+        for (id, state) in physical {
+            if let Err(e) = self.commit_physical(&id, &state).await {
+                failed = Some(e);
+                break;
+            }
+            done.insert(id);
+        }
+
+        for id in order {
+            let Some(part) = planned.remove(&id) else {
+                continue;
             };
-            if old_state == state {
+            let Some(virtual_device) = devices.get_mut(&id) else {
+                failed.get_or_insert(VirtualDeviceError::DeviceNotFound(id));
+                continue;
+            };
+            let committed = part
+                .members
+                .iter()
+                .filter(|member| !part.overridden.contains(member))
+                .all(|member| done.contains(member));
+            if !committed {
+                // A device keeps its state on failure, but the store must
+                // not be left behind it.
+                let current_state = virtual_device.current_state();
+                if let Err(store_error) = self.store_state(&id, current_state, false).await {
+                    tracing::error!("Failed to update virtual device state: {}", store_error);
+                }
                 continue;
             }
-            self.commit_member_write(&id, &old_state, &state, devices.contains_key(&id))
-                .await?;
+
+            virtual_device.take_state(part.state);
+            // Every member is where the write leaves it now. One this device
+            // takes as an input, and whose state its new one doesn't account
+            // for (a more direct path set it, or it re-derived itself just
+            // now), is what input tracking would re-derive it from, once it
+            // got to the echoes: do it here, so the one echo shows it.
+            let inputs = virtual_device.input_devices();
+            for member in part.members.iter().filter(|member| inputs.contains(member)) {
+                let Some(input) = self.state_store.get_device(member).await else {
+                    continue;
+                };
+                if virtual_device.accounts_for(member, &input.state) {
+                    continue;
+                }
+                if let Err(e) = virtual_device.on_input_changed(member, &input).await {
+                    tracing::warn!("Virtual device {} failed to handle input change: {}", id, e);
+                }
+            }
+            let echo_unchanged = id == root;
+            match self
+                .store_state(&id, virtual_device.current_state(), echo_unchanged)
+                .await
+            {
+                Ok(_) => {
+                    done.insert(id);
+                }
+                Err(e) => {
+                    failed.get_or_insert(e.into());
+                }
+            }
         }
-        Ok(())
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Commit `new_state` for `member_id`, a member of a write that the
+    /// manager doesn't have, through [`Self::commit_member_write`]. One the
+    /// write leaves as it is has nothing to push or echo, and is skipped.
+    ///
+    /// One the store doesn't have (#2) fails the write. So does one the
+    /// store marks virtual (one the manager is removing): the manager is
+    /// its only writer, and the gateway doesn't know it, as for a button
+    /// action's target (#34 review, finding 2).
+    async fn commit_physical(
+        &self,
+        member_id: &DeviceId,
+        new_state: &DeviceStateValue,
+    ) -> Result<(), VirtualDeviceError> {
+        let Some(member) = self.state_store.get_device(member_id).await else {
+            return Err(StateError::DeviceNotFound(member_id.clone()).into());
+        };
+        if is_virtual(&member.device_info) {
+            return Err(VirtualDeviceError::DeviceNotFound(member_id.clone()));
+        }
+        if member.state == *new_state {
+            return Ok(());
+        }
+        self.commit_member_write(member_id, &member.state, new_state)
+            .await
     }
 
     /// Add a virtual device to the manager. It first takes its state from
@@ -305,6 +738,15 @@ impl VirtualDeviceManager {
     /// [`VirtualDevice::seed_from_inputs`]), so register a group after its
     /// members are in the store. Once it's in the store, a `DeviceAdded`
     /// event announces it, so clients pick it up without a refetch (#16).
+    ///
+    /// A member may be a virtual device that isn't registered yet: whether
+    /// it's virtual is only resolved when a write reaches it (#58). When it
+    /// is registered, every group that has it as a member, directly or
+    /// through others, catches up with it (see `catch_up_with`), so a group
+    /// of groups registered first shows its lit members as soon as its
+    /// inner group is in. But a device whose members lead back to it (a
+    /// group in a group that contains it) is [`VirtualDeviceError::Cycle`],
+    /// and isn't added: whichever of the two comes second.
     pub async fn add_virtual_device(
         &self,
         mut device: Box<dyn VirtualDevice>,
@@ -332,9 +774,20 @@ impl VirtualDeviceManager {
         }
 
         // Add device. It queues on its id too, so it doesn't replace one of
-        // that id while a write to it is in flight.
+        // that id while a write to it is in flight. A device whose outputs
+        // lead back to it through the others would make every write to it
+        // fail (#58), so it isn't added. That's checked in the same hold of
+        // the lock, so two adds can't each miss the other's half of a cycle.
         {
             let (_turn, mut devices) = self.lock_for_write(|_| vec![device_id.clone()]).await;
+            if let Some(cycle) = Self::cycle_through(&devices, &device_id, &output_devices) {
+                tracing::error!(
+                    "❌ Virtual device {} isn't added: its members lead back to it ({})",
+                    device_id,
+                    cycle.join(" → ")
+                );
+                return Err(VirtualDeviceError::Cycle(cycle));
+            }
             devices.insert(device_id.clone(), device);
         }
 
@@ -373,6 +826,9 @@ impl VirtualDeviceManager {
         // Announced the way the server announces a discovered device.
         self.publish_lifecycle(&device_id, EventType::DeviceAdded { device_type })
             .await;
+        // A group already registered with it as a member (a group of groups
+        // whose file sorts first) seeded without it: catch it up now.
+        self.catch_up_with(&device_id).await;
         Ok(())
     }
 
@@ -412,6 +868,32 @@ impl VirtualDeviceManager {
         }
         dangling.sort();
         dangling
+    }
+
+    /// Every `(virtual device, virtual device it writes)` pair where the
+    /// second can't be set like a light: a scene that sets another scene
+    /// controller, a group with a button controller among its members.
+    /// Every write that reaches such a target fails
+    /// ([`VirtualDeviceError::Member`], #58), or, for a button action,
+    /// does nothing. A scene's checks can't tell at load, since its target
+    /// may load after it, so [`Self::start`] logs these once everything is
+    /// in.
+    pub async fn unsupported_targets(&self) -> Vec<(DeviceId, DeviceId)> {
+        let devices = self.virtual_devices.read().await;
+        let mut unsupported = Vec::new();
+        for device in devices.values() {
+            for output in device.output_devices() {
+                let Some(target) = devices.get(&output) else {
+                    continue;
+                };
+                if !matches!(target.current_state(), DeviceStateValue::Light(_)) {
+                    unsupported.push((device.device_id().clone(), output));
+                }
+            }
+        }
+        unsupported.sort();
+        unsupported.dedup();
+        unsupported
     }
 
     /// Every button that more than one button controller binds, with those
@@ -601,17 +1083,21 @@ impl VirtualDeviceManager {
         device_id: &DeviceId,
         new_state: &DeviceState,
     ) -> Result<(), VirtualDeviceError> {
-        self.track_input(device_id, Some(new_state)).await
+        self.track_input(device_id, Some(new_state))
+            .await
+            .map(|_moved| ())
     }
 
     /// [`Self::handle_device_state_change`], with `fallback` as the input
     /// for a device the store doesn't have. With none, such an input is
     /// skipped ([`Self::resync`] has nothing else to go on).
+    ///
+    /// Returns the virtual devices it moved (their stored state changed).
     async fn track_input(
         &self,
         device_id: &DeviceId,
         fallback: Option<&DeviceState>,
-    ) -> Result<(), VirtualDeviceError> {
+    ) -> Result<Vec<DeviceId>, VirtualDeviceError> {
         // Find virtual devices that depend on this physical device
         let virtual_device_ids = {
             let input_map = self.input_mappings.read().await;
@@ -619,7 +1105,7 @@ impl VirtualDeviceManager {
         };
 
         if virtual_device_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Take the lock before reading the input, so no virtual write is
@@ -627,8 +1113,9 @@ impl VirtualDeviceManager {
         let mut devices = self.virtual_devices.write().await;
         let stored = self.state_store.get_device(device_id).await;
         let Some(input) = stored.as_ref().or(fallback) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
+        let mut moved = Vec::new();
 
         // Notify all dependent virtual devices
         for virtual_id in virtual_device_ids {
@@ -654,15 +1141,49 @@ impl VirtualDeviceManager {
 
             // Update virtual device state in store, and echo it if it moved
             let new_virtual_state = virtual_device.current_state();
-            if let Err(e) = self
+            match self
                 .store_state(&virtual_id, new_virtual_state, false)
                 .await
             {
-                tracing::error!("Failed to update virtual device state: {}", e);
+                Ok(true) => moved.push(virtual_id),
+                Ok(false) => {}
+                Err(e) => tracing::error!("Failed to update virtual device state: {}", e),
             }
         }
 
-        Ok(())
+        Ok(moved)
+    }
+
+    /// Catch up every virtual device that takes `device_id` as an input,
+    /// directly or through others, with it as the store holds it now: each
+    /// one that doesn't already account for it is re-derived (see
+    /// [`Self::track_input`]), and so, in turn, is each device that takes a
+    /// device that moved as an input.
+    ///
+    /// [`Self::add_virtual_device`] does this for the device it adds (#58
+    /// review, finding 2). A group of groups registered before its inner
+    /// group (its file sorts first, or the API created it first) seeded
+    /// without it, and stayed that way until one of the inner group's lights
+    /// changed: a toggle of it at startup lit a lit room to 100 % instead of
+    /// switching it off. It doesn't wait for input tracking, which may not
+    /// be running yet while the server loads its devices.
+    async fn catch_up_with(&self, device_id: &DeviceId) {
+        // A device that moves goes back in, so what depends on it catches
+        // up in turn. The nesting is acyclic (registration rejects a cycle),
+        // so it ends; the bound is only a backstop.
+        let mut inputs = std::collections::VecDeque::from([device_id.clone()]);
+        let mut rounds = 0;
+        while let Some(input) = inputs.pop_front() {
+            rounds += 1;
+            if rounds > 1000 {
+                tracing::warn!("⚠️ Gave up catching up the devices that depend on {device_id}");
+                break;
+            }
+            match self.track_input(&input, None).await {
+                Ok(moved) => inputs.extend(moved),
+                Err(e) => tracing::error!("Failed to catch virtual devices up with {input}: {e}"),
+            }
+        }
     }
 
     /// Make the writes the virtual devices that `event` is an input of ask
@@ -713,9 +1234,10 @@ impl VirtualDeviceManager {
     /// Make the write `action` asks for, starting from its target's state
     /// at the time. The target must be a light. A virtual one (a light
     /// group) is written the way [`Self::set_virtual_device_state`] writes
-    /// it: the group fans out to its members, and they're committed through
-    /// the sync engine and echoed. A physical one is written like a direct
-    /// write.
+    /// it, through the same expansion: the group fans out to its members,
+    /// through any of them that are groups themselves, all the way down
+    /// (#58), and the lights are committed through the sync engine and
+    /// echoed. A physical one is written like a direct write.
     ///
     /// A target the manager doesn't have is physical only if the store
     /// doesn't mark it virtual, as the API tells them apart. A virtual one
@@ -728,25 +1250,18 @@ impl VirtualDeviceManager {
     ///
     /// First it queues on the target and, for a virtual one, its outputs
     /// (every member any write to it can write; the action's state isn't
-    /// known until its turn comes). So a press that shares a light with a
-    /// scene's fade waits for the fade's commit, and lands after it, as a
-    /// write that overlaps one does (see
-    /// [`Self::set_virtual_device_state`]). Input tracking runs a press's
-    /// actions in turn, so it waits with it: the presses and re-derivations
-    /// behind it wait too, until the fade commits. That's as before #58,
-    /// when tracking waited for every fade. A press that shares nothing with
-    /// a write in flight doesn't wait.
+    /// known until its turn comes), and theirs, all the way down (see
+    /// `write_keys`). So a press that shares a light with a scene's fade
+    /// waits for the fade's commit, and lands after it, as a write that
+    /// overlaps one does (see [`Self::set_virtual_device_state`]). Input
+    /// tracking runs a press's actions in turn, so it waits with it: the
+    /// presses and re-derivations behind it wait too, until the fade
+    /// commits. That's as before #58, when tracking waited for every fade.
+    /// A press that shares nothing with a write in flight doesn't wait.
     async fn run_action(&self, action: &ButtonAction) -> Result<(), VirtualDeviceError> {
         let target = &action.target;
         let (turn, mut devices) = self
-            .lock_for_write(|devices| {
-                let mut keys = devices
-                    .get(target)
-                    .map(|device| device.output_devices())
-                    .unwrap_or_default();
-                keys.push(target.clone());
-                keys
-            })
+            .lock_for_write(|devices| Self::write_keys(devices, target, None))
             .await;
         let current = if let Some(device) = devices.get(target) {
             device.current_state()
@@ -756,12 +1271,7 @@ impl VirtualDeviceManager {
                 .get_device(target)
                 .await
                 .ok_or_else(|| VirtualDeviceError::DeviceNotFound(target.clone()))?;
-            if stored
-                .device_info
-                .device_groups
-                .iter()
-                .any(|g| g == "virtual")
-            {
+            if is_virtual(&stored.device_info) {
                 return Err(VirtualDeviceError::DeviceNotFound(target.clone()));
             }
             stored.state
@@ -781,8 +1291,7 @@ impl VirtualDeviceManager {
                 .write_virtual(&mut devices, &turn, target, new_state)
                 .await;
         }
-        self.commit_member_write(target, &current, &new_state, false)
-            .await
+        self.commit_member_write(target, &current, &new_state).await
     }
 
     /// Set virtual device state (called from API)
@@ -802,6 +1311,37 @@ impl VirtualDeviceManager {
     /// from them like after any outside change: the group ends up showing
     /// what happened.
     ///
+    /// # A virtual member fans out too (#58)
+    ///
+    /// A member of the write can be a virtual device itself: a scene that
+    /// sets a light group ("movie: the living room at 30 %"), a group in a
+    /// group. The write reaches that member's lights through its own plan:
+    /// the manager asks it for its [`VirtualDevice::plan_write`] of the
+    /// state listed for it, and plans its members the same way, level by
+    /// level, down to the physical lights (`expand`). That's one plan in
+    /// which each device appears once: the most direct path to a device
+    /// sets it, so a scene that sets a group to 30 % and one of the group's
+    /// lamps to 5 % puts the lamp at 5 %, every time. Each physical light is
+    /// committed through the sync engine as before. Then each virtual
+    /// member takes its new state, level and all, is stored, and is echoed
+    /// if the write changed it, like a physical member (re-derived first
+    /// from a lamp a more direct path set, so it shows its lights as they
+    /// are). It all happens in the same hold of the `virtual_devices` lock
+    /// as the rest of the commit, so input tracking finds each group
+    /// already where the write put it: its members' echoes are its own
+    /// write, and don't re-derive it.
+    ///
+    /// The whole expansion is planned before any of it is committed, so a
+    /// write that can't be made fails with nothing committed: one whose
+    /// virtual members nest in a cycle ([`VirtualDeviceError::Cycle`]), or
+    /// more than [`MAX_NESTING`] levels deep
+    /// ([`VirtualDeviceError::TooDeep`]), or one a virtual member can't
+    /// plan its part of ([`VirtualDeviceError::Member`]: a scene that sets a
+    /// scene controller as if it were a light). Whether a member is virtual
+    /// is resolved there, when the write reaches it, not when the device
+    /// that names it is loaded. So a scene or a group can name a group that
+    /// loads after it.
+    ///
     /// # Writes that overlap wait, the others don't (#58)
     ///
     /// A write whose plan takes time, a scene that fades or steps through a
@@ -813,13 +1353,15 @@ impl VirtualDeviceManager {
     /// no other virtual write in between.
     ///
     /// What orders writes is a write queue. Every write joins it in the
-    /// order it asks, with the devices it writes: its virtual device, and
-    /// every member it may write ([`VirtualDevice::writes_to`]). A button
-    /// action joins with its target (and a virtual target's outputs), and
-    /// an add or a removal with the device itself. A write goes once every
-    /// write that joined before it and shares a device with it is over,
-    /// whether that one is running or still waiting itself, and it stays in
-    /// the queue until it has committed, a scene's delays included. So:
+    /// order it asks, with the devices it writes: its virtual device, every
+    /// member it may write ([`VirtualDevice::writes_to`]), and, through each
+    /// member that's virtual, everything that one may write in turn, all
+    /// the way down (`write_keys`, #58). A button action joins with its
+    /// target (and a virtual target's outputs, and theirs), and an add or a
+    /// removal with the device itself. A write goes once every write that
+    /// joined before it and shares a device with it is over, whether that
+    /// one is running or still waiting itself, and it stays in the queue
+    /// until it has committed, a scene's delays included. So:
     ///
     /// - **A write that overlaps a transition** (it shares a member with
     ///   it, or is to the same scene controller) waits for the
@@ -832,6 +1374,9 @@ impl VirtualDeviceManager {
     ///   A write to `[a, z]` that waits for a fade of `a` holds up a later
     ///   write to `z` alone, which then lands after it (#60 review,
     ///   finding 1).
+    /// - **Writes that overlap through a virtual member** too: a scene that
+    ///   sets a group waits for a fade of one of the group's lights, and a
+    ///   later write to that light alone waits for the scene.
     /// - **A write that overlaps nothing in flight** goes ahead at once. A
     ///   one-second fade used to hold up every virtual write, input
     ///   tracking, resync and button press for its whole second.
@@ -875,7 +1420,7 @@ impl VirtualDeviceManager {
     ) -> Result<(), VirtualDeviceError> {
         // Held until the write is committed (see above).
         let (turn, mut devices) = self
-            .lock_for_write(|devices| Self::write_keys(devices, device_id, &new_state))
+            .lock_for_write(|devices| Self::write_keys(devices, device_id, Some(&new_state)))
             .await;
         let Some(virtual_device) = devices.get(device_id) else {
             return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
@@ -925,10 +1470,16 @@ impl VirtualDeviceManager {
     }
 
     /// Commit `planned`, the write `device_id` planned (or the error its
-    /// plan failed with): its members, in order, then its own new state,
-    /// stored and echoed. `devices` is what the `virtual_devices` lock
-    /// guards, which the caller holds, and which has `device_id`. `turn` is
-    /// the write's place in the write queue, which the caller holds too.
+    /// plan failed with): planned all the way down through its virtual
+    /// members, each device once ([`Self::expand`]), then committed
+    /// ([`Self::commit_expansion`]): the physical members, then each
+    /// virtual device's new state, stored and echoed, `device_id`'s last.
+    /// `devices` is what the `virtual_devices` lock guards, which the
+    /// caller holds, and which has `device_id`. `turn` is the write's place
+    /// in the write queue, which the caller holds too.
+    ///
+    /// A plan that fails, or can't be expanded, commits nothing, and the
+    /// device keeps its state.
     async fn commit_write(
         &self,
         devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
@@ -936,34 +1487,26 @@ impl VirtualDeviceManager {
         device_id: &DeviceId,
         planned: Result<VirtualWrite, VirtualDeviceError>,
     ) -> Result<(), VirtualDeviceError> {
-        let result = match planned {
-            Ok(write) => {
-                // A member the write wasn't queued on could be written while
-                // another write to it is in flight: `writes_to` listed too
-                // few (see there).
-                debug_assert!(
-                    turn.covers(write.members.iter().map(|(id, _)| id)),
-                    "{device_id} planned a write outside its `writes_to`: {:?}",
-                    write.members
-                );
-                self.commit_members(devices, write.members)
-                    .await
-                    .map(|()| write.state)
-            }
+        let expansion = match planned {
+            Ok(write) => Self::expand(devices, device_id, write).await,
             Err(e) => Err(e),
         };
-
-        let Some(virtual_device) = devices.get_mut(device_id) else {
-            return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
-        };
-        match result {
-            Ok(state) => {
-                virtual_device.take_state(state);
-                self.store_state(device_id, virtual_device.current_state(), true)
-                    .await?;
-                Ok(())
+        match expansion {
+            Ok(expansion) => {
+                // A device the write wasn't queued on could be written while
+                // another write to it is in flight: a `writes_to` (or, for a
+                // virtual member, an `output_devices`) listed too few.
+                debug_assert!(
+                    turn.covers(expansion.writes()),
+                    "{device_id} planned a write outside the devices it queued on: {:?}",
+                    expansion.writes()
+                );
+                self.commit_expansion(devices, expansion).await
             }
             Err(e) => {
+                let Some(virtual_device) = devices.get(device_id) else {
+                    return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
+                };
                 // A device keeps its state on failure, but the store must
                 // not be left behind it.
                 let current_state = virtual_device.current_state();
@@ -1015,9 +1558,10 @@ impl VirtualDeviceManager {
     /// Start the manager: input tracking runs [`Self::handle_event`] for
     /// every event on the bus, in a background task, and [`Self::resync`]
     /// whenever it has fallen behind the bus and missed some. It also logs
-    /// every dangling reference (see [`Self::dangling_references`]), and
-    /// every button more than one controller binds (see
-    /// [`Self::shared_buttons`]).
+    /// every dangling reference (see [`Self::dangling_references`]), every
+    /// virtual target that can't be set like a light (see
+    /// [`Self::unsupported_targets`]), and every button more than one
+    /// controller binds (see [`Self::shared_buttons`]).
     /// The server calls this once all virtual devices are loaded.
     pub async fn start(&self) -> Result<(), VirtualDeviceError> {
         let manager = Arc::new(self.clone());
@@ -1029,6 +1573,13 @@ impl VirtualDeviceManager {
         self.tracking.store(true, Ordering::Release);
         for (virtual_id, missing) in self.dangling_references().await {
             warn_dangling(&virtual_id, &missing);
+        }
+        for (virtual_id, target) in self.unsupported_targets().await {
+            tracing::warn!(
+                "⚠️ Virtual device {} sets {}, a virtual device that can't be set like a light: every write that reaches it fails",
+                virtual_id,
+                target
+            );
         }
         for (button, controllers) in self.shared_buttons().await {
             tracing::warn!(
@@ -1732,12 +2283,21 @@ mod tests {
         store: &Arc<StateStore>,
         scenes: impl IntoIterator<Item = (String, serde_json::Value)>,
     ) -> SceneController {
+        scene_controller_named("scene", store, scenes)
+    }
+
+    /// Scene controller `device_id`, with `scenes` (see [`scene_config`]).
+    fn scene_controller_named(
+        device_id: &str,
+        store: &Arc<StateStore>,
+        scenes: impl IntoIterator<Item = (String, serde_json::Value)>,
+    ) -> SceneController {
         let scenes: serde_json::Map<String, serde_json::Value> = scenes.into_iter().collect();
         SceneController::new(
             VirtualDeviceConfig {
-                device_id: "scene".to_string(),
+                device_id: device_id.to_string(),
                 device_type: VirtualDeviceType::SceneController,
-                name: "Scene".to_string(),
+                name: device_id.to_string(),
                 description: None,
                 enabled: true,
                 config: serde_json::json!({ "scenes": scenes }),
@@ -4260,5 +4820,925 @@ mod tests {
             .await
             .expect("sync engine task")
             .expect("sync engine");
+    }
+
+    // -----------------------------------------------------------------
+    // #58: a write fans out through its virtual members
+    // -----------------------------------------------------------------
+
+    /// A `LightGroupLinear` named `device_id` over `ranges`, each a light
+    /// and its `[min, max]`.
+    fn linear_group_over(
+        device_id: &str,
+        ranges: &[(&str, (u8, u8))],
+        store: &Arc<StateStore>,
+    ) -> LightGroupLinear {
+        let members = ranges
+            .iter()
+            .map(|(id, _)| ((*id).to_string(), (*id).to_string()))
+            .collect();
+        let ranges = ranges
+            .iter()
+            .map(|(id, range)| ((*id).to_string(), *range))
+            .collect();
+        let config = VirtualDeviceConfig {
+            device_id: device_id.to_string(),
+            device_type: VirtualDeviceType::LightGroupLinear,
+            name: device_id.to_string(),
+            description: None,
+            enabled: true,
+            config: serde_json::json!({}),
+        };
+        LightGroupLinear::new(config, members, ranges, store.clone()).expect("linear group")
+    }
+
+    /// Lights `lights` in a new store, all off, and a manager over it with
+    /// no sync engine and input tracking not started.
+    async fn manager_over(
+        lights: &[&str],
+    ) -> (VirtualDeviceManager, Arc<StateStore>, Arc<EventBus>) {
+        let store = StateStore::new();
+        for id in lights {
+            store.add_device(light_info(id), off()).await;
+        }
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        (manager, store, bus)
+    }
+
+    async fn register(manager: &VirtualDeviceManager, device: impl VirtualDevice + 'static) {
+        let id = device.device_id().clone();
+        manager
+            .add_virtual_device(Box::new(device))
+            .await
+            .unwrap_or_else(|e| panic!("register {id}: {e}"));
+    }
+
+    /// A write of `state` to `device_id`, as the API makes one.
+    async fn write(
+        manager: &VirtualDeviceManager,
+        device_id: &str,
+        state: DeviceStateValue,
+    ) -> Result<(), VirtualDeviceError> {
+        manager
+            .set_virtual_device_state(&device_id.to_string(), state)
+            .await
+    }
+
+    async fn own_state(manager: &VirtualDeviceManager, device_id: &str) -> DeviceStateValue {
+        manager
+            .get_virtual_device_state(&device_id.to_string())
+            .await
+            .unwrap_or_else(|e| panic!("{device_id}: {e}"))
+    }
+
+    /// #58: a scene that sets a light group reaches the group's lights,
+    /// through the group's own plan: each at the level its range maps the
+    /// scene's 30 to. The group ends up at 30, in the store and its own
+    /// state, and each device is echoed once. It used to write the group's
+    /// state into the store, and no light moved.
+    ///
+    /// The scene is registered before the group it sets, as when its file
+    /// loads first: a virtual member is only resolved when a write reaches
+    /// it.
+    ///
+    /// The group takes the level it was set to (`set_level`), so input
+    /// tracking doesn't re-derive it from its own lights' echoes, and a
+    /// light that moves afterwards (`b` switched off at the wall) is
+    /// inverted towards 30: `a` at 86 lights at any level from 28 to 32,
+    /// and the group reads 30. With the level it started at (100) it would
+    /// read 32.
+    #[tokio::test]
+    async fn a_scene_that_sets_a_group_reaches_its_lights_through_it() {
+        let (manager, store, bus) = manager_over(&["a", "b", "c"]).await;
+        let targets = [("g", light(true, 30)), ("c", light(true, 70))];
+        register(
+            &manager,
+            scene(&store, &targets, &serde_json::json!("Instant")),
+        )
+        .await;
+        register(
+            &manager,
+            linear_group_over("g", &[("a", (80, 100)), ("b", (0, 50))], &store),
+        )
+        .await;
+        let mut rx = bus.subscribe();
+
+        write(&manager, "scene", evening()).await.expect("evening");
+        // Before tracking has seen a thing: the write itself put `g` there.
+        assert_eq!(stored(&store, "g").await, light(true, 30), "g, written");
+        assert_eq!(own_state(&manager, "g").await, light(true, 30), "g, taken");
+        let events = pump(&manager, &mut rx).await;
+
+        for (id, level) in [("a", 86), ("b", 15), ("c", 70)] {
+            assert_eq!(stored(&store, id).await, light(true, level), "{id}");
+            assert_eq!(echoes(&events, id), vec![light(true, level)], "{id} echo");
+        }
+        assert_eq!(stored(&store, "g").await, light(true, 30), "g in the store");
+        assert_eq!(own_state(&manager, "g").await, light(true, 30), "g's own");
+        assert_eq!(
+            echoes(&events, "g"),
+            vec![light(true, 30)],
+            "g, echoed once"
+        );
+        assert_eq!(
+            echoes(&events, "scene"),
+            vec![evening()],
+            "the scene's echo"
+        );
+
+        moved(&store, &bus, "b", off()).await;
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(stored(&store, "g").await, light(true, 30), "g drifted");
+        assert!(echoes(&events, "g").is_empty(), "g moved: {events:?}");
+    }
+
+    /// #58: a group of groups: a curved `LightGroup` inside a
+    /// `LightGroupLinear`. The outer group at 50 puts the inner one at 40
+    /// (its range, 20-60), and the inner one puts its lights where its
+    /// curves take 40: `a` at 30 (10-60) and `b` at 70 (50-100). The outer
+    /// group's own light, `c` (0-100), goes to 50. Each group takes its
+    /// level and is echoed once, and so is each light. Tracking then leaves
+    /// both groups alone: each accounts for what its write put where.
+    ///
+    /// The outer group is registered first, before the inner one exists.
+    #[tokio::test]
+    async fn a_group_of_groups_fans_out_all_the_way_down() {
+        let (manager, store, bus) = manager_over(&["a", "b", "c"]).await;
+        register(
+            &manager,
+            linear_group_over("outer", &[("inner", (20, 60)), ("c", (0, 100))], &store),
+        )
+        .await;
+        let curves = serde_json::json!({
+            "a": { "breakpoints": [[0, 10], [100, 60]] },
+            "b": { "breakpoints": [[0, 50], [100, 100]] },
+        });
+        let inner = LightGroup::new(
+            VirtualDeviceConfig {
+                device_id: "inner".to_string(),
+                device_type: VirtualDeviceType::LightGroup,
+                name: "inner".to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({ "lights": ["a", "b"], "brightness_curves": curves }),
+            },
+            store.clone(),
+        )
+        .expect("inner group");
+        register(&manager, inner).await;
+        let mut rx = bus.subscribe();
+
+        write(&manager, "outer", light(true, 50))
+            .await
+            .expect("outer to 50");
+        // Before tracking has seen a thing: the write itself put `inner`
+        // there.
+        assert_eq!(own_state(&manager, "inner").await, light(true, 40), "inner");
+        let events = pump(&manager, &mut rx).await;
+
+        for (id, level) in [
+            ("a", 30),
+            ("b", 70),
+            ("c", 50),
+            ("inner", 40),
+            ("outer", 50),
+        ] {
+            assert_eq!(stored(&store, id).await, light(true, level), "{id}");
+            assert_eq!(echoes(&events, id), vec![light(true, level)], "{id}'s echo");
+        }
+        for (id, level) in [("inner", 40), ("outer", 50)] {
+            assert_eq!(own_state(&manager, id).await, light(true, level), "{id}");
+        }
+    }
+
+    /// #58: a button action on a group of groups goes through the same
+    /// expansion as any write: the press sets the outer group to 60, which
+    /// sets its inner group (1:1) to 60, which sets its lights. Each is
+    /// echoed once.
+    #[tokio::test]
+    async fn a_button_press_on_a_group_of_groups_reaches_its_lights() {
+        let (manager, store, bus) = manager_over(&["a", "b", "c"]).await;
+        register(&manager, group("inner", &["a", "b"], &store)).await;
+        register(&manager, group("outer", &["inner", "c"], &store)).await;
+        let press_on = serde_json::json!(["set", "outer", 60]);
+        add_controller(&manager, &store, press_on, serde_json::json!([])).await;
+        let mut rx = bus.subscribe();
+
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        let events = pump(&manager, &mut rx).await;
+
+        for id in ["a", "b", "c", "inner", "outer"] {
+            assert_eq!(stored(&store, id).await, light(true, 60), "{id}");
+            assert_eq!(echoes(&events, id), vec![light(true, 60)], "{id}'s echo");
+        }
+    }
+
+    /// #58: a group whose members lead back to it (`A` contains `B`, and
+    /// `B` would contain `A`) isn't registered: whichever of the two comes
+    /// second fails with the cycle, and isn't in the manager or the store.
+    /// Nor is a group that contains itself.
+    #[tokio::test]
+    async fn a_group_that_would_nest_in_a_cycle_is_not_registered() {
+        let (manager, store, bus) = manager_over(&["a", "b"]).await;
+        register(&manager, group("A", &["a", "B"], &store)).await;
+        let mut rx = bus.subscribe();
+
+        for (device, cycle) in [
+            (group("B", &["b", "A"], &store), vec!["B", "A", "B"]),
+            (group("S", &["a", "S"], &store), vec!["S", "S"]),
+        ] {
+            let id = device.device_id().clone();
+            let result = manager.add_virtual_device(Box::new(device)).await;
+            let cycle: Vec<DeviceId> = cycle.into_iter().map(String::from).collect();
+            assert!(
+                matches!(&result, Err(VirtualDeviceError::Cycle(path)) if *path == cycle),
+                "{id}: {result:?}"
+            );
+            assert!(manager.get_virtual_device_state(&id).await.is_err(), "{id}");
+            assert!(store.get_device(&id).await.is_none(), "{id} in the store");
+        }
+        assert!(
+            pump(&manager, &mut rx).await.is_empty(),
+            "a device that isn't added isn't announced"
+        );
+    }
+
+    /// #58: a write that would fan out through a cycle fails with it, and
+    /// commits nothing: not even the light before the cycle in its group's
+    /// plan. Registration rejects a cycle, so this one is put straight into
+    /// the manager's devices, as a device whose `output_devices` hid a
+    /// member would.
+    #[tokio::test]
+    async fn a_write_through_a_cycle_fails_and_commits_nothing() {
+        let (manager, store, bus) = manager_over(&["a", "b"]).await;
+        register(&manager, group("A", &["a", "B"], &store)).await;
+        manager
+            .virtual_devices
+            .write()
+            .await
+            .insert("B".to_string(), Box::new(group("B", &["b", "A"], &store)));
+        let before = stored(&store, "A").await;
+        let mut rx = bus.subscribe();
+
+        let result = write(&manager, "A", light(true, 60)).await;
+        let cycle: Vec<DeviceId> = ["A", "B", "A"].map(String::from).into();
+        assert!(
+            matches!(&result, Err(VirtualDeviceError::Cycle(path)) if *path == cycle),
+            "{result:?}"
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Virtual devices nest in a cycle: A → B → A"
+        );
+        for id in ["a", "b"] {
+            assert_eq!(stored(&store, id).await, off(), "{id} was committed");
+        }
+        assert_eq!(stored(&store, "A").await, before, "A moved");
+        assert_eq!(own_state(&manager, "A").await, before, "A's own state");
+        assert!(pump(&manager, &mut rx).await.is_empty(), "something echoed");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #58: a write fans out through [`MAX_NESTING`] levels of groups below
+    /// the one it's to, and fails one level deeper, committing nothing.
+    /// `g0` contains `g1`, … `g5` contains the light `x`: a write to `g1`
+    /// reaches `x` through `g5` at level 4, and one to `g0` would need
+    /// level 5.
+    #[tokio::test]
+    async fn a_write_nested_deeper_than_the_limit_fails_and_commits_nothing() {
+        const CHAIN: [&str; 6] = ["g0", "g1", "g2", "g3", "g4", "g5"];
+        assert_eq!(MAX_NESTING, CHAIN.len() - 2, "the chain fits the limit");
+        let (manager, store, bus) = manager_over(&["x"]).await;
+        for (level, id) in CHAIN.iter().enumerate().rev() {
+            let member = CHAIN.get(level + 1).copied().unwrap_or("x");
+            register(&manager, group(id, &[member], &store)).await;
+        }
+        let mut rx = bus.subscribe();
+
+        let result = write(&manager, "g0", light(true, 60)).await;
+        let path: Vec<DeviceId> = CHAIN.map(String::from).into();
+        assert!(
+            matches!(&result, Err(VirtualDeviceError::TooDeep { path: p, max }) if *p == path && *max == MAX_NESTING),
+            "{result:?}"
+        );
+        assert_eq!(stored(&store, "x").await, off(), "x was committed");
+        assert!(pump(&manager, &mut rx).await.is_empty(), "something echoed");
+
+        write(&manager, "g1", light(true, 60))
+            .await
+            .expect("g1, 4 levels deep");
+        let events = pump(&manager, &mut rx).await;
+        for id in ["x", "g1", "g2", "g3", "g4", "g5"] {
+            assert_eq!(stored(&store, id).await, light(true, 60), "{id}");
+            assert_eq!(echoes(&events, id), vec![light(true, 60)], "{id}'s echo");
+        }
+    }
+
+    /// #58: a scene that sets another scene controller as if it were a
+    /// light fails when it's activated, with the member's error, and
+    /// commits nothing, not even its light. (It's no error when it's
+    /// created: see `scene_controller_toml.rs`.)
+    #[tokio::test]
+    async fn a_scene_that_sets_a_scene_controller_fails_and_commits_nothing() {
+        let (manager, store, bus) = manager_over(&["a"]).await;
+        let targets = [("a", light(true, 50)), ("other", light(true, 50))];
+        register(
+            &manager,
+            scene(&store, &targets, &serde_json::json!("Instant")),
+        )
+        .await;
+        let other = scene_config(
+            "x",
+            &[("a", light(true, 10))],
+            &serde_json::json!("Instant"),
+        );
+        register(&manager, scene_controller_named("other", &store, [other])).await;
+        let mut rx = bus.subscribe();
+
+        let result = write(&manager, "scene", evening()).await;
+        assert!(
+            matches!(
+                &result,
+                Err(VirtualDeviceError::Member { device_id, error })
+                    if device_id == "other"
+                        && matches!(**error, VirtualDeviceError::InvalidStateType)
+            ),
+            "{result:?}"
+        );
+        assert_eq!(stored(&store, "a").await, off(), "a was committed");
+        assert_eq!(stored(&store, "scene").await, no_scene(), "the scene");
+        assert!(pump(&manager, &mut rx).await.is_empty(), "something echoed");
+    }
+
+    /// #58: a write through an inner group keeps the write queue's order,
+    /// because it queues on everything it can reach, the inner group's
+    /// lights included (`write_keys`).
+    ///
+    /// `fader` fades light `l` to 80 over a second. 100 ms in, `movies`
+    /// (another controller) sets group `g`, over `l` and `m`, to 30: it
+    /// shares `l` with the fade only through `g`, and waits for it. 100 ms
+    /// later a write to `l` alone (group `solo`) asks for 50: it shares `l`
+    /// with the waiting scene, and waits for it. Once the fade commits,
+    /// they land in the order they asked: `l` goes 80, 30, 50, and the
+    /// newest shows. `m` doesn't move before the scene lands.
+    ///
+    /// Queued on `g` alone, the scene went at once, during the fade, and
+    /// the fade then put the older 80 over it.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_through_an_inner_group_keeps_the_queue_order() {
+        let (manager, store, bus) = manager_over(&["l", "m"]).await;
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        let sunset = scene_config("evening", &[("l", light(true, 80))], &fade);
+        register(&manager, scene_controller_named("fader", &store, [sunset])).await;
+        let movie = scene_config(
+            "movie",
+            &[("g", light(true, 30))],
+            &serde_json::json!("Instant"),
+        );
+        register(&manager, scene_controller_named("movies", &store, [movie])).await;
+        register(&manager, group("g", &["l", "m"], &store)).await;
+        register(&manager, group("solo", &["l"], &store)).await;
+        let mut rx = bus.subscribe();
+        let activate_on = |controller: &'static str, scene_name: &str| {
+            let state = DeviceStateValue::Scene(SceneState {
+                scene_name: scene_name.to_string(),
+                is_active: true,
+            });
+            spawn_write(&manager, controller, state)
+        };
+
+        let started = tokio::time::Instant::now();
+        let fade = activate_on("fader", "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let movie = activate_on("movies", "movie");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let solo = spawn_write(&manager, "solo", light(true, 50));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(!movie.is_finished(), "the scene didn't wait for the fade");
+        assert!(!solo.is_finished(), "the write to l didn't wait");
+        for id in ["l", "m"] {
+            assert_eq!(
+                stored(&store, id).await,
+                off(),
+                "{id} moved during the fade"
+            );
+        }
+
+        for (what, task) in [("the fade", fade), ("the scene", movie), ("solo", solo)] {
+            let (result, landed) = task.await.expect("write task");
+            result.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(landed - started, Duration::from_secs(1), "{what} landed");
+        }
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "l"),
+            vec![light(true, 80), light(true, 30), light(true, 50)],
+            "l's echoes: the fade, the scene through g, the write to l"
+        );
+        assert_eq!(echoes(&events, "m"), vec![light(true, 30)], "m's echoes");
+        assert_eq!(
+            stored(&store, "l").await,
+            light(true, 50),
+            "the newest shows"
+        );
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #58: #60's retry, with the devices a write reaches through a
+    /// virtual member. A scene over group `g` (over `a`) queues on `g` and
+    /// `a` too. While it waits for `g`, `g` is replaced by a group over
+    /// `z`, which a write in flight holds. When `g` is let go, the scene
+    /// must not go: what it reaches now names `z`, so it joins again, and
+    /// waits for `z`. Then it sets `z`, not `a`.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_whose_inner_group_changes_while_it_waits_joins_again() {
+        let (manager, store, _bus) = manager_over(&["a", "z"]).await;
+        let movie = scene_config(
+            "movie",
+            &[("g", light(true, 30))],
+            &serde_json::json!("Instant"),
+        );
+        register(&manager, scene_controller_named("movies", &store, [movie])).await;
+        register(&manager, group("g", &["a"], &store)).await;
+        let on_g = manager.write_queue.join(["g".to_string()]);
+        let on_z = manager.write_queue.join(["z".to_string()]);
+        let state = DeviceStateValue::Scene(SceneState {
+            scene_name: "movie".to_string(),
+            is_active: true,
+        });
+        let movie = spawn_write(&manager, "movies", state);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!movie.is_finished(), "it went before g was let go");
+
+        manager
+            .virtual_devices
+            .write()
+            .await
+            .insert("g".to_string(), Box::new(group("g", &["z"], &store)));
+        drop(on_g);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!movie.is_finished(), "it went without its turn on z");
+
+        drop(on_z);
+        let (result, _) = tokio::time::timeout(Duration::from_secs(1), movie)
+            .await
+            .expect("it never went")
+            .expect("write task");
+        result.expect("movie");
+        assert_eq!(stored(&store, "z").await, light(true, 30), "z");
+        assert_eq!(stored(&store, "a").await, off(), "a");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #58: a group a write fans out through isn't re-derived from its own
+    /// lights' echoes, any more than the group written is (#22): the
+    /// manager hands it its new state before tracking sees them, and it
+    /// accounts for them. [`LossyGroup`] `k` re-derives lossily (set to 50,
+    /// it reads 49), so only that skip keeps it at 50, whether a scene or a
+    /// group sets it.
+    #[tokio::test]
+    async fn an_inner_lossy_group_is_not_re_derived_from_its_own_echoes() {
+        for outer in ["scene", "outer"] {
+            let (manager, store, bus) = manager_over(&["e", "f"]).await;
+            register(&manager, lossy_group("k", ["e", "f"], &store)).await;
+            let targets = [("k", light(true, 50))];
+            register(
+                &manager,
+                scene(&store, &targets, &serde_json::json!("Instant")),
+            )
+            .await;
+            register(&manager, group("outer", &["k"], &store)).await;
+            let mut rx = bus.subscribe();
+
+            let asked = if outer == "scene" {
+                evening()
+            } else {
+                light(true, 50)
+            };
+            write(&manager, outer, asked).await.expect("the write");
+            let events = pump(&manager, &mut rx).await;
+
+            for (id, level) in [("e", 90), ("f", 25)] {
+                assert_eq!(
+                    stored(&store, id).await,
+                    light(true, level),
+                    "{outer}: {id}"
+                );
+            }
+            assert_eq!(stored(&store, "k").await, light(true, 50), "{outer}: k");
+            assert_eq!(
+                own_state(&manager, "k").await,
+                light(true, 50),
+                "{outer}: k's own"
+            );
+            assert_eq!(
+                echoes(&events, "k"),
+                vec![light(true, 50)],
+                "{outer}: one echo of k, and no re-derived one"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // #72 review: one plan per write, each device once; groups of groups
+    // catch up with a group registered after them
+    // -----------------------------------------------------------------
+
+    /// A `LightGroup` named `device_id` over `member` alone, with the
+    /// curve `[[0, lo], [100, hi]]`.
+    fn curved_group(
+        device_id: &str,
+        member: &str,
+        (lo, hi): (u8, u8),
+        store: &Arc<StateStore>,
+    ) -> LightGroup {
+        let curves = serde_json::json!({ member: { "breakpoints": [[0, lo], [100, hi]] } });
+        LightGroup::new(
+            VirtualDeviceConfig {
+                device_id: device_id.to_string(),
+                device_type: VirtualDeviceType::LightGroup,
+                name: device_id.to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({ "lights": [member], "brightness_curves": curves }),
+            },
+            store.clone(),
+        )
+        .expect("curved group")
+    }
+
+    /// #72 review, finding 1: a scene that sets group `g` (over the lamp
+    /// and `m`) to 30 and the lamp itself to 5 puts the lamp at 5 every
+    /// time: the scene's own target is the most direct path to it. It used
+    /// to be written through both paths, in the order of the scene's
+    /// `HashMap`, which changes with every new map: the lamp ended at 30 in
+    /// about 40 % of runs, and `g` re-derived to 17 in the others.
+    ///
+    /// 60 fresh managers, each with scenes of fresh `HashMap`s. The lamp's
+    /// id sorts after `g`'s (`l`), then before it (`a`), and the scene
+    /// lists the two one way round, then the other. Every run: the lamp is
+    /// at 5 and `m` at 30, each echoed once. `g` took 30, then re-derived
+    /// from its lights as they are, (5 + 30) / 2 = 17, in the same commit:
+    /// echoed once, at 17, and tracking leaves it there.
+    #[tokio::test]
+    async fn a_scene_over_a_group_and_one_of_its_lamps_sets_the_lamp_every_time() {
+        for run in 0..60 {
+            let lamp = if run % 2 == 0 { "l" } else { "a" };
+            let (manager, store, bus) = manager_over(&[lamp, "m"]).await;
+            register(&manager, group("g", &[lamp, "m"], &store)).await;
+            let mut targets = vec![("g", light(true, 30)), (lamp, light(true, 5))];
+            if run % 4 >= 2 {
+                targets.reverse();
+            }
+            let order: Vec<&str> = targets.iter().map(|(id, _)| *id).collect();
+            let case = format!("run {run}, the scene lists {order:?}");
+            register(
+                &manager,
+                scene(&store, &targets, &serde_json::json!("Instant")),
+            )
+            .await;
+            let mut rx = bus.subscribe();
+
+            write(&manager, "scene", evening()).await.expect("evening");
+            assert_eq!(stored(&store, lamp).await, light(true, 5), "{case}: lamp");
+            assert_eq!(stored(&store, "g").await, light(true, 17), "{case}: g");
+            assert_eq!(own_state(&manager, "g").await, light(true, 17), "{case}");
+            let events = pump(&manager, &mut rx).await;
+
+            for (id, state) in [
+                (lamp, light(true, 5)),
+                ("m", light(true, 30)),
+                ("g", light(true, 17)),
+            ] {
+                assert_eq!(stored(&store, id).await, state, "{case}: {id}");
+                assert_eq!(echoes(&events, id), vec![state], "{case}: {id}'s echoes");
+            }
+            assert_eq!(echoes(&events, "scene"), vec![evening()], "{case}");
+        }
+    }
+
+    /// #72 review, finding 3: a group reached through two groups of the
+    /// device written is planned once, and it and its light are written
+    /// and echoed once. `O` (1:1) is over `A` (1:1) and `B` (a curve from
+    /// 50 to 100), and both are over `G`, over `l`. `O` at 40 would put `G`
+    /// at 40 through `A`, and at 70 through `B`: two paths of the same
+    /// length, so the one through the id that sorts first, `A`, sets it,
+    /// however `O` lists them. `G` and `l` go to 40, once each; it used to
+    /// be planned and committed through both (`l` echoed 40, then 70).
+    ///
+    /// `B` can't show `G` at 40 (its curve starts at 50), so it re-derives
+    /// in the same commit, to the level that puts `G` nearest 40 (1 and 2
+    /// both put it at 51, and 2 is nearer the 40 it was set to). `O` then
+    /// follows its members to (40 + 2) / 2 = 21. Each is echoed once, where
+    /// input tracking leaves it.
+    #[tokio::test]
+    async fn a_group_reached_through_two_groups_is_planned_and_echoed_once() {
+        for listed in [["A", "B"], ["B", "A"]] {
+            let (manager, store, bus) = manager_over(&["l"]).await;
+            register(&manager, group("G", &["l"], &store)).await;
+            register(&manager, group("A", &["G"], &store)).await;
+            register(&manager, curved_group("B", "G", (50, 100), &store)).await;
+            register(&manager, group("O", &listed, &store)).await;
+            let mut rx = bus.subscribe();
+
+            write(&manager, "O", light(true, 40))
+                .await
+                .expect("O at 40");
+            let events = pump(&manager, &mut rx).await;
+
+            for (id, level) in [("l", 40), ("G", 40), ("A", 40), ("B", 2), ("O", 21)] {
+                let want = light(true, level);
+                assert_eq!(stored(&store, id).await, want, "O lists {listed:?}: {id}");
+                assert_eq!(echoes(&events, id), vec![want], "O lists {listed:?}: {id}");
+            }
+        }
+    }
+
+    /// #72 review, finding 2: a group of groups registered before its inner
+    /// group (its file sorts first) catches up with it as soon as the inner
+    /// one is registered. It used to seed without it, as off, and stay so
+    /// until one of the inner group's lights changed. Both orders end the
+    /// same: `downstairs` on at 80, where `living` puts it.
+    ///
+    /// And through three levels, registered outermost first: each catch-up
+    /// moves the group above it, up to the top.
+    #[tokio::test]
+    async fn a_group_of_groups_registered_before_its_inner_group_catches_up_with_it() {
+        let mut seeded = Vec::new();
+        for inner_first in [true, false] {
+            let (manager, store, _bus) = manager_over(&["a", "h"]).await;
+            store
+                .update_device_state(&"a".to_string(), light(true, 80))
+                .await
+                .expect("a");
+            let inner = group("living", &["a"], &store);
+            let outer = group("downstairs", &["living", "h"], &store);
+            if inner_first {
+                register(&manager, inner).await;
+                register(&manager, outer).await;
+            } else {
+                register(&manager, outer).await;
+                register(&manager, inner).await;
+            }
+            let state = stored(&store, "downstairs").await;
+            assert_eq!(own_state(&manager, "downstairs").await, state);
+            seeded.push((inner_first, state));
+        }
+        assert_eq!(
+            seeded,
+            vec![(true, light(true, 80)), (false, light(true, 80))],
+            "downstairs, registered after its inner group and before it"
+        );
+
+        let (manager, store, _bus) = manager_over(&["a"]).await;
+        store
+            .update_device_state(&"a".to_string(), light(true, 80))
+            .await
+            .expect("a");
+        for (id, member) in [("top", "mid"), ("mid", "low"), ("low", "a")] {
+            register(&manager, group(id, &[member], &store)).await;
+        }
+        for id in ["low", "mid", "top"] {
+            assert_eq!(stored(&store, id).await, light(true, 80), "{id}");
+            assert_eq!(own_state(&manager, id).await, light(true, 80), "{id}");
+        }
+    }
+
+    /// #72 review, finding 2: a toggle of a group of groups registered
+    /// before its inner group switches a lit room off. It used to start
+    /// from the stale "off" the group seeded as, and so switched it on at
+    /// 100: `a`, lit at 80, went up to 100, and `h` came on too.
+    #[tokio::test]
+    async fn a_toggle_of_a_group_of_groups_registered_first_switches_a_lit_room_off() {
+        let (manager, store, bus) = manager_over(&["a", "h"]).await;
+        store
+            .update_device_state(&"a".to_string(), light(true, 80))
+            .await
+            .expect("a");
+        register(&manager, group("downstairs", &["living", "h"], &store)).await;
+        register(&manager, group("living", &["a"], &store)).await;
+        let toggle = serde_json::json!(["toggle", "downstairs"]);
+        add_controller(&manager, &store, toggle, serde_json::json!([])).await;
+        let mut rx = bus.subscribe();
+
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        pump(&manager, &mut rx).await;
+        for (id, state) in [
+            ("a", off()),
+            ("h", off()),
+            ("living", light(false, 80)),
+            ("downstairs", light(false, 80)),
+        ] {
+            assert_eq!(stored(&store, id).await, state, "{id}");
+        }
+    }
+
+    /// #72 review, nit 4: the queue's device set goes all the way down,
+    /// past two levels. Two writes that overlap only two levels below the
+    /// devices they're to (`m`, under `g1` under `o1`, and under `g2`
+    /// under `o2`) land in the order they asked. The first waits for a fade
+    /// of `l`, which it reaches two levels down too. An unrelated write
+    /// goes at once.
+    #[tokio::test(start_paused = true)]
+    async fn writes_that_overlap_two_levels_down_keep_their_order() {
+        let (manager, store, bus) = manager_over(&["l", "m", "n"]).await;
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        let sunset = scene_config("evening", &[("l", light(true, 80))], &fade);
+        register(&manager, scene_controller_named("fader", &store, [sunset])).await;
+        register(&manager, group("g1", &["l", "m"], &store)).await;
+        register(&manager, group("o1", &["g1"], &store)).await;
+        register(&manager, group("g2", &["m"], &store)).await;
+        register(&manager, group("o2", &["g2"], &store)).await;
+        register(&manager, group("o3", &["n"], &store)).await;
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let fade = spawn_write(&manager, "fader", evening());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let first = spawn_write(&manager, "o1", light(true, 30));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = spawn_write(&manager, "o2", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (result, landed) = spawn_write(&manager, "o3", light(true, 40))
+            .await
+            .expect("o3 task");
+        result.expect("o3");
+        assert_eq!(landed - started, Duration::from_millis(300), "o3 waited");
+        assert!(!first.is_finished(), "o1 went during the fade");
+        assert!(!second.is_finished(), "o2 went during the fade");
+        assert_eq!(stored(&store, "m").await, off(), "m moved during the fade");
+
+        let landed = tokio::time::timeout(Duration::from_secs(10), async {
+            [fade.await, first.await, second.await]
+        })
+        .await
+        .expect("deadlocked");
+        for (what, task) in ["the fade", "o1", "o2"].into_iter().zip(landed) {
+            let (result, at) = task.expect("write task");
+            result.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(at - started, Duration::from_secs(1), "{what} landed");
+        }
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "m"),
+            vec![light(true, 30), light(true, 60)],
+            "m: o1, then o2"
+        );
+        assert_eq!(
+            echoes(&events, "l"),
+            vec![light(true, 80), light(true, 30)],
+            "l: the fade, then o1"
+        );
+        assert_eq!(stored(&store, "m").await, light(true, 60), "the newest");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #72 review, nit 4: #60's retry follows a group replaced three levels
+    /// below the device written. While a write to `o2` (over `o1`, over
+    /// `g`, over `a`) waits behind a fade of `g`, `g` is replaced (a real
+    /// `add_virtual_device`) by a group over `a` and `z`, and a 2 s fade of
+    /// `z` asks after it. The write joins again with `z`, waits for that
+    /// fade, and lands after it: `z` ends at 60, the newest. Queued on two
+    /// levels only, it missed `z`, landed at once and the fade then put the
+    /// older 90 over it. (The release build has no debug assert to catch
+    /// that.)
+    #[tokio::test(start_paused = true)]
+    async fn a_write_three_levels_above_a_replaced_group_joins_again_with_its_lights() {
+        let (manager, store, bus) = manager_over(&["a", "z"]).await;
+        let one_second = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        let first = scene_config("evening", &[("g", light(true, 80))], &one_second);
+        register(&manager, scene_controller_named("fader1", &store, [first])).await;
+        let two_seconds = serde_json::json!({ "Fade": { "duration_ms": 2000 } });
+        let second = scene_config("evening", &[("z", light(true, 90))], &two_seconds);
+        register(&manager, scene_controller_named("fader2", &store, [second])).await;
+        register(&manager, group("g", &["a"], &store)).await;
+        register(&manager, group("o1", &["g"], &store)).await;
+        register(&manager, group("o2", &["o1"], &store)).await;
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let fade1 = spawn_write(&manager, "fader1", evening());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let replace = tokio::spawn({
+            let (manager, store) = (manager.clone(), store.clone());
+            async move {
+                manager
+                    .add_virtual_device(Box::new(group("g", &["a", "z"], &store)))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let write_o2 = spawn_write(&manager, "o2", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fade2 = spawn_write(&manager, "fader2", evening());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!replace.is_finished(), "the replacement went during fade1");
+        assert!(!write_o2.is_finished(), "o2 went during fade1");
+
+        let (result, landed) = tokio::time::timeout(Duration::from_secs(10), write_o2)
+            .await
+            .expect("deadlocked")
+            .expect("o2 task");
+        result.expect("o2");
+        fade1.await.expect("fade1 task").0.expect("fade1");
+        replace.await.expect("replacement task").expect("replace g");
+        let (result, fade2_landed) = fade2.await.expect("fade2 task");
+        result.expect("fade2");
+        assert_eq!(fade2_landed - started, Duration::from_millis(2300), "fade2");
+        assert_eq!(
+            landed - started,
+            Duration::from_millis(2300),
+            "o2 waited for fade2"
+        );
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "z"),
+            vec![light(true, 90), light(true, 60)],
+            "z: fade2, then o2"
+        );
+        for id in ["a", "z"] {
+            assert_eq!(stored(&store, id).await, light(true, 60), "{id}");
+        }
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #72 review, nit 5: an inner group a write leaves as it is isn't
+    /// echoed, as a light it leaves as it is isn't. `inner`'s range in
+    /// `outer` is flat at 50, so `outer` at 60 and then at 70 puts it at 50
+    /// both times: the second write echoes `outer` and `c`, and nothing
+    /// under `inner`.
+    #[tokio::test]
+    async fn an_inner_group_the_write_leaves_as_it_is_is_not_echoed() {
+        let (manager, store, bus) = manager_over(&["a", "b", "c"]).await;
+        register(&manager, group("inner", &["a", "b"], &store)).await;
+        let ranges = [("inner", (50, 50)), ("c", (0, 100))];
+        register(&manager, linear_group_over("outer", &ranges, &store)).await;
+        let mut rx = bus.subscribe();
+
+        write(&manager, "outer", light(true, 60)).await.expect("60");
+        let events = pump(&manager, &mut rx).await;
+        for (id, level) in [
+            ("a", 50),
+            ("b", 50),
+            ("inner", 50),
+            ("c", 60),
+            ("outer", 60),
+        ] {
+            assert_eq!(echoes(&events, id), vec![light(true, level)], "60: {id}");
+        }
+
+        write(&manager, "outer", light(true, 70)).await.expect("70");
+        let events = pump(&manager, &mut rx).await;
+        for (id, level) in [("c", 70), ("outer", 70)] {
+            assert_eq!(echoes(&events, id), vec![light(true, level)], "70: {id}");
+        }
+        for id in ["a", "b", "inner"] {
+            assert!(
+                echoes(&events, id).is_empty(),
+                "70: {id} echoed: {events:?}"
+            );
+        }
+    }
+
+    /// #72 review, nit 6: a scene aimed at another scene controller as if
+    /// it were a light loads (its target may load after it), but `start`
+    /// warns about it, once everything is in: every activation of it fails.
+    /// A scene aimed at a light group is fine, and isn't flagged.
+    #[tokio::test]
+    async fn start_warns_about_a_virtual_target_that_cant_be_set_like_a_light() {
+        let (manager, store, _bus) = manager_over(&["a"]).await;
+        register(&manager, group("g", &["a"], &store)).await;
+        let x = scene_config(
+            "x",
+            &[("a", light(true, 10))],
+            &serde_json::json!("Instant"),
+        );
+        register(&manager, scene_controller_named("other", &store, [x])).await;
+        let targets = [("g", light(true, 30)), ("other", light(true, 30))];
+        register(
+            &manager,
+            scene(&store, &targets, &serde_json::json!("Instant")),
+        )
+        .await;
+        assert_eq!(
+            manager.unsupported_targets().await,
+            vec![("scene".to_string(), "other".to_string())]
+        );
+
+        let logs = CapturedLogs::default();
+        {
+            let _default = tracing::subscriber::set_default(logs.subscriber());
+            manager.start().await.expect("start");
+        }
+        let logs = logs.text();
+        assert!(
+            logs.contains(
+                "Virtual device scene sets other, a virtual device that can't be set like a light"
+            ),
+            "start must warn about other: {logs:?}"
+        );
+        assert!(!logs.contains("sets g,"), "g is a light group: {logs:?}");
     }
 }

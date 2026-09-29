@@ -1,0 +1,19 @@
+# 🪆 A GROUP OF GROUPS - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. It's the nesting example of `docs/VIRTUAL_DEVICES.md`,
+# over the dummy `basic_home` scenario's lights, with each file named after
+# its id: so this one, the outer group, sorts before `living_room_lights.toml`,
+# the group it nests, and loads first.
+
+type = "light_group_linear"
+device_id = "downstairs_lights"
+name = "Downstairs"
+
+[members]
+living = "living_room_lights"   # a light group: fans out to its own lights
+hall = "light_bedroom"
+
+[brightness]
+living = [20, 100]
+hall = [0, 100]

@@ -1,0 +1,11 @@
+# 🔘 A SWITCH THAT TOGGLES A GROUP OF GROUPS - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. A click of the dummy's `switch_hallway` toggles
+# `downstairs_lights`.
+
+type = "button_controller"
+device_id = "switch_downstairs"
+name = "Downstairs Switch"
+button = "switch_hallway"
+press_on = ["toggle", "downstairs_lights"]

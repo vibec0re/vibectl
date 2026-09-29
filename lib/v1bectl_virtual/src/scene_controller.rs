@@ -1,7 +1,7 @@
 use crate::config::{SceneControllerConfig, SceneDeviceState};
 use crate::virtual_device::{
-    DetachedPlan, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
-    VirtualWrite,
+    is_virtual, DetachedPlan, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError,
+    VirtualDeviceType, VirtualWrite,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,16 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Its devices and their targets, in the order of the devices' ids: the
+    /// order activating it sets them in (and a sequence's delays go by).
+    /// `device_states` is a `HashMap`, whose own order changes from one
+    /// server start to the next (#58 review, finding 1).
+    fn targets(&self) -> Vec<(&DeviceId, &DeviceStateValue)> {
+        let mut targets: Vec<_> = self.device_states.iter().collect();
+        targets.sort_by_key(|(device_id, _)| *device_id);
+        targets
+    }
+
     /// Whether activating it waits: a fade of at least one step, or a
     /// sequence with a delay before one of its devices.
     fn waits(&self) -> bool {
@@ -46,8 +56,14 @@ impl Scene {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransitionType {
     Instant,
-    Fade { duration_ms: u64 },
-    Sequence { delays_ms: Vec<u64> },
+    Fade {
+        duration_ms: u64,
+    },
+    /// The i-th delay goes before the i-th device, in the order of the
+    /// devices' ids.
+    Sequence {
+        delays_ms: Vec<u64>,
+    },
 }
 
 /// What a write to a scene controller asks of it.
@@ -144,7 +160,10 @@ impl SceneController {
     /// `CreateVirtualDevice` sends it, checked the way [`Self::from_toml`]
     /// checks a TOML one, by the same checks (`check_scenes`), so both
     /// reject the same configs with the same messages (#64). With a line
-    /// for each thing it only warns about, for the caller to log.
+    /// for each thing it only warns about, for the caller to log. As there,
+    /// a target that's a virtual device is resolved when the scene is
+    /// activated, so it makes no difference whether the API created it
+    /// before the scene or after (#58).
     ///
     /// On top of those, each scene must be listed under its own `name`. A
     /// scene is activated by the name it's listed under, so one listed
@@ -195,7 +214,9 @@ impl SceneController {
     /// - Each `[[scenes]]` is a scene of its `name`. Its `display_name` is
     ///   kept in the config, but nothing at runtime reads it.
     /// - Each of its `devices` is a target (see `toml_state`), in the shape
-    ///   the store holds that device in (see `in_store_shape`).
+    ///   the store holds that device in (see `in_store_shape`), if it's a
+    ///   physical one. A target that's a virtual device is kept as the TOML
+    ///   says it, and resolved when the scene is activated (#58).
     /// - `settings.transition_duration` is every scene's transition (see
     ///   `toml_transition`): a fade over it, or instant for 0. The TOML
     ///   has no transition per scene, and no sequence.
@@ -208,14 +229,19 @@ impl SceneController {
     /// config that is ambiguous or can't work: two scenes of one name, a
     /// scene named `none` or with no name (a write of either deactivates
     /// the current scene, so it could never be activated), a device twice
-    /// in one scene, a brightness over 100, or a device the store holds as
-    /// something a scene can't set (a switch, a sensor).
+    /// in one scene, a brightness over 100, or a physical device the store
+    /// holds as something a scene can't set (a switch, a sensor).
     ///
     /// A device the store doesn't have is no error, as for the other
     /// virtual devices: it may be a virtual device that loads later. The
     /// manager warns about each one still missing once all are loaded (see
     /// [`crate::VirtualDeviceManager::dangling_references`]), and activating
-    /// a scene that sets one fails at it.
+    /// a scene that sets one fails at it. A virtual device that's already
+    /// loaded counts the same (see `physical_state`), so the files' load
+    /// order changes nothing: a scene that sets a light group works
+    /// whichever loads first, and one that sets something only a light can
+    /// be set to, but isn't a light (another scene controller), fails when
+    /// it's activated, with nothing committed (#58).
     pub async fn from_toml(
         toml: &SceneControllerConfig,
         state_store: Arc<StateStore>,
@@ -242,7 +268,7 @@ impl SceneController {
             let name = &scene.name;
             let mut device_states = HashMap::new();
             for (device_id, target) in &checked.targets {
-                let current = state_store.get_device(device_id).await.map(|d| d.state);
+                let current = physical_state(&state_store, device_id).await;
                 device_states.insert(
                     (*device_id).clone(),
                     in_store_shape(target, current.as_ref()),
@@ -379,7 +405,7 @@ impl SceneController {
         match scene.transition_type {
             TransitionType::Instant => {
                 // Set all devices immediately
-                for (device_id, target) in &scene.device_states {
+                for (device_id, target) in scene.targets() {
                     if !Self::stage_target(store, &mut staged, device_id, target).await {
                         break;
                     }
@@ -392,7 +418,7 @@ impl SceneController {
 
                 if steps == 0 {
                     // Just set immediately if duration too short
-                    for (device_id, target) in &scene.device_states {
+                    for (device_id, target) in scene.targets() {
                         if !Self::stage_target(store, &mut staged, device_id, target).await {
                             break;
                         }
@@ -416,7 +442,7 @@ impl SceneController {
                     )]
                     let progress = step as f32 / steps as f32;
 
-                    for (device_id, target_state) in &scene.device_states {
+                    for (device_id, target_state) in scene.targets() {
                         let started = staged.get(device_id).cloned();
                         let (current_state, target) =
                             match started.zip(targets.get(device_id).cloned()) {
@@ -456,7 +482,7 @@ impl SceneController {
             }
             TransitionType::Sequence { ref delays_ms } => {
                 // Activate devices in sequence with specified delays
-                for (i, (device_id, target)) in scene.device_states.iter().enumerate() {
+                for (i, (device_id, target)) in scene.targets().into_iter().enumerate() {
                     if let Some(&delay_ms) = delays_ms.get(i) {
                         if delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -794,15 +820,20 @@ impl<'a> SceneTargets<'a> {
 ///   the current scene, so it could never be activated;
 /// - a device twice in one scene;
 /// - a brightness over 100;
-/// - a device the store holds as something a scene can't set (a switch, a
-///   sensor), or a target that isn't a light's or an outlet's state.
+/// - a physical device the store holds as something a scene can't set (a
+///   switch, a sensor), or a target that isn't a light's or an outlet's
+///   state.
 ///
 /// It warns about a config with no scenes, a scene with no devices, and a
-/// light's brightness or colour for a device the store holds as an outlet:
-/// only whether it's on is set (see [`in_store_shape`]).
+/// light's brightness or colour for a physical device the store holds as an
+/// outlet: only whether it's on is set (see [`in_store_shape`]).
 ///
 /// A device the store doesn't have is no error, as for the other virtual
-/// devices: it may be a virtual device that loads later.
+/// devices: it may be a virtual device that loads later. A virtual device
+/// the store already has counts as one it doesn't (see [`physical_state`]):
+/// whether the store has it depends on whether it was loaded, or created
+/// through the API, before the scene or after. It's resolved when the scene
+/// is activated (#58).
 async fn check_scenes(
     scenes: &[SceneTargets<'_>],
     store: &StateStore,
@@ -877,7 +908,7 @@ async fn check_target(
         )));
     }
 
-    match store.get_device(device_id).await.map(|device| device.state) {
+    match physical_state(store, device_id).await {
         None | Some(DeviceStateValue::Light(_)) => {}
         Some(DeviceStateValue::Outlet(_)) => {
             if brightness.is_some() || names_colour {
@@ -894,6 +925,23 @@ async fn check_target(
         }
     }
     Ok(())
+}
+
+/// The state the store holds for `device_id`, if it's a physical device's.
+/// That's all a scene's checks ([`check_target`]) and its TOML mapping
+/// ([`SceneController::from_toml`]) go by. A virtual device (a light group,
+/// another controller) counts as one the store doesn't have: it's resolved
+/// when the scene is activated, where the manager writes it through its own
+/// plan (#58). The virtual devices load from `virtual_devices/*.toml` one
+/// file after another, and a client creates them through the API in any
+/// order, so going by the ones already loaded would accept a scene or
+/// reject it, and shape its targets, by that order (#63 review, finding 2).
+async fn physical_state(store: &StateStore, device_id: &DeviceId) -> Option<DeviceStateValue> {
+    store
+        .get_device(device_id)
+        .await
+        .filter(|device| !is_virtual(&device.device_info))
+        .map(|device| device.state)
 }
 
 /// What kind of device holds `state`, for an error message.
@@ -1064,13 +1112,15 @@ mod tests {
     }
 
     /// The scene's devices in the order its transition takes them: the
-    /// order of its `device_states`.
+    /// order of their ids (#58 review, finding 1), not their `HashMap`'s.
     fn order(controller: &SceneController) -> Vec<DeviceId> {
-        controller.scenes["evening"]
+        let mut ids: Vec<DeviceId> = controller.scenes["evening"]
             .device_states
             .keys()
             .cloned()
-            .collect()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// #58: a sequence takes its devices in order, the i-th after the i-th

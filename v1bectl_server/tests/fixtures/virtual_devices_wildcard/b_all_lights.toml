@@ -1,0 +1,11 @@
+# 💡 A WILDCARD LIGHT GROUP - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. `light_*` matches the dummy `basic_home` scenario's
+# lights, and not `light_virtual_pair` from `a_light_virtual.toml`, though
+# that one is loaded (and in the store) by the time this file is.
+
+type = "light_group"
+device_id = "all_lights"
+name = "All Lights"
+members = ["light_*"]

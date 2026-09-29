@@ -21,6 +21,32 @@ pub enum VirtualDeviceError {
     Config(String),
     #[error("Timer error: {0}")]
     Timer(String),
+    /// A write reached a virtual device it was already fanning out through
+    /// (#58): the devices nest in a cycle. The path runs from the device
+    /// written to the one it came back to. Nothing was committed.
+    #[error("Virtual devices nest in a cycle: {}", .0.join(" → "))]
+    Cycle(Vec<DeviceId>),
+    /// A write would fan out through more levels of virtual devices than
+    /// `MAX_NESTING` (#58). The path runs from the device written to the
+    /// one past the limit. Nothing was committed.
+    #[error("Virtual devices nest more than {} levels deep: {}", .max, .path.join(" → "))]
+    TooDeep { path: Vec<DeviceId>, max: usize },
+    /// A virtual member of a write couldn't plan the state the write gives
+    /// it (#58): a scene that sets a scene controller as if it were a
+    /// light, say. Nothing was committed.
+    #[error("Virtual member {device_id} can't take its part of the write: {error}")]
+    Member {
+        device_id: DeviceId,
+        error: Box<VirtualDeviceError>,
+    },
+}
+
+/// Whether `info` is a virtual device's, as the store holds it: the manager
+/// registers each one in the `virtual` device group, and the API tells them
+/// apart the same way.
+#[must_use]
+pub fn is_virtual(info: &DeviceInfo) -> bool {
+    info.device_groups.iter().any(|group| group == "virtual")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +110,12 @@ pub trait VirtualDevice: Send + Sync {
     /// and revert the member. Only once every member write is committed
     /// does the manager hand the device its new state
     /// ([`Self::take_state`]). If one fails, the device keeps its old one.
+    ///
+    /// A member may be a virtual device itself (a scene's light group, a
+    /// group in a group). The manager then asks that one for its own plan
+    /// of the state listed for it, and commits that the same way, all the
+    /// way down to the physical members (#58). The device doesn't need to
+    /// know which of its members are virtual.
     async fn plan_write(
         &self,
         new_state: DeviceStateValue,
@@ -109,6 +141,10 @@ pub trait VirtualDevice: Send + Sync {
     /// hold of its lock, so no other write lands in between. A group needs
     /// that: its plan starts from its own state (a plain `on` restores its
     /// level, #16).
+    ///
+    /// Only the device a write is to plans this way. One it reaches as a
+    /// virtual member is planned with [`Self::plan_write`], in the hold of
+    /// the lock that commits the write.
     fn plan_write_detached(&self, new_state: &DeviceStateValue) -> Option<DetachedPlan> {
         let _ = new_state;
         None
@@ -128,6 +164,12 @@ pub trait VirtualDevice: Send + Sync {
     /// scene it's asked for. (A button action queues on its target's
     /// [`Self::output_devices`] instead, since the state it writes isn't
     /// known until its turn comes. So list nothing outside those.)
+    ///
+    /// A member that is itself virtual (a scene's light group, a group in a
+    /// group) is written through its own plan, so the write reaches its
+    /// members too (#58). The manager adds those on its own, through that
+    /// member's [`Self::output_devices`], all the way down: list only your
+    /// own members here.
     fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
         let _ = new_state;
         self.output_devices()
@@ -210,7 +252,11 @@ pub trait VirtualDevice: Send + Sync {
         Vec::new()
     }
 
-    /// Which physical devices this virtual device controls (for output)
+    /// Which devices this virtual device controls (for output): every
+    /// member any write to it may write. One may be virtual itself (a light
+    /// group in a light group): a write fans out through it to its own
+    /// members (#58). The manager rejects a device whose outputs lead back
+    /// to it, when it's registered.
     fn output_devices(&self) -> Vec<DeviceId> {
         Vec::new()
     }
