@@ -115,19 +115,19 @@ pub trait VirtualDevice: Send + Sync {
     }
 
     /// The devices a write of `new_state` to this device can write: every
-    /// member its plan may list. The manager holds each one's write lock,
-    /// and this device's own, from before it plans the write to after it
-    /// commits it, a scene's delays included (#58). So a write that shares
-    /// any of them with one in progress waits for it, and one that shares
-    /// none doesn't.
+    /// member its plan may list. The manager queues the write on them, and
+    /// on this device, from before it plans the write to after it commits
+    /// it, a scene's delays included (#58). So a write that shares any of
+    /// them with one in flight waits for it, and one that shares none
+    /// doesn't.
     ///
     /// It may list more than the write needs, which only serializes more.
-    /// It must not list less. The default is [`Self::output_devices`]: a
-    /// group writes its members. A scene controller writes only the
-    /// devices of the scene it's asked for. (A button action takes the
-    /// locks of its target's [`Self::output_devices`] instead, since the
-    /// state it writes isn't known until it holds them. So list nothing
-    /// outside those.)
+    /// It must not list less: a debug build asserts that a plan stays
+    /// within it. The default is [`Self::output_devices`]: a group writes
+    /// its members. A scene controller writes only the devices of the
+    /// scene it's asked for. (A button action queues on its target's
+    /// [`Self::output_devices`] instead, since the state it writes isn't
+    /// known until its turn comes. So list nothing outside those.)
     fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
         let _ = new_state;
         self.output_devices()

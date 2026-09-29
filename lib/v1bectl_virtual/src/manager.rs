@@ -1,8 +1,8 @@
 use crate::button_controller::ButtonAction;
-use crate::device_locks::{DeviceLockSet, DeviceLocks};
 use crate::virtual_device::{
     VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
 };
+use crate::write_queue::{WriteQueue, WriteTurn};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -27,8 +27,8 @@ use v1bectl_sync::{
 /// The one exception is a scene's transition, which waits between its steps
 /// (#58). It runs without that lock, and only its commit takes it, so a fade
 /// doesn't hold up what it has nothing to do with. A write that shares a
-/// device with it still waits for it, through the per-device locks every
-/// write takes first (see [`Self::set_virtual_device_state`]).
+/// device with it still waits for it, through the write queue every write
+/// joins first (see [`Self::set_virtual_device_state`]).
 pub struct VirtualDeviceManager {
     /// All virtual devices indexed by device ID
     virtual_devices: Arc<RwLock<HashMap<DeviceId, Box<dyn VirtualDevice>>>>,
@@ -49,10 +49,10 @@ pub struct VirtualDeviceManager {
     sync_engine: Arc<OnceLock<Arc<SyncEngine>>>,
     /// Set once [`Self::start`] has run (see [`Self::add_virtual_device`]).
     tracking: Arc<AtomicBool>,
-    /// Each write's hold on the devices it writes, from before it plans to
-    /// after it commits (see [`Self::set_virtual_device_state`]). Always
-    /// taken before the `virtual_devices` lock, never while holding it.
-    device_locks: Arc<DeviceLocks>,
+    /// Every write's place in line, on the devices it writes, from before it
+    /// plans to after it commits (see [`Self::set_virtual_device_state`]).
+    /// Waited in before the `virtual_devices` lock, never while holding it.
+    write_queue: Arc<WriteQueue>,
 }
 
 /// A state echo for `device_id`, in the same `AttributeChanged{attribute:
@@ -100,7 +100,7 @@ impl VirtualDeviceManager {
             event_bus,
             sync_engine: Arc::new(OnceLock::new()),
             tracking: Arc::new(AtomicBool::new(false)),
-            device_locks: Arc::default(),
+            write_queue: Arc::default(),
         }
     }
 
@@ -149,36 +149,47 @@ impl VirtualDeviceManager {
         Ok(())
     }
 
-    /// Take the write locks of the devices `keys` names (see
-    /// [`Self::set_virtual_device_state`]), then the `virtual_devices` lock.
-    /// `keys` reads them off the devices the manager has: a write's device
-    /// and every member it may write.
+    /// Queue a write on the devices `keys` names (see
+    /// [`Self::set_virtual_device_state`]), wait for its turn, then take the
+    /// `virtual_devices` lock. `keys` reads them off the devices the manager
+    /// has: a write's device and every member it may write. Keep the
+    /// returned turn until the write is committed.
     ///
-    /// The device locks come first, and are waited for without the
-    /// `virtual_devices` lock, which nothing holds while it waits for a
-    /// device lock. So the two can't deadlock. The devices can change while
-    /// it waits (a device added or removed), so it reads `keys` again under
-    /// the lock, and starts over if that names one it doesn't hold.
+    /// The write joins the queue under a brief read of the devices, so the
+    /// devices it names are the ones the manager had when it asked. It waits
+    /// for its turn without the `virtual_devices` lock, which nothing holds
+    /// while it waits in the queue, so the two can't deadlock.
+    ///
+    /// A write ahead of it in the queue can change the devices it names (an
+    /// add or remove of its target, which queues on the target too). So it
+    /// reads `keys` again under the lock, and if that names a device it
+    /// wasn't queued on, it leaves the queue and joins again with the new
+    /// devices, **at the back**: it's asked again, against the devices as
+    /// they are now. It can't keep its old place. That would have it wait
+    /// for writes that asked after it (on the devices it now names), while
+    /// others that asked after it wait for it, and that can deadlock.
     async fn lock_for_write(
         &self,
         keys: impl Fn(&HashMap<DeviceId, Box<dyn VirtualDevice>>) -> Vec<DeviceId>,
     ) -> (
-        DeviceLockSet,
+        WriteTurn,
         RwLockWriteGuard<'_, HashMap<DeviceId, Box<dyn VirtualDevice>>>,
     ) {
         loop {
-            let wanted = keys(&*self.virtual_devices.read().await);
-            let held = self.device_locks.lock(wanted).await;
+            let mut turn = {
+                let devices = self.virtual_devices.read().await;
+                self.write_queue.join(keys(&devices))
+            };
+            turn.ready().await;
             let devices = self.virtual_devices.write().await;
-            if held.covers(&keys(&devices)) {
-                return (held, devices);
+            if turn.covers(&keys(&devices)) {
+                return (turn, devices);
             }
         }
     }
 
-    /// The device locks a write of `new_state` to `device_id` takes: its
-    /// own, and those of every member it may write
-    /// ([`VirtualDevice::writes_to`]).
+    /// The devices a write of `new_state` to `device_id` queues on: itself,
+    /// and every member it may write ([`VirtualDevice::writes_to`]).
     fn write_keys(
         devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
         device_id: &DeviceId,
@@ -315,10 +326,10 @@ impl VirtualDeviceManager {
             }
         }
 
-        // Add device. Under its device lock too, so it doesn't replace one
-        // of that id while a write to it is in progress.
+        // Add device. It queues on its id too, so it doesn't replace one of
+        // that id while a write to it is in flight.
         {
-            let (_held, mut devices) = self.lock_for_write(|_| vec![device_id.clone()]).await;
+            let (_turn, mut devices) = self.lock_for_write(|_| vec![device_id.clone()]).await;
             devices.insert(device_id.clone(), device);
         }
 
@@ -460,13 +471,13 @@ impl VirtualDeviceManager {
         &self,
         device_id: &DeviceId,
     ) -> Result<(), VirtualDeviceError> {
-        // Remove from devices, and from the store, in one hold. Its device
-        // lock is taken first, so a write to it in progress (a scene's fade)
-        // commits before it goes, as it did when that write held the
-        // `virtual_devices` lock throughout (#58). It's let go with that
-        // lock, before the mappings are cleaned up.
+        // Remove from devices, and from the store, in one hold. It queues on
+        // its id first, so a write to it in flight (a scene's fade) commits
+        // before it goes, as it did when that write held the
+        // `virtual_devices` lock throughout (#58). It leaves the queue with
+        // that lock, before the mappings are cleaned up.
         let (device, removed_from_store) = {
-            let (_held, mut devices) = self.lock_for_write(|_| vec![device_id.clone()]).await;
+            let (_turn, mut devices) = self.lock_for_write(|_| vec![device_id.clone()]).await;
             let Some(device) = devices.remove(device_id) else {
                 return Ok(());
             };
@@ -709,17 +720,19 @@ impl VirtualDeviceManager {
     /// state the action starts from is still the target's when the write
     /// lands (see the type's docs). So don't call it with that lock held.
     ///
-    /// First it takes the device locks of the target and, for a virtual
-    /// one, its outputs (every member any write to it can write; the
-    /// action's state isn't known until it holds them). So a press that
-    /// shares a light with a scene's fade waits for the fade's commit, and
-    /// lands after it, as a write that overlaps one does (see
+    /// First it queues on the target and, for a virtual one, its outputs
+    /// (every member any write to it can write; the action's state isn't
+    /// known until its turn comes). So a press that shares a light with a
+    /// scene's fade waits for the fade's commit, and lands after it, as a
+    /// write that overlaps one does (see
     /// [`Self::set_virtual_device_state`]). Input tracking runs a press's
-    /// actions in turn, so it waits with it, as it waited for every fade
-    /// before #58. A press that shares nothing with a fade doesn't wait.
+    /// actions in turn, so it waits with it: the presses and re-derivations
+    /// behind it wait too, until the fade commits. That's as before #58,
+    /// when tracking waited for every fade. A press that shares nothing with
+    /// a write in flight doesn't wait.
     async fn run_action(&self, action: &ButtonAction) -> Result<(), VirtualDeviceError> {
         let target = &action.target;
-        let (_held, mut devices) = self
+        let (turn, mut devices) = self
             .lock_for_write(|devices| {
                 let mut keys = devices
                     .get(target)
@@ -758,7 +771,9 @@ impl VirtualDeviceManager {
         let new_state = DeviceStateValue::Light(action.apply(light.clone()));
 
         if devices.contains_key(target) {
-            return self.write_virtual(&mut devices, target, new_state).await;
+            return self
+                .write_virtual(&mut devices, &turn, target, new_state)
+                .await;
         }
         self.commit_member_write(target, &current, &new_state, false)
             .await
@@ -791,35 +806,51 @@ impl VirtualDeviceManager {
     /// the lock: the members, the scene's own state and their echoes, with
     /// no other virtual write in between.
     ///
-    /// What orders writes is a lock per device. Every write takes the locks
-    /// of the devices it writes, before it plans and until it has
-    /// committed, a scene's delays included: its virtual device's own, and
+    /// What orders writes is a write queue. Every write joins it in the
+    /// order it asks, with the devices it writes: its virtual device, and
     /// every member it may write ([`VirtualDevice::writes_to`]). A button
-    /// action takes its target's, and a removal the removed device's. So:
+    /// action joins with its target (and a virtual target's outputs), and
+    /// an add or a removal with the device itself. A write goes once every
+    /// write that joined before it and shares a device with it is over,
+    /// whether that one is running or still waiting itself, and it stays in
+    /// the queue until it has committed, a scene's delays included. So:
     ///
     /// - **A write that overlaps a transition** (it shares a member with
     ///   it, or is to the same scene controller) waits for the
     ///   transition's commit, and lands after it. The newest write ends up
     ///   showing, as when every write waited on the `virtual_devices` lock.
     ///   An "all off" pressed during a ten-second fade turns the lights off
-    ///   once the fade has committed, and they stay off. Overlapping writes
-    ///   go in the order they asked (the locks are fair).
-    /// - **A write that doesn't overlap** goes ahead at once. A one-second
-    ///   fade used to hold up every virtual write, input tracking, resync
-    ///   and button press for its whole second.
+    ///   once the fade has committed, and they stay off.
+    /// - **Writes that overlap each other** land in the order they asked,
+    ///   even when they overlap only through a write that's still waiting.
+    ///   A write to `[a, z]` that waits for a fade of `a` holds up a later
+    ///   write to `z` alone, which then lands after it (#60 review,
+    ///   finding 1).
+    /// - **A write that overlaps nothing in flight** goes ahead at once. A
+    ///   one-second fade used to hold up every virtual write, input
+    ///   tracking, resync and button press for its whole second.
     /// - **A scene controller removed during its transition** goes once the
     ///   transition has committed, as before.
+    /// - **A write dropped part-way** (a client that went away), while it
+    ///   waits or during its transition, leaves the queue at once, and the
+    ///   writes behind it go on. It commits nothing.
     /// - **A direct write to a light through the API** doesn't go through
     ///   the manager, so it lands at once, and a fade over that light
     ///   overwrites it when it commits. That's as it always was.
     ///
-    /// Input tracking and resync take no device lock. They only re-derive a
-    /// virtual device from its inputs, under the `virtual_devices` lock, so
-    /// they never wait for a transition.
+    /// Input tracking and resync don't queue. They only re-derive a virtual
+    /// device from its inputs, under the `virtual_devices` lock, so they
+    /// don't wait for a transition themselves. But tracking runs a press's
+    /// actions in turn, and a press that overlaps a transition waits for
+    /// it. Until the transition commits, the presses and re-derivations
+    /// behind that press wait too. That's as before #58, when tracking
+    /// waited for every transition.
     ///
-    /// None of this can deadlock. A write takes all its device locks at
-    /// once, in one order (sorted by id), before the `virtual_devices` lock,
-    /// and nothing waits for a device lock while it holds that one.
+    /// None of this can deadlock. A write waits only for writes that asked
+    /// before it, so the earliest one in the queue never waits, and it
+    /// waits in the queue before it takes the `virtual_devices` lock, which
+    /// nothing holds while it waits in the queue. The queue holds only the
+    /// writes in flight: each leaves it when it's over, however it ends.
     ///
     /// Cancelling a transition when a newer write to its devices comes in,
     /// instead of making that write wait, could be a later improvement. It
@@ -837,7 +868,7 @@ impl VirtualDeviceManager {
         new_state: DeviceStateValue,
     ) -> Result<(), VirtualDeviceError> {
         // Held until the write is committed (see above).
-        let (_held, mut devices) = self
+        let (turn, mut devices) = self
             .lock_for_write(|devices| Self::write_keys(devices, device_id, &new_state))
             .await;
         let Some(virtual_device) = devices.get(device_id) else {
@@ -845,7 +876,9 @@ impl VirtualDeviceManager {
         };
         let Some(plan) = virtual_device.plan_write_detached(&new_state) else {
             // Held to the end (see the type's docs).
-            return self.write_virtual(&mut devices, device_id, new_state).await;
+            return self
+                .write_virtual(&mut devices, &turn, device_id, new_state)
+                .await;
         };
 
         // A plan that waits runs without the `virtual_devices` lock (see
@@ -854,18 +887,21 @@ impl VirtualDeviceManager {
         let planned = plan.await;
         let mut devices = self.virtual_devices.write().await;
         if !devices.contains_key(device_id) {
-            // Can't happen: a removal waits for the device lock we hold.
+            // Can't happen: a removal queues on it, behind this write.
             return Err(VirtualDeviceError::DeviceNotFound(device_id.clone()));
         }
-        self.commit_write(&mut devices, device_id, planned).await
+        self.commit_write(&mut devices, &turn, device_id, planned)
+            .await
     }
 
     /// [`Self::set_virtual_device_state`], for a caller that already holds
-    /// the `virtual_devices` lock: `devices` is what it guards. The write is
-    /// planned and committed in that one hold.
+    /// the `virtual_devices` lock and `turn`, its place in the write queue:
+    /// `devices` is what the lock guards. The write is planned and committed
+    /// in that one hold.
     async fn write_virtual(
         &self,
         devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        turn: &WriteTurn,
         device_id: &DeviceId,
         new_state: DeviceStateValue,
     ) -> Result<(), VirtualDeviceError> {
@@ -879,24 +915,35 @@ impl VirtualDeviceManager {
         // the manager to commit after, left a gap a pull could revert them
         // in.
         let planned = virtual_device.plan_write(new_state).await;
-        self.commit_write(devices, device_id, planned).await
+        self.commit_write(devices, turn, device_id, planned).await
     }
 
     /// Commit `planned`, the write `device_id` planned (or the error its
     /// plan failed with): its members, in order, then its own new state,
     /// stored and echoed. `devices` is what the `virtual_devices` lock
-    /// guards, which the caller holds, and which has `device_id`.
+    /// guards, which the caller holds, and which has `device_id`. `turn` is
+    /// the write's place in the write queue, which the caller holds too.
     async fn commit_write(
         &self,
         devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        turn: &WriteTurn,
         device_id: &DeviceId,
         planned: Result<VirtualWrite, VirtualDeviceError>,
     ) -> Result<(), VirtualDeviceError> {
         let result = match planned {
-            Ok(write) => self
-                .commit_members(devices, write.members)
-                .await
-                .map(|()| write.state),
+            Ok(write) => {
+                // A member the write wasn't queued on could be written while
+                // another write to it is in flight: `writes_to` listed too
+                // few (see there).
+                debug_assert!(
+                    turn.covers(write.members.iter().map(|(id, _)| id)),
+                    "{device_id} planned a write outside its `writes_to`: {:?}",
+                    write.members
+                );
+                self.commit_members(devices, write.members)
+                    .await
+                    .map(|()| write.state)
+            }
             Err(e) => Err(e),
         };
 
@@ -1063,7 +1110,7 @@ impl Clone for VirtualDeviceManager {
             event_bus: Arc::clone(&self.event_bus),
             sync_engine: Arc::clone(&self.sync_engine),
             tracking: Arc::clone(&self.tracking),
-            device_locks: Arc::clone(&self.device_locks),
+            write_queue: Arc::clone(&self.write_queue),
         }
     }
 }
@@ -2082,16 +2129,17 @@ mod tests {
         );
     }
 
-    /// #58: writes that each hold one device another waits for can't
-    /// deadlock: a write takes its device locks in one order, sorted by id,
-    /// whatever order its members come in.
+    /// #58: writes over the same devices in opposite member order can't
+    /// deadlock: a write waits in the queue for the writes that asked
+    /// before it, all its devices at once, whatever order its members come
+    /// in.
     ///
     /// Group `g1` lists `a` then `b`, and `g2` lists `b` then `a`. Both ask
-    /// during a fade over `a` and `b`, so both wait, and both are woken
-    /// when the fade lets go. Taking the locks in member order, `g1` would
-    /// get `a` and wait for `b` while `g2` got `b` and waited for `a`. Both
-    /// finish, bounded by a timeout, in the order they asked, so `g2`'s
-    /// level ends up showing.
+    /// during a fade over `a` and `b`, so both wait, and both can go when
+    /// the fade is over. With per-device locks taken in member order, `g1`
+    /// would get `a` and wait for `b` while `g2` got `b` and waited for
+    /// `a`. Both finish, bounded by a timeout, in the order they asked, so
+    /// `g2`'s level ends up showing.
     #[tokio::test(start_paused = true)]
     async fn overlapping_writes_in_opposite_member_order_do_not_deadlock() {
         let store = StateStore::new();
@@ -2135,7 +2183,11 @@ mod tests {
         for id in ["a", "b"] {
             assert_eq!(stored(&store, id).await, light(true, 70), "{id}: g2 last");
         }
-        assert_eq!(manager.device_locks.len(), 0, "idle locks must not pile up");
+        assert_eq!(
+            manager.write_queue.len(),
+            0,
+            "the queue holds only writes in flight"
+        );
     }
 
     /// #58: a scene controller removed during its fade goes once the fade
@@ -2175,6 +2227,257 @@ mod tests {
             .get_virtual_device_state(&"scene".to_string())
             .await
             .is_err());
+    }
+
+    /// Lights `lights`, off; a 1:1 group for each of `groups`; and scene
+    /// controller `scene`, whose `evening` fades `a` and `b` to 80 over a
+    /// second.
+    async fn fade_of_a_and_b_with(
+        lights: &[&str],
+        groups: &[(&str, &[&str])],
+    ) -> (VirtualDeviceManager, Arc<StateStore>, Arc<EventBus>) {
+        let store = StateStore::new();
+        for id in lights {
+            store.add_device(light_info(id), off()).await;
+        }
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        for (id, members) in groups {
+            manager
+                .add_virtual_device(Box::new(group(id, members, &store)))
+                .await
+                .expect("register");
+        }
+        let targets = [("a", light(true, 80)), ("b", light(true, 80))];
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        manager
+            .add_virtual_device(Box::new(scene(&store, &targets, &fade)))
+            .await
+            .expect("register");
+        (manager, store, bus)
+    }
+
+    /// A write of `state` to `id` on a task of its own, which returns when
+    /// it finished.
+    fn spawn_write(
+        manager: &VirtualDeviceManager,
+        id: &'static str,
+        state: DeviceStateValue,
+    ) -> tokio::task::JoinHandle<(Result<(), VirtualDeviceError>, tokio::time::Instant)> {
+        let manager = manager.clone();
+        timed(async move {
+            manager
+                .set_virtual_device_state(&id.to_string(), state)
+                .await
+        })
+    }
+
+    /// #60 review, finding 1 (R1): a later write doesn't overtake an
+    /// earlier one that waits, when they share a device the earlier one
+    /// waits with.
+    ///
+    /// During a one-second fade of `a` and `b`, `g1` (over `a` and `z`)
+    /// asks for 60, and waits for the fade on `a`. Then `g2` (over `z`
+    /// alone) asks for 20. `z` is free, but `g1` is ahead of `g2` on it, so
+    /// `g2` waits for `g1`. Both land once the fade has committed, `g1`
+    /// first, and `z` ends at 20, the newest write, as on `main`. Per-device
+    /// locks taken one at a time let `g2` land at once, and `g1` then
+    /// overwrote it with 60.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_write_does_not_overtake_an_earlier_waiting_one() {
+        let (manager, store, bus) =
+            fade_of_a_and_b_with(&["a", "b", "z"], &[("g1", &["a", "z"]), ("g2", &["z"])]).await;
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let g1 = spawn_write(&manager, "g1", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let g2 = spawn_write(&manager, "g2", light(true, 20));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !g2.is_finished(),
+            "g2 overtook g1, which waits for the fade"
+        );
+        assert_eq!(stored(&store, "z").await, off(), "z moved during the fade");
+
+        fade.await.expect("fade task").expect("fade");
+        let (result, g1_landed) = g1.await.expect("g1 task");
+        result.expect("g1");
+        let (result, g2_landed) = g2.await.expect("g2 task");
+        result.expect("g2");
+        assert_eq!(g1_landed - started, Duration::from_secs(1), "g1 landed");
+        assert_eq!(g2_landed - started, Duration::from_secs(1), "g2 landed");
+
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "z"),
+            vec![light(true, 60), light(true, 20)],
+            "z's echoes: g1, then g2"
+        );
+        assert_eq!(
+            stored(&store, "z").await,
+            light(true, 20),
+            "the newest shows"
+        );
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #60 review, finding 3 (mutant B): a button press on a group queues
+    /// on the group's members too, so a press on a group that shares a
+    /// light with a fade waits for the fade, and the press shows.
+    ///
+    /// Group `g` over `a` and `c` is on at 60. During a fade of `a` to 80,
+    /// a click turns `g` off. It lands once the fade has committed, and
+    /// `a` ends off.
+    #[tokio::test(start_paused = true)]
+    async fn a_press_on_a_group_waits_for_a_fade_over_its_members() {
+        let (manager, store, bus) =
+            fade_of_a_and_b_with(&["a", "b", "c"], &[("g", &["a", "c"])]).await;
+        let all_off = serde_json::json!(["off", "g"]);
+        let controller = controller("ctrl", "btn", all_off, serde_json::json!([]));
+        manager
+            .add_virtual_device(Box::new(controller))
+            .await
+            .expect("register");
+        manager
+            .set_virtual_device_state(&"g".to_string(), light(true, 60))
+            .await
+            .expect("g on");
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let press = timed({
+            let manager = manager.clone();
+            async move { manager.handle_event(&click("btn")).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!press.is_finished(), "the press didn't wait for the fade");
+
+        fade.await.expect("fade task").expect("fade");
+        let (result, landed) = press.await.expect("press task");
+        result.expect("input tracking");
+        assert_eq!(landed - started, Duration::from_secs(1), "the press landed");
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "a"),
+            vec![light(true, 80), light(false, 0)],
+            "a's echoes: the fade, then the press"
+        );
+        for id in ["a", "c"] {
+            assert_eq!(stored(&store, id).await, light(false, 0), "{id} is off");
+        }
+    }
+
+    /// #60 review, finding 3 (mutant C): a write whose devices change while
+    /// it waits in the queue (an add or a removal ahead of it changed its
+    /// target) joins again with the new devices, and waits for those too.
+    ///
+    /// The write names `a`, which another write holds, and `z` is held too.
+    /// While it waits, what it names grows to `a` and `z`. When `a` is let
+    /// go, the write must not go: it joins again, and waits for `z`.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_whose_devices_change_while_it_waits_joins_again_with_them() {
+        let manager = VirtualDeviceManager::new(StateStore::new(), Arc::new(EventBus::new(10)));
+        let on_a = manager.write_queue.join(["a".to_string()]);
+        let on_z = manager.write_queue.join(["z".to_string()]);
+        let names = Arc::new(std::sync::Mutex::new(vec!["a".to_string()]));
+        let write = tokio::spawn({
+            let (manager, names) = (manager.clone(), Arc::clone(&names));
+            async move {
+                let (turn, devices) = manager
+                    .lock_for_write(|_| names.lock().expect("names").clone())
+                    .await;
+                drop((devices, turn));
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!write.is_finished(), "it went before a was let go");
+
+        names.lock().expect("names").push("z".to_string());
+        drop(on_a);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!write.is_finished(), "it went without its turn on z");
+
+        drop(on_z);
+        tokio::time::timeout(Duration::from_secs(1), write)
+            .await
+            .expect("it never went")
+            .expect("write task");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// A write dropped while it waits in the queue (a client that went
+    /// away) leaves the queue at once. A later write that waited for it
+    /// goes, and the dropped write commits nothing.
+    ///
+    /// During a fade of `a`, `g1` (over `a` and `z`) waits for it, and `g2`
+    /// (over `z`) waits for `g1`. `g1` is dropped: `g2` lands at once,
+    /// without waiting for the fade.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_dropped_while_it_waits_lets_later_writes_go() {
+        let (manager, store, _bus) =
+            fade_of_a_and_b_with(&["a", "b", "z"], &[("g1", &["a", "z"]), ("g2", &["z"])]).await;
+
+        let started = tokio::time::Instant::now();
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let g1 = spawn_write(&manager, "g1", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let g2 = spawn_write(&manager, "g2", light(true, 20));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!g2.is_finished(), "g2 overtook g1");
+
+        g1.abort();
+        assert!(g1.await.expect_err("g1 finished").is_cancelled());
+        let (result, g2_landed) = tokio::time::timeout(Duration::from_millis(1), g2)
+            .await
+            .expect("g2 still waits for the dropped write")
+            .expect("g2 task");
+        result.expect("g2");
+        assert_eq!(g2_landed - started, Duration::from_millis(300), "g2 landed");
+        assert_eq!(stored(&store, "z").await, light(true, 20), "z");
+
+        fade.await.expect("fade task").expect("fade");
+        assert_eq!(stored(&store, "a").await, light(true, 80), "a: the fade");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// A scene activation dropped during its fade (a client that went away)
+    /// leaves the queue at once. The write waiting for it goes, and the
+    /// fade commits nothing.
+    #[tokio::test(start_paused = true)]
+    async fn a_fade_dropped_mid_transition_lets_later_writes_go() {
+        let (manager, store, _bus) =
+            fade_of_a_and_b_with(&["a", "b", "z"], &[("g1", &["a", "z"])]).await;
+
+        let started = tokio::time::Instant::now();
+        let fade = activate(&manager, "evening");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let g1 = spawn_write(&manager, "g1", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!g1.is_finished(), "g1 didn't wait for the fade");
+
+        fade.abort();
+        assert!(fade.await.expect_err("the fade finished").is_cancelled());
+        let (result, g1_landed) = tokio::time::timeout(Duration::from_millis(1), g1)
+            .await
+            .expect("g1 still waits for the dropped fade")
+            .expect("g1 task");
+        result.expect("g1");
+        assert_eq!(g1_landed - started, Duration::from_millis(300), "g1 landed");
+
+        // Well past where the fade would have ended: it committed nothing.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for id in ["a", "z"] {
+            assert_eq!(stored(&store, id).await, light(true, 60), "{id}: g1");
+        }
+        assert_eq!(stored(&store, "b").await, off(), "b: the fade committed");
+        assert_eq!(stored(&store, "scene").await, no_scene(), "the scene");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
     }
 
     /// Scene devices and controller targets are outputs, not inputs. A
