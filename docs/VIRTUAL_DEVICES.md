@@ -622,7 +622,7 @@ own 1:1 brightness curves for each member rather than using
 
 ### `scene_controller`
 
-Named scenes of device states, each with its own transition
+Named scenes of device states, all with the same transition
 (`SceneControllerConfig`):
 
 ```toml
@@ -655,12 +655,46 @@ default_scene = "cozy"
 
 Each scene device has a `device_id` and a tagged `state`: `type = "light"`
 (`is_on`, optional `brightness`, optional `color_temp`) or `type = "outlet"`
-(`is_on`). The loader parses this shape fine, but `v1bectl_server` doesn't
-build a `SceneController` from it yet — that `match` arm is still a TODO
-("Scene controllers not yet implemented!" in
-`v1bectl_server/src/main.rs`). The `SceneController` type itself, and its
-fade and sequence transitions, are real and tested (see 🚦 above); only the
-TOML wiring for it is missing.
+(`is_on`). `v1bectl_server` builds a `SceneController` from it with
+`SceneController::from_toml` (`lib/v1bectl_virtual/src/scene_controller.rs`)
+and registers it like the types above (#10). The file maps onto the same
+runtime config the API's `CreateVirtualDevice` takes:
+
+| TOML | Runtime |
+|---|---|
+| `device_id`, `name` | the controller's id and name |
+| `[[scenes]]` `name` | a scene of that name, which `ActivateScene` sets |
+| `display_name` | kept in the controller's config; nothing at runtime reads it |
+| `[[scenes.devices]]` | that device's target in the scene, in the shape the store holds the device in |
+| `type = "light"` | a light state (`is_on`, `brightness`, `color_temp`); `rgb_color` is unset |
+| `type = "outlet"` | an outlet state if the store holds the device as one (the dummy's `outlet_tv`), or an on/off light state if it holds it as a light, which is how a Dirigera hub reads its outlets |
+| `settings.transition_duration` (ms, default 1000) | every scene's transition: `Instant` at 0, else a `Fade` over it, in whole 100 ms steps |
+| `settings.default_scene` | kept in the config, with a warning: nothing activates it |
+
+The file can't express a transition per scene, or a `Sequence` with its
+delays (see 🚦 above for both). A light field it leaves out (`brightness`,
+`color_temp`) is unset in the target, as in a scene the API creates: a
+scene writes the device's whole state.
+
+When the server loads the file, it checks it the way it checks the other
+types:
+- ❌ **Not created** (logged; the other files still load): two scenes of one
+  name, a scene named `none` or with no name (setting either deactivates, so
+  it could never be set), a device twice in one scene, a `brightness` over
+  100, or a device the store holds as something a scene can't set (a switch,
+  a sensor).
+- ⚠️ **Created, with a warning**: no scenes, a scene with no devices, a
+  `default_scene`, a `transition_duration` shorter than one 100 ms step (set
+  instantly) or between steps (rounded down), and `brightness`/`color_temp`
+  for a device the store holds as an outlet (only `is_on` is set).
+- A device the store doesn't have is no error, as for a button controller's
+  target: it may be a virtual device that loads later. The manager's `start`
+  warns about each one still missing (`dangling_references`), and setting a
+  scene with one fails at that device.
+
+`v1bectl_server/src/tests.rs` loads two such files
+(`v1bectl_server/tests/fixtures/virtual_devices/`) the way the server does,
+and sets their scenes against the dummy hub: an instant one and a 2 s fade.
 
 ## API Integration
 
