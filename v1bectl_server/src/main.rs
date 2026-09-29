@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn, Level};
+use tracing::{debug, error, info, warn};
 use v1bectl_api::AxumServer;
 use v1bectl_gateway::{DirigeraGateway, Gateway};
 use v1bectl_sync::{
@@ -42,10 +42,31 @@ enum Commands {
     },
 }
 
+/// Builds the tracing filter from an already-read `RUST_LOG` value (or
+/// `None` if it's unset), defaulting to `info` when it's unset or invalid.
+/// An invalid value (a typo, say) prints a one-line ⚠️ warning to stderr
+/// instead of silently falling back, so field debugging isn't blind twice
+/// over.
+///
+/// Takes the env value as a parameter, rather than reading `RUST_LOG`
+/// itself, so it can be unit-tested without racing other tests over process
+/// environment state.
+fn log_filter(env: Option<&str>) -> tracing_subscriber::EnvFilter {
+    match env {
+        Some(value) => tracing_subscriber::EnvFilter::try_new(value).unwrap_or_else(|err| {
+            eprintln!("⚠️ invalid RUST_LOG={value:?} ({err}), defaulting to info");
+            tracing_subscriber::EnvFilter::new("info")
+        }),
+        None => tracing_subscriber::EnvFilter::new("info"),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize tracing with VIBEC0RE vibes! 🔥
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .init();
 
     let cli = Cli::parse();
 
@@ -723,3 +744,31 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    #[test]
+    fn unset_defaults_to_info() {
+        assert_eq!(log_filter(None).to_string(), "info");
+    }
+
+    #[test]
+    fn override_sets_the_level() {
+        assert_eq!(log_filter(Some("debug")).to_string(), "debug");
+    }
+
+    #[test]
+    fn override_accepts_a_per_crate_directive() {
+        assert_eq!(
+            log_filter(Some("v1bectl_sync=debug")).to_string(),
+            "v1bectl_sync=debug"
+        );
+    }
+
+    #[test]
+    fn invalid_directive_falls_back_to_info() {
+        assert_eq!(log_filter(Some("!!not-a-directive!!")).to_string(), "info");
+    }
+}

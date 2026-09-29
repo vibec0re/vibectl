@@ -103,6 +103,17 @@ The server reads your Dirigera access token from `~/.local/state/v1bectl/access.
 (or the `V1BECTL_ACCESS_TOKEN` environment variable). See
 [IKEA's pairing flow](https://github.com/Leggin/dirigera) for how to obtain one.
 
+### Logging
+
+The server, CLI and TUI all take their log level from `RUST_LOG` (via
+`tracing_subscriber::EnvFilter`), defaulting to `info` when it's unset or
+invalid. For field debugging, scope it to the crates you care about instead
+of turning on `debug` everywhere:
+
+```bash
+RUST_LOG=v1bectl_sync=debug,v1bectl_gateway=debug cargo run -p v1bectl_server -- dummy --scenario basic_home
+```
+
 ### Clients
 
 ```bash
