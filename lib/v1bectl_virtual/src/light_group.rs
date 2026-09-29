@@ -298,6 +298,33 @@ impl LightGroup {
         )
         .map_err(|e| VirtualDeviceError::Config(format!("Invalid brightness curves: {e}")))?;
 
+        // #71: the TOML path only ever builds a 2-point curve from a
+        // `min`/`max` pair, checked before it's built (`v1bectl_server`).
+        // The API's `CreateVirtualDevice` takes a `LightGroup`'s raw
+        // breakpoints straight from the client, so they're checked here
+        // too, the same way #68 checks a scene's brightness: every
+        // currently-valid curve stays valid — rising, falling (`min >
+        // max`), a dip or a plateau — as long as each breakpoint is a
+        // brightness, 0..=100, and there are at least two of them to
+        // interpolate between.
+        for (light_id, curve) in &brightness_curves {
+            if curve.breakpoints.len() < 2 {
+                return Err(VirtualDeviceError::Config(format!(
+                    "{light_id}'s brightness curve needs at least 2 breakpoints, has {}",
+                    curve.breakpoints.len()
+                )));
+            }
+            if let Some(&(group_level, device_level)) = curve
+                .breakpoints
+                .iter()
+                .find(|&&(group_level, device_level)| group_level > 100 || device_level > 100)
+            {
+                return Err(VirtualDeviceError::Config(format!(
+                    "{light_id}'s brightness curve is out of range ({group_level}, {device_level}); both values of a breakpoint must be 0-100"
+                )));
+            }
+        }
+
         // Validate that all lights have curves
         for light_id in &lights {
             if !brightness_curves.contains_key(light_id) {
