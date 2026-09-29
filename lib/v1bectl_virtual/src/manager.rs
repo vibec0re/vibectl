@@ -3603,13 +3603,99 @@ mod tests {
         bus.publish(state_event(&id, Some(&old), &state)).await;
     }
 
-    /// A `LightGroup` named `device_id` over two lights, with curves (80-100
-    /// and 0-50) that make re-deriving it lossy: set to 50, it reads back as
-    /// 57. A curved group re-derives from its members' own levels, so only
-    /// the skip of its own echoes (`accounts_for`) keeps it at its level. A
-    /// linear group inverts its ranges and would read back 50 either way
-    /// (#10).
-    fn lossy_group(device_id: &str, [e, f]: [&str; 2], store: &Arc<StateStore>) -> LightGroup {
+    /// `level` rounded down to an odd level: the steps a [`LossyGroup`]
+    /// reads its level back in.
+    fn coarse(level: u8) -> u8 {
+        if level.is_multiple_of(2) {
+            level.saturating_sub(1)
+        } else {
+            level
+        }
+    }
+
+    /// A group that fans out, and accounts for its members, exactly as the
+    /// group it wraps, but re-derives lossily: it reads its level back in
+    /// steps of two, [`coarse`]. Set to 50, it would read 49 once its
+    /// members' echoes re-derived it.
+    ///
+    /// Both light group types read back the level they were set to (#10,
+    /// #66), so over them no test can tell whether the manager skipped the
+    /// echoes of a group's own write (`accounts_for`). Over this one it
+    /// can: only the skip keeps it at the even level it was set to.
+    struct LossyGroup(Box<dyn VirtualDevice>);
+
+    impl LossyGroup {
+        /// Take the state the wrapped group just re-derived, coarsened.
+        fn coarsen(&mut self) {
+            if let DeviceStateValue::Light(mut group) = self.0.current_state() {
+                group.brightness = group.brightness.map(coarse);
+                self.0.take_state(DeviceStateValue::Light(group));
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VirtualDevice for LossyGroup {
+        fn device_id(&self) -> &DeviceId {
+            self.0.device_id()
+        }
+
+        fn device_type(&self) -> VirtualDeviceType {
+            self.0.device_type()
+        }
+
+        fn config(&self) -> &VirtualDeviceConfig {
+            self.0.config()
+        }
+
+        async fn plan_write(
+            &self,
+            new_state: DeviceStateValue,
+        ) -> Result<VirtualWrite, VirtualDeviceError> {
+            self.0.plan_write(new_state).await
+        }
+
+        fn take_state(&mut self, state: DeviceStateValue) {
+            self.0.take_state(state);
+        }
+
+        async fn seed_from_inputs(&mut self) -> Result<(), VirtualDeviceError> {
+            self.0.seed_from_inputs().await?;
+            self.coarsen();
+            Ok(())
+        }
+
+        async fn on_input_changed(
+            &mut self,
+            device_id: &DeviceId,
+            new_state: &DeviceState,
+        ) -> Result<(), VirtualDeviceError> {
+            self.0.on_input_changed(device_id, new_state).await?;
+            self.coarsen();
+            Ok(())
+        }
+
+        fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
+            self.0.accounts_for(input, state)
+        }
+
+        fn current_state(&self) -> DeviceStateValue {
+            self.0.current_state()
+        }
+
+        fn input_devices(&self) -> Vec<DeviceId> {
+            self.0.input_devices()
+        }
+
+        fn output_devices(&self) -> Vec<DeviceId> {
+            self.0.output_devices()
+        }
+    }
+
+    /// A [`LossyGroup`] named `device_id` over a `LightGroup` of two lights,
+    /// with curves (80-100 and 0-50): set to 50, it puts `e` at 90 and `f`
+    /// at 25, and re-derived from them it would read 49.
+    fn lossy_group(device_id: &str, [e, f]: [&str; 2], store: &Arc<StateStore>) -> LossyGroup {
         let curves = serde_json::json!({
             e: { "breakpoints": [[0, 80], [100, 100]] },
             f: { "breakpoints": [[0, 0], [100, 50]] },
@@ -3622,7 +3708,20 @@ mod tests {
             enabled: true,
             config: serde_json::json!({ "lights": [e, f], "brightness_curves": curves }),
         };
-        LightGroup::new(config, store.clone()).expect("lossy group")
+        let group = LightGroup::new(config, store.clone()).expect("curved group");
+        LossyGroup(Box::new(group))
+    }
+
+    /// The [`coarse`] steps a [`LossyGroup`] reads back in: an odd level is
+    /// one, an even one isn't. So the even levels the guards over it set
+    /// (50, 80, 30) all read back one lower if its members' echoes
+    /// re-derive it. If they didn't move, those guards would lose their
+    /// teeth again.
+    #[test]
+    fn a_lossy_group_reads_its_level_back_in_odd_steps() {
+        for (level, want) in [(50, 49), (80, 79), (30, 29), (49, 49), (1, 1), (100, 99)] {
+            assert_eq!(coarse(level), want, "{level}");
+        }
     }
 
     /// [`lossy_group`] `k` over `e` and `f`, both off, set to 50 (so `e` at
@@ -3657,15 +3756,15 @@ mod tests {
         (manager, store, bus, rx, events)
     }
 
-    /// #22: the echoes of a curved group's own write don't re-derive it,
-    /// since it accounts for them. Re-deriving it from its members' own
-    /// levels is lossy (set to 50, it reads 57), so only that skip keeps it
-    /// where it was set. Two writes before tracking sees the first one's
-    /// echoes end at the last (#14 review, finding 1): the stale echoes are
-    /// judged by the store, which holds the second write's members. (A
-    /// linear group re-derives exactly and can't tell, #10.)
+    /// #22: the echoes of a group's own write don't re-derive it, since it
+    /// accounts for them. Re-deriving [`LossyGroup`] is lossy (set to 50,
+    /// it reads 49), so only that skip keeps it where it was set. Two writes
+    /// before tracking sees the first one's echoes end at the last (#14
+    /// review, finding 1): the stale echoes are judged by the store, which
+    /// holds the second write's members. (A light group re-derives exactly
+    /// and can't tell, #10, #66.)
     #[tokio::test]
-    async fn a_curved_group_is_not_re_derived_from_its_own_echoes() {
+    async fn a_lossy_group_is_not_re_derived_from_its_own_echoes() {
         let (manager, store, _bus, mut rx, events) = lossy_group_at_50().await;
         assert_eq!(stored(&store, "k").await, light(true, 50), "k at 50");
         assert_eq!(echoes(&events, "k"), vec![light(true, 50)], "k's echo");
@@ -3678,7 +3777,7 @@ mod tests {
                 .expect("k's write");
         }
         let events = pump(&manager, &mut rx).await;
-        // Re-derived, `e` at 86 and `f` at 15 would read 50.
+        // Re-derived from `e` at 86 and `f` at 15, it would read 29.
         assert_eq!(stored(&store, "k").await, light(true, 30), "k at 30");
         assert_eq!(
             echoes(&events, "k"),
@@ -3688,10 +3787,11 @@ mod tests {
     }
 
     /// #14 review, finding 4b: a member the hub reports its own way (a bulb
-    /// without colour temperature has none) is still where its curved group
-    /// put it, so the group isn't re-derived. That would read 57, not 50.
+    /// without colour temperature has none) is still where its group put
+    /// it, so the group isn't re-derived. [`LossyGroup`] would read 49, not
+    /// 50.
     #[tokio::test]
-    async fn a_member_colour_the_hub_normalised_does_not_re_derive_a_curved_group() {
+    async fn a_member_colour_the_hub_normalised_does_not_re_derive_a_lossy_group() {
         let (manager, store, bus, mut rx, _) = lossy_group_at_50().await;
         let hub_view = DeviceStateValue::Light(LightState {
             is_on: true,
@@ -3704,6 +3804,35 @@ mod tests {
 
         assert_eq!(stored(&store, "k").await, light(true, 50), "k re-derived");
         assert!(echoes(&events, "k").is_empty(), "k re-echoed: {events:?}");
+    }
+
+    /// #16, #22: a group switched off keeps its level, and its members'
+    /// echoes of the off don't re-derive it: [`LossyGroup`] would go off at
+    /// 49, and the next plain `on` would light its members at 49's fan-out.
+    /// It lights them where 50 put them.
+    #[tokio::test]
+    async fn a_lossy_group_switched_off_keeps_its_level_through_its_echoes() {
+        let (manager, store, _bus, mut rx, _) = lossy_group_at_50().await;
+        let k = "k".to_string();
+
+        manager
+            .set_virtual_device_state(&k, light(false, 0))
+            .await
+            .expect("k off");
+        let events = pump(&manager, &mut rx).await;
+        let off_at_50 = light(false, 50);
+        assert_eq!(stored(&store, "k").await, off_at_50, "k off");
+        assert_eq!(echoes(&events, "k"), vec![off_at_50], "k's echo, once");
+        for id in ["e", "f"] {
+            assert_eq!(stored(&store, id).await, off(), "{id} off");
+        }
+
+        plain_on(&manager, &store, "k").await;
+        pump(&manager, &mut rx).await;
+        assert_eq!(stored(&store, "k").await, light(true, 50), "k back on");
+        for (id, level) in [("e", 90), ("f", 25)] {
+            assert_eq!(stored(&store, id).await, light(true, level), "{id} at 50");
+        }
     }
 
     /// A bus small enough for a test to overflow: a subscriber lags once it
@@ -3723,8 +3852,8 @@ mod tests {
     /// `g` (curves) must follow `a` to `{on, 40}`, and `h` (linear) go off
     /// with its level kept when `c` and `d` go off (#16), each echoed once
     /// and no more. `k`'s members didn't move, and it accounts for them
-    /// (#22): re-deriving it anyway would be lossy (set to 50, its curves
-    /// read back as 57), so it must keep 50 and not echo.
+    /// (#22): re-deriving it anyway would be lossy (a [`LossyGroup`] set to
+    /// 50 reads back 49), so it must keep 50 and not echo.
     ///
     /// The last event buffered is a press of `btn`, whose controller turns
     /// `marker` on. Tracking handles it before it catches up (#47 review,
