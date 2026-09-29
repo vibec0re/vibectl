@@ -613,12 +613,22 @@ exclude = []
 
 A member may end in `*` to match every device id with that prefix;
 `settings.exclude` (patterns or plain ids) then drops any of those back out
-before the group is built. As of this writing, though, `v1bectl_server` only
-forwards the resolved `members` to the `LightGroup` it builds: it derives its
-own 1:1 brightness curves for each member rather than using
-`brightness_curves` from the file, and doesn't forward `settings` at all
-(beyond using `exclude` for the wildcard match itself). Prefer
-`light_group_linear` above for curves that actually take effect.
+before the group is built. `v1bectl_server` maps each member's
+`brightness_curves` entry into the two-breakpoint curve `LightGroup` expects:
+group 0 -> `min`, group 100 -> `max` (#62). `light_3` above gets no entry, so
+it falls back to a 1:1 curve (group brightness = device brightness), logged
+at debug; a member only reached through a `*` wildcard always falls back the
+same way, since the file has no way to give a curve to an id it doesn't
+name. A curve with `min` or `max` over 100 fails the whole group, logged
+like any other creation failure.
+
+`LightGroup` itself always averages the levels of the members that are on
+and writes every member instantly (like `light_group_linear` above,
+`transition_time` isn't wired up on either type yet), so
+`settings.aggregation` other than `"average"` and any
+`settings.transition_time` are not honoured — each logs a `warn!` once at
+load rather than being silently dropped. `settings.exclude` *is* honoured,
+since it's applied to the wildcard match itself, before the group is built.
 
 ### `scene_controller`
 

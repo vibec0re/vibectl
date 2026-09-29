@@ -1,0 +1,22 @@
+# 🎚️ LIGHT GROUP - a test fixture (#62), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`, kept in its own fixture dir (separate from the scene
+# controller fixtures in `tests/fixtures/virtual_devices/`) so this group's
+# members don't clash with theirs.
+#
+# Its members are the dummy `basic_home` scenario's: `light_living_room`
+# gets a curve (group 100 -> member 60), and `light_kitchen` gets none, so
+# it falls back to the 1:1 default (#62).
+
+type = "light_group"
+device_id = "lg_test_curves"
+name = "Curve Test Light Group"
+members = ["light_living_room", "light_kitchen"]
+
+[brightness_curves.light_living_room]
+min = 0
+max = 60
+
+[settings]
+aggregation = "average"
