@@ -29,6 +29,10 @@ trait VirtualDevice: Send + Sync {
     // its lock. Default: None (plan with `plan_write`, under the lock).
     fn plan_write_detached(&self, new_state: &DeviceStateValue) -> Option<DetachedPlan> { None }
 
+    // Every device a write of `new_state` may write: the manager locks them
+    // (and this device) for the write's whole duration. Default: outputs.
+    fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> { self.output_devices() }
+
     // The manager committed every member write of a plan: take its state.
     // If one failed, this isn't called, and the device keeps its old state.
     fn take_state(&mut self, state: DeviceStateValue);
@@ -115,20 +119,35 @@ them reverted **and** never pushed. 💔 So:
 
 A scene's fade or sequence waits between its steps. It hands the manager its
 plan from `plan_write_detached`, as a future that owns its scene and the
-store, so the manager runs it **without** its lock and takes the lock only
-to commit where the transition ends. A one-second fade no longer holds up
-every other virtual write, input tracking and button press for its second.
+store, so the manager runs it **without** its `virtual_devices` lock and
+takes that lock only to commit where the transition ends.
 
-What overlaps a transition is then ordered by commit, and the **last commit
-wins**:
+What keeps writes in order is a 🔐 **lock per device**. Every manager write
+(a group write, a scene activation, a button action, a removal) takes the
+locks of the devices it writes, its own and every member's
+(`writes_to`), before it plans and until it has committed, a fade's delays
+included. So:
 
-- A group write (or a direct write) to a scene's light during its fade lands
-  at once. The fade's commit overwrites it when the fade ends.
-- Two activations of one scene controller commit in the order their
-  transitions *end*. The controller's own state is always the scene of its
-  last commit.
-- A scene controller removed during its fade commits nothing: the
-  activation fails with `DeviceNotFound`.
+- **A write that overlaps a transition** (it shares a light with it, or it's
+  to the same scene controller) waits for the transition's commit, and lands
+  after it. The newest write ends up showing, exactly as when every write
+  queued on the manager's lock: an "all off" pressed 3 s into a 10 s sunset
+  fade turns the lights off once the fade has committed, and they stay off.
+- **A write that doesn't overlap** goes ahead at once. A one-second fade no
+  longer holds up every other virtual write, input tracking and button press
+  for its whole second. 🔓
+- A direct write to a light through the API never went through the manager,
+  so it lands at once, and a fade over that light overwrites it when it
+  commits, as it always did.
+
+The locks are taken in one order (sorted by device id), all before the
+`virtual_devices` lock, and nothing waits for one while it holds that lock,
+so writes can't deadlock. Idle locks are dropped, so the map only holds the
+devices being written right now.
+
+Cancelling a fade when a newer write to its lights comes in, instead of
+making that write wait, would be a possible later improvement. It changes
+what shows, so it's the owner's call, and it isn't done.
 
 A write whose plan doesn't wait (a light group, an instant scene) keeps the
 default `None`, and is planned and committed in one hold of the lock. A
@@ -288,6 +307,17 @@ impl VirtualDevice for SceneController {
                 state: DeviceStateValue::Scene(SceneState { scene_name, is_active: true }),
             })
         }))
+    }
+
+    // 🔐 Only the asked-for scene's lights: a write to a light of another
+    // scene of this controller doesn't wait for this one's fade
+    fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
+        match new_state {
+            DeviceStateValue::Scene(s) => self.scenes.get(&s.scene_name)
+                .map(|scene| scene.device_states.keys().cloned().collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        }
     }
 
     fn take_state(&mut self, state: DeviceStateValue) {
