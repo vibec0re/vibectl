@@ -916,10 +916,10 @@ async fn check_target(
 /// ([`SceneController::from_toml`]) go by. A virtual device (a light group,
 /// another controller) counts as one the store doesn't have: it's resolved
 /// when the scene is activated, where the manager writes it through its own
-/// plan (#58). The virtual devices load from `virtual_devices/*.toml` in
-/// whatever order the files come in, so going by the ones already loaded
-/// would accept a scene or reject it, and shape its targets, by that order
-/// (#63 review, finding 2).
+/// plan (#58). The virtual devices load from `virtual_devices/*.toml` one
+/// file after another, and a client creates them through the API in any
+/// order, so going by the ones already loaded would accept a scene or
+/// reject it, and shape its targets, by that order (#63 review, finding 2).
 async fn physical_state(store: &StateStore, device_id: &DeviceId) -> Option<DeviceStateValue> {
     store
         .get_device(device_id)
