@@ -2446,6 +2446,43 @@ mod tests {
         assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
     }
 
+    /// #60 re-check (nit): a write whose commit fails leaves the queue just
+    /// as one that succeeds does. A mutant that skips that cleanup only on
+    /// the error path survives the rest of this suite, since every other
+    /// write here succeeds: only a write queued behind the failed one, and
+    /// left waiting on a "done" signal it never sends, catches it (the
+    /// reviewer's stress test deadlocked on it).
+    ///
+    /// `g` is a group over `a` and `missing`, and `missing` isn't in the
+    /// store yet, so writing `g` fails partway (`a` commits, `missing`
+    /// doesn't). A second write to `g` — it overlaps the first on `g`
+    /// itself — must not wait on the failed write's queue entry: bounded by
+    /// a timeout, it must land promptly once `missing` is there to commit.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_still_leaves_the_queue() {
+        let (manager, store, _bus) = manager_with_group(&["a", "missing"]).await;
+        store.add_device(light_info("a"), off()).await;
+
+        let failed = manager
+            .set_virtual_device_state(&"g".to_string(), light(true, 60))
+            .await;
+        assert!(failed.is_err(), "the missing member must fail the write");
+
+        // Now that `missing` exists, an overlapping write must go through: a
+        // failed write's queue entry left behind would hang it forever.
+        store.add_device(light_info("missing"), off()).await;
+        let overlapping = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.set_virtual_device_state(&"g".to_string(), light(true, 40)),
+        )
+        .await
+        .expect("the failed write left its place in the queue");
+        overlapping.expect("the overlapping write");
+
+        assert_eq!(stored(&store, "g").await, light(true, 40), "g");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
     /// A scene activation dropped during its fade (a client that went away)
     /// leaves the queue at once. The write waiting for it goes, and the
     /// fade commits nothing.
