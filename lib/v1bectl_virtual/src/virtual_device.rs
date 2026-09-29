@@ -92,11 +92,12 @@ pub trait VirtualDevice: Send + Sync {
     /// [`Self::plan_write`], for a write whose plan takes time: a scene's
     /// fade or sequence, which waits between its steps. It comes as a
     /// future that owns what it needs, so the manager runs it without its
-    /// lock, and takes the lock only to commit the [`VirtualWrite`] it ends
-    /// with (#58). So a transition doesn't hold up the other virtual
-    /// writes, input tracking, resync or button presses while it waits.
-    /// See `VirtualDeviceManager::set_virtual_device_state` for how what
-    /// overlaps it is ordered.
+    /// `virtual_devices` lock, and takes that lock only to commit the
+    /// [`VirtualWrite`] it ends with (#58). So a transition doesn't hold up
+    /// the virtual writes it has nothing to do with, input tracking, resync
+    /// or button presses while it waits. A write that shares a device with
+    /// it (see [`Self::writes_to`]) still waits for its commit, as before:
+    /// see `VirtualDeviceManager::set_virtual_device_state`.
     ///
     /// Only the call itself sees the device (under the manager's lock). The
     /// plan it returns runs later, when the device may have changed, so it
@@ -111,6 +112,25 @@ pub trait VirtualDevice: Send + Sync {
     fn plan_write_detached(&self, new_state: &DeviceStateValue) -> Option<DetachedPlan> {
         let _ = new_state;
         None
+    }
+
+    /// The devices a write of `new_state` to this device can write: every
+    /// member its plan may list. The manager holds each one's write lock,
+    /// and this device's own, from before it plans the write to after it
+    /// commits it, a scene's delays included (#58). So a write that shares
+    /// any of them with one in progress waits for it, and one that shares
+    /// none doesn't.
+    ///
+    /// It may list more than the write needs, which only serializes more.
+    /// It must not list less. The default is [`Self::output_devices`]: a
+    /// group writes its members. A scene controller writes only the
+    /// devices of the scene it's asked for. (A button action takes the
+    /// locks of its target's [`Self::output_devices`] instead, since the
+    /// state it writes isn't known until it holds them. So list nothing
+    /// outside those.)
+    fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
+        let _ = new_state;
+        self.output_devices()
     }
 
     /// Take `state`, the [`VirtualWrite::state`] of a write this device

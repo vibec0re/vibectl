@@ -428,6 +428,17 @@ impl VirtualDevice for SceneController {
         }))
     }
 
+    /// The devices of the scene `new_state` activates: all its transition
+    /// can write. Its other scenes' devices aren't locked, so a write to
+    /// one of those doesn't wait for this scene's fade (#58). A
+    /// deactivation, or a write that fails at once, writes none.
+    fn writes_to(&self, new_state: &DeviceStateValue) -> Vec<DeviceId> {
+        match self.activation(new_state) {
+            Ok(Activation::Activate(_, scene)) => scene.device_states.keys().cloned().collect(),
+            Ok(Activation::Deactivate) | Err(_) => Vec::new(),
+        }
+    }
+
     fn take_state(&mut self, state: DeviceStateValue) {
         if let DeviceStateValue::Scene(SceneState {
             scene_name,

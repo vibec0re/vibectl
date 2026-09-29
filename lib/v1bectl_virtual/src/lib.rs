@@ -1,6 +1,7 @@
 // Virtual device system - VIBEC0RE MAGIC! 🔥
 pub mod button_controller; // 🔥 BUTTON EVENT CONTROLLER! 💖
 pub mod config;
+mod device_locks; // 🔐 PER-DEVICE WRITE LOCKS (#58)
 pub mod dummy;
 pub mod event_producer;
 pub mod light_group;
