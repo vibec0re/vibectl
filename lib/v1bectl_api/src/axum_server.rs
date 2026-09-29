@@ -1461,11 +1461,14 @@ mod tests {
             vec![DeviceStateValue::Light(kitchen)],
             "a physical write must be echoed exactly once"
         );
-        // Re-derived from the members: the average of 90, 65 and 40.
+        // Re-derived from the members, each at the group level it inverts
+        // to (#10): 90 and 65 are still where 50 put them, and 40 is where
+        // 79 and 80 put the kitchen light (0-50), 79 being nearer 50. So
+        // (50 + 50 + 79) / 3.
         let group = light(&home.store, GROUP).await;
         assert_eq!(
             (group.is_on, group.brightness),
-            (true, Some(65)),
+            (true, Some(59)),
             "group must follow the outside change: {group:?}"
         );
         assert_eq!(
@@ -1586,12 +1589,15 @@ mod tests {
     /// #35: `PressButton` on the dummy's switch, through the API handler.
     /// It's answered, its `ButtonPressed` goes on the bus, and the
     /// controller bound to the switch runs from there, as for a real
-    /// remote. Bedroom Lights starts on at 75 (the dummy's kitchen light).
-    /// A click toggles it off, keeping 75, and its members with it (#35
-    /// review, finding 1: it used to run `on` then `off`, so a click always
-    /// ended off). The next click lights it again at 75. A long press takes
-    /// it to 85 and a double press to 100, and each member write is queued
-    /// for the gateway.
+    /// remote. Bedroom Lights starts on at 100: the dummy's kitchen light,
+    /// its only lit member, is on at 75, past the top of its range (0-50),
+    /// which the group puts it nearest to at 100 (#10). It's set to 75
+    /// first, so a long press has room to go brighter. A click toggles it
+    /// off, keeping 75, and its members with it (#35 review, finding 1: it
+    /// used to run `on` then `off`, so a click always ended off). The next
+    /// click lights it again at 75. A long press takes it to 85 and a
+    /// double press to 100, and each member write is queued for the
+    /// gateway.
     #[tokio::test]
     async fn press_button_runs_the_controller_bound_to_the_dummy_switch() {
         let home = home().await;
@@ -1599,10 +1605,12 @@ mod tests {
         let group = light(&home.store, GROUP).await;
         assert_eq!(
             (group.is_on, group.brightness),
-            (true, Some(75)),
+            (true, Some(100)),
             "at start"
         );
         let mut rx = home.bus.subscribe();
+        set_light(&home.server, GROUP, Some(true), Some(75)).await;
+        pump(&home, &mut rx).await;
 
         let response = press(&home.server, SWITCH, ButtonPressType::SinglePress).await;
         assert!(

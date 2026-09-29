@@ -417,8 +417,10 @@ async fn shipped_button_controller_lights_its_group_against_dummy() {
 /// #35: the shipped controller follows the gestures a hub reports whole
 /// (`ButtonPressed`), against the dummy. Its binding is `press_on = toggle`
 /// with no `press_off`, `press_double = set 100` and `press_on_long = inc
-/// 10`, on Bedroom Lights, which starts on at 75 (the dummy's kitchen
-/// light).
+/// 10`, on Bedroom Lights. It starts on at 100: its only lit member is the
+/// dummy's kitchen light, its `bed` (0-50), on at 75, past the top of its
+/// range, which the group puts it nearest to at 100 (#10). It's set to 75
+/// first, so a long press has room to go brighter.
 /// - A click toggles: the group goes off and keeps its level, and so does
 ///   every member. The next click lights them again, at that level (#35
 ///   review, finding 1: a click used to run `on` then `off`, so it always
@@ -450,7 +452,29 @@ async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
         "the binding this test drives"
     );
     let members = &home.group_members[GROUP];
-    assert_eq!(home.light(GROUP).await, (true, Some(75)), "group at start");
+    assert_eq!(home.light(GROUP).await, (true, Some(100)), "group at start");
+    let DeviceStateValue::Light(group) = home
+        .store
+        .get_device(&GROUP.to_string())
+        .await
+        .unwrap()
+        .state
+    else {
+        panic!("{GROUP} isn't a light");
+    };
+    let mut rx = home.bus.subscribe();
+    home.manager
+        .set_virtual_device_state(
+            &GROUP.to_string(),
+            DeviceStateValue::Light(LightState {
+                brightness: Some(75),
+                ..group
+            }),
+        )
+        .await
+        .expect("group to 75");
+    home.pump(&mut rx).await;
+    assert_eq!(home.light(GROUP).await, (true, Some(75)), "group set to 75");
     let report = |press_type| DeviceEvent {
         timestamp: std::time::SystemTime::now(),
         device_id: c.button.clone(),
@@ -459,7 +483,6 @@ async fn shipped_button_controller_follows_reported_gestures_against_dummy() {
             press_type,
         },
     };
-    let mut rx = home.bus.subscribe();
 
     for (click, want) in [("one click", false), ("the next click", true)] {
         home.bus.publish(report(ButtonPressType::SinglePress)).await;
