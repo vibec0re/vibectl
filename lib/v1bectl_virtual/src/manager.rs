@@ -1,4 +1,5 @@
 use crate::button_controller::ButtonAction;
+use crate::scene_controller::Scene;
 use crate::virtual_device::{
     is_virtual, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
     VirtualWrite,
@@ -896,6 +897,50 @@ impl VirtualDeviceManager {
         unsupported
     }
 
+    /// Every `(scene controller, light group)` pair where some scene of the
+    /// first sets the second to an outlet state (#58, from the #72 review).
+    /// [`Self::unsupported_targets`] doesn't catch this: the light group is
+    /// fine to set like a light in general, it's only *this* scene's target
+    /// for it that isn't one, so every activation of that scene that
+    /// reaches the light group fails there
+    /// ([`VirtualDeviceError::InvalidStateType`], `LightGroup::plan_write`).
+    /// `check_scenes` can't tell either, at the scene's own creation: a
+    /// virtual target is resolved only once the scene is activated (#58),
+    /// so this can only be caught once every device has loaded, the way
+    /// [`Self::unsupported_targets`] is. [`Self::start`] logs these.
+    pub async fn scenes_giving_light_groups_a_non_light_state(&self) -> Vec<(DeviceId, DeviceId)> {
+        let devices = self.virtual_devices.read().await;
+        let mut mismatched = Vec::new();
+        for device in devices.values() {
+            if !matches!(device.device_type(), VirtualDeviceType::SceneController) {
+                continue;
+            }
+            let Some(scenes_value) = device.config().config.get("scenes") else {
+                continue;
+            };
+            let Ok(scenes) = serde_json::from_value::<HashMap<String, Scene>>(scenes_value.clone())
+            else {
+                continue;
+            };
+            for scene in scenes.values() {
+                for (target_id, target_state) in &scene.device_states {
+                    if matches!(target_state, DeviceStateValue::Light(_)) {
+                        continue;
+                    }
+                    let Some(target) = devices.get(target_id) else {
+                        continue;
+                    };
+                    if matches!(target.current_state(), DeviceStateValue::Light(_)) {
+                        mismatched.push((device.device_id().clone(), target_id.clone()));
+                    }
+                }
+            }
+        }
+        mismatched.sort();
+        mismatched.dedup();
+        mismatched
+    }
+
     /// Every button that more than one button controller binds, with those
     /// controllers (sorted). Each press of such a button runs all of their
     /// actions. A stale `button_test.toml` next to `button_ctrl.toml` did
@@ -1560,8 +1605,10 @@ impl VirtualDeviceManager {
     /// whenever it has fallen behind the bus and missed some. It also logs
     /// every dangling reference (see [`Self::dangling_references`]), every
     /// virtual target that can't be set like a light (see
-    /// [`Self::unsupported_targets`]), and every button more than one
-    /// controller binds (see [`Self::shared_buttons`]).
+    /// [`Self::unsupported_targets`]), every scene that gives a light group
+    /// an outlet state (see [`Self::scenes_giving_light_groups_a_non_light_state`],
+    /// #58), and every button more than one controller binds (see
+    /// [`Self::shared_buttons`]).
     /// The server calls this once all virtual devices are loaded.
     pub async fn start(&self) -> Result<(), VirtualDeviceError> {
         let manager = Arc::new(self.clone());
@@ -1577,6 +1624,13 @@ impl VirtualDeviceManager {
         for (virtual_id, target) in self.unsupported_targets().await {
             tracing::warn!(
                 "⚠️ Virtual device {} sets {}, a virtual device that can't be set like a light: every write that reaches it fails",
+                virtual_id,
+                target
+            );
+        }
+        for (virtual_id, target) in self.scenes_giving_light_groups_a_non_light_state().await {
+            tracing::warn!(
+                "⚠️ Virtual device {} sets {}, a light group, to a non-light state: every activation that reaches it fails",
                 virtual_id,
                 target
             );
@@ -1688,7 +1742,7 @@ mod tests {
     use tokio::sync::watch;
     use v1bectl_sync::{
         recv_lossy, ButtonPressType, Capability, Gateway, GatewayError, GatewayHealth, LightState,
-        SceneState, SwitchState, SyncConfig, SyncStatus,
+        OutletState, SceneState, SwitchState, SyncConfig, SyncStatus,
     };
 
     fn light_info(device_id: &str) -> DeviceInfo {
@@ -5740,5 +5794,48 @@ mod tests {
             "start must warn about other: {logs:?}"
         );
         assert!(!logs.contains("sets g,"), "g is a light group: {logs:?}");
+    }
+
+    /// #58 (from the #72 review): `start` also warns when a scene gives a
+    /// light group an outlet state. The light group is fine to set like a
+    /// light in general — `unsupported_targets` doesn't flag it — but this
+    /// scene's own target for it isn't a light, so every activation that
+    /// reaches it still fails.
+    #[tokio::test]
+    async fn start_warns_when_a_scene_gives_a_light_group_an_outlet_state() {
+        let (manager, store, _bus) = manager_over(&["a"]).await;
+        register(&manager, group("g", &["a"], &store)).await;
+        let outlet = DeviceStateValue::Outlet(OutletState {
+            is_on: true,
+            power_consumption: None,
+            total_energy: None,
+        });
+        let targets = [("g", outlet)];
+        register(
+            &manager,
+            scene(&store, &targets, &serde_json::json!("Instant")),
+        )
+        .await;
+
+        assert_eq!(
+            manager.unsupported_targets().await,
+            vec![],
+            "g is a light group: unsupported_targets doesn't flag it"
+        );
+        assert_eq!(
+            manager.scenes_giving_light_groups_a_non_light_state().await,
+            vec![("scene".to_string(), "g".to_string())]
+        );
+
+        let logs = CapturedLogs::default();
+        {
+            let _default = tracing::subscriber::set_default(logs.subscriber());
+            manager.start().await.expect("start");
+        }
+        let logs = logs.text();
+        assert!(
+            logs.contains("Virtual device scene sets g, a light group, to a non-light state"),
+            "start must warn about g: {logs:?}"
+        );
     }
 }
