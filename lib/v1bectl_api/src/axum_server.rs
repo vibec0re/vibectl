@@ -1117,7 +1117,7 @@ mod tests {
         Capability, DeviceId, DeviceType, GatewayError, GatewayHealth, SwitchState, SyncStatus,
     };
     use v1bectl_virtual::{
-        ButtonController, DummyGateway, LightGroupLinear, VirtualDeviceTomlConfig,
+        ButtonController, DummyGateway, LightGroupLinear, VirtualDevice, VirtualDeviceTomlConfig,
     };
 
     const GROUP: &str = "virtual_bedroom_lights";
@@ -1143,9 +1143,33 @@ mod tests {
         manager: Arc<VirtualDeviceManager>,
     }
 
-    /// Dummy devices seeded into the store as the server does at startup,
-    /// a sync engine attached, and the Bedroom Lights linear group registered.
+    /// Which group [`home_with`] registers as [`GROUP`].
+    #[derive(Clone, Copy, Debug)]
+    enum Kind {
+        /// The shipped Bedroom Lights: a `LightGroupLinear` over the ranges
+        /// of `virtual_devices/bedroom_lights.toml`.
+        Linear,
+        /// A `LightGroup` over the same members, with curves that light
+        /// them exactly as those ranges do (so at [`MEMBERS_AT_50`] and
+        /// [`MEMBERS_AT_80`]). A curved group re-derives from its members'
+        /// own levels, so re-deriving it is lossy: at 50 it reads back 60.
+        /// A linear group inverts its ranges and reads back 50 (#10). So
+        /// only over this one can a test tell whether the members' echoes
+        /// re-derived the group (`accounts_for`).
+        Curves,
+    }
+
+    const KINDS: [Kind; 2] = [Kind::Linear, Kind::Curves];
+
+    /// [`home_with`] Bedroom Lights, the shipped linear group.
     async fn home() -> Home {
+        home_with(Kind::Linear).await
+    }
+
+    /// Dummy devices seeded into the store as the server does at startup,
+    /// a sync engine attached, and a group of `kind` registered as
+    /// [`GROUP`].
+    async fn home_with(kind: Kind) -> Home {
         let store = StateStore::new();
         let bus = Arc::new(EventBus::new(1000));
         let gateway: Arc<dyn Gateway> = Arc::new(DummyGateway::new("basic_home"));
@@ -1165,28 +1189,57 @@ mod tests {
         let server = AxumServer::new(0, store.clone(), bus.clone(), gateway)
             .with_sync_engine(engine.clone());
 
-        let members = HashMap::from([
-            ("top".to_string(), "light_bedroom".to_string()),
-            ("main".to_string(), "light_living_room".to_string()),
-            ("bed".to_string(), "light_kitchen".to_string()),
-        ]);
-        let ranges = HashMap::from([
-            ("top".to_string(), (80, 100)),
-            ("main".to_string(), (40, 90)),
-            ("bed".to_string(), (0, 50)),
-        ]);
-        let config = VirtualDeviceConfig {
-            device_id: GROUP.to_string(),
-            device_type: VirtualDeviceType::LightGroupLinear,
-            name: "Bedroom Lights".to_string(),
-            description: None,
-            enabled: true,
-            config: serde_json::json!({}),
+        // (name, member, range) of the shipped Bedroom Lights.
+        let ranges = [
+            ("top", "light_bedroom", (80, 100)),
+            ("main", "light_living_room", (40, 90)),
+            ("bed", "light_kitchen", (0, 50)),
+        ];
+        let group: Box<dyn VirtualDevice> = match kind {
+            Kind::Linear => {
+                let config = VirtualDeviceConfig {
+                    device_id: GROUP.to_string(),
+                    device_type: VirtualDeviceType::LightGroupLinear,
+                    name: "Bedroom Lights".to_string(),
+                    description: None,
+                    enabled: true,
+                    config: serde_json::json!({}),
+                };
+                let members = ranges
+                    .iter()
+                    .map(|(name, id, _)| ((*name).to_string(), (*id).to_string()))
+                    .collect();
+                let ranges = ranges
+                    .iter()
+                    .map(|(name, _, range)| ((*name).to_string(), *range))
+                    .collect();
+                Box::new(
+                    LightGroupLinear::new(config, members, ranges, store.clone()).expect("group"),
+                )
+            }
+            Kind::Curves => {
+                let lights: Vec<&str> = ranges.iter().map(|(_, id, _)| *id).collect();
+                let curves: serde_json::Map<String, serde_json::Value> = ranges
+                    .iter()
+                    .map(|(_, id, (min, max))| {
+                        let curve = serde_json::json!({ "breakpoints": [[0, min], [100, max]] });
+                        ((*id).to_string(), curve)
+                    })
+                    .collect();
+                let config = VirtualDeviceConfig {
+                    device_id: GROUP.to_string(),
+                    device_type: VirtualDeviceType::LightGroup,
+                    name: "Curved Bedroom Lights".to_string(),
+                    description: None,
+                    enabled: true,
+                    config: serde_json::json!({ "lights": lights, "brightness_curves": curves }),
+                };
+                Box::new(LightGroup::new(config, store.clone()).expect("group"))
+            }
         };
-        let group = LightGroupLinear::new(config, members, ranges, store.clone()).expect("group");
         let manager = server.virtual_device_manager();
         manager
-            .add_virtual_device(Box::new(group))
+            .add_virtual_device(group)
             .await
             .expect("register group");
 
@@ -1290,74 +1343,89 @@ mod tests {
     }
 
     /// #1: a virtual group write must echo the group and every member it
-    /// changed, exactly once each, with the state the store now holds.
+    /// changed, exactly once each, with the state the store now holds. For
+    /// both kinds of group: over curves, a re-derive from the members'
+    /// echoes would echo the group a second time, at 60.
     #[tokio::test]
     async fn virtual_group_write_echoes_group_and_members() {
-        let home = home().await;
-        let mut rx = home.bus.subscribe();
+        for kind in KINDS {
+            let home = home_with(kind).await;
+            let mut rx = home.bus.subscribe();
 
-        let response = set_light(&home.server, GROUP, Some(true), Some(50)).await;
-        assert!(
-            matches!(
-                response,
-                ApiResponse::LightUpdated {
-                    new_state: LightState {
-                        is_on: true,
-                        brightness: Some(50),
-                        ..
-                    }
-                }
-            ),
-            "unexpected response: {response:?}"
-        );
-        let events = pump(&home, &mut rx).await;
-
-        let group = home.store.get_device(&GROUP.to_string()).await.unwrap();
-        assert_eq!(
-            echoes(&events, GROUP),
-            vec![group.state],
-            "group {GROUP} must be echoed exactly once, with its stored state"
-        );
-
-        for (member, brightness) in MEMBERS_AT_50 {
-            let state = light(&home.store, member).await;
-            assert!(state.is_on, "{member} should be on: {state:?}");
-            assert_eq!(state.brightness, Some(brightness), "{member} brightness");
-            assert_eq!(
-                echoes(&events, member),
-                vec![DeviceStateValue::Light(state)],
-                "member {member} must be echoed exactly once, with its stored state"
-            );
-            // Handed to the gateway sync, like a direct write to the member.
-            let status = home.engine.get_sync_status(&member.to_string()).await;
+            let response = set_light(&home.server, GROUP, Some(true), Some(50)).await;
             assert!(
-                matches!(status, Some(SyncStatus::PendingSync { .. })),
-                "member {member} write never queued for the gateway: {status:?}"
+                matches!(
+                    response,
+                    ApiResponse::LightUpdated {
+                        new_state: LightState {
+                            is_on: true,
+                            brightness: Some(50),
+                            ..
+                        }
+                    }
+                ),
+                "{kind:?}: unexpected response: {response:?}"
             );
+            let events = pump(&home, &mut rx).await;
+
+            let group = home.store.get_device(&GROUP.to_string()).await.unwrap();
+            assert_eq!(
+                echoes(&events, GROUP),
+                vec![group.state],
+                "{kind:?}: group {GROUP} must be echoed exactly once, with its stored state"
+            );
+
+            for (member, brightness) in MEMBERS_AT_50 {
+                let state = light(&home.store, member).await;
+                assert!(state.is_on, "{kind:?}: {member} should be on: {state:?}");
+                assert_eq!(
+                    state.brightness,
+                    Some(brightness),
+                    "{kind:?}: {member} brightness"
+                );
+                assert_eq!(
+                    echoes(&events, member),
+                    vec![DeviceStateValue::Light(state)],
+                    "{kind:?}: member {member} must be echoed exactly once, with its stored state"
+                );
+                // Handed to the gateway sync, like a direct write to the member.
+                let status = home.engine.get_sync_status(&member.to_string()).await;
+                assert!(
+                    matches!(status, Some(SyncStatus::PendingSync { .. })),
+                    "{kind:?}: member {member} write never queued for the gateway: {status:?}"
+                );
+            }
         }
     }
 
     /// The members' echoes of our own fan-out must not re-derive the group.
     /// If they did, an off would store brightness 0 and the next plain `on`
-    /// would light nothing. Here tracking keeps up with every write.
+    /// would light nothing, and over curves the group would forget 50 for
+    /// the 60 it re-derives. Here tracking keeps up with every write.
     #[tokio::test]
     async fn group_off_then_on_restores_members() {
-        let home = home().await;
-        let mut rx = home.bus.subscribe();
+        for kind in KINDS {
+            let home = home_with(kind).await;
+            let mut rx = home.bus.subscribe();
 
-        set_light(&home.server, GROUP, Some(true), Some(50)).await;
-        pump(&home, &mut rx).await;
-        set_light(&home.server, GROUP, Some(false), None).await;
-        pump(&home, &mut rx).await;
+            set_light(&home.server, GROUP, Some(true), Some(50)).await;
+            pump(&home, &mut rx).await;
+            set_light(&home.server, GROUP, Some(false), None).await;
+            pump(&home, &mut rx).await;
 
-        let group = light(&home.store, GROUP).await;
-        assert!(!group.is_on, "group should be off: {group:?}");
-        assert_eq!(group.brightness, Some(50), "group forgot its level");
-        assert_members_off(&home.store).await;
+            let group = light(&home.store, GROUP).await;
+            assert!(!group.is_on, "{kind:?}: group should be off: {group:?}");
+            assert_eq!(
+                group.brightness,
+                Some(50),
+                "{kind:?}: group forgot its level"
+            );
+            assert_members_off(&home.store).await;
 
-        set_light(&home.server, GROUP, Some(true), None).await;
-        pump(&home, &mut rx).await;
-        assert_members(&home.store, MEMBERS_AT_50).await;
+            set_light(&home.server, GROUP, Some(true), None).await;
+            pump(&home, &mut rx).await;
+            assert_members(&home.store, MEMBERS_AT_50).await;
+        }
     }
 
     /// #14 review, finding 1: two writes before tracking sees the first
@@ -1390,29 +1458,32 @@ mod tests {
     }
 
     /// #14 review, finding 1: two level changes in a row (a slider drag)
-    /// end at the last one, not at a re-derived average of the members.
+    /// end at the last one, not at a re-derived average of the members
+    /// (72, over curves).
     #[tokio::test]
     async fn back_to_back_level_changes_end_at_the_last_level() {
-        let home = home().await;
-        let mut rx = home.bus.subscribe();
+        for kind in KINDS {
+            let home = home_with(kind).await;
+            let mut rx = home.bus.subscribe();
 
-        set_light(&home.server, GROUP, Some(true), Some(50)).await;
-        set_light(&home.server, GROUP, Some(true), Some(80)).await;
-        let events = pump(&home, &mut rx).await;
+            set_light(&home.server, GROUP, Some(true), Some(50)).await;
+            set_light(&home.server, GROUP, Some(true), Some(80)).await;
+            let events = pump(&home, &mut rx).await;
 
-        let group = light(&home.store, GROUP).await;
-        assert!(group.is_on, "group should be on: {group:?}");
-        assert_eq!(
-            group.brightness,
-            Some(80),
-            "group must end at the last level"
-        );
-        assert_eq!(
-            levels(&events, GROUP),
-            vec![(true, Some(50)), (true, Some(80))],
-            "one group echo per write, and no re-derived one"
-        );
-        assert_members(&home.store, MEMBERS_AT_80).await;
+            let group = light(&home.store, GROUP).await;
+            assert!(group.is_on, "{kind:?}: group should be on: {group:?}");
+            assert_eq!(
+                group.brightness,
+                Some(80),
+                "{kind:?}: group must end at the last level"
+            );
+            assert_eq!(
+                levels(&events, GROUP),
+                vec![(true, Some(50)), (true, Some(80))],
+                "{kind:?}: one group echo per write, and no re-derived one"
+            );
+            assert_members(&home.store, MEMBERS_AT_80).await;
+        }
     }
 
     /// A direct write to a group member still echoes once (no double
@@ -1482,49 +1553,54 @@ mod tests {
     /// (a bulb without colour temperature has none, the RGB bulb its hue).
     /// When that view lands in the store (`GatewayWins`, after the protection
     /// window), the member is still where the group put it. So the group
-    /// must not be re-derived, which would be lossy: Bedroom Lights at 50
-    /// would read back as 60.
+    /// must not be re-derived. For both kinds of group: over curves,
+    /// re-deriving is lossy, and the group at 50 would read back as 60.
     #[tokio::test]
     async fn hub_normalised_member_colour_does_not_re_derive_the_group() {
-        let home = home().await;
-        let mut rx = home.bus.subscribe();
+        for kind in KINDS {
+            let home = home_with(kind).await;
+            let mut rx = home.bus.subscribe();
 
-        set_light(&home.server, GROUP, Some(true), Some(50)).await;
-        pump(&home, &mut rx).await;
+            set_light(&home.server, GROUP, Some(true), Some(50)).await;
+            pump(&home, &mut rx).await;
 
-        // What the sync engine's GatewayWins does with the hub's view.
-        let member = "light_bedroom".to_string();
-        let ours = home.store.get_device(&member).await.unwrap().state;
-        let hub_view = DeviceStateValue::Light(LightState {
-            is_on: true,
-            brightness: Some(90),
-            color_temp: None,
-            rgb_color: Some(RgbColor { r: 255, g: 0, b: 0 }),
-        });
-        home.store
-            .update_device_state(&member, hub_view.clone())
-            .await
-            .unwrap();
-        home.bus
-            .publish(DeviceEvent {
-                timestamp: std::time::SystemTime::now(),
-                device_id: member.clone(),
-                event_type: EventType::AttributeChanged {
-                    attribute: "state".to_string(),
-                    old_value: serde_json::to_value(&ours).unwrap(),
-                    new_value: serde_json::to_value(&hub_view).unwrap(),
-                },
-            })
-            .await;
-        let events = pump(&home, &mut rx).await;
+            // What the sync engine's GatewayWins does with the hub's view.
+            let member = "light_bedroom".to_string();
+            let ours = home.store.get_device(&member).await.unwrap().state;
+            let hub_view = DeviceStateValue::Light(LightState {
+                is_on: true,
+                brightness: Some(90),
+                color_temp: None,
+                rgb_color: Some(RgbColor { r: 255, g: 0, b: 0 }),
+            });
+            home.store
+                .update_device_state(&member, hub_view.clone())
+                .await
+                .unwrap();
+            home.bus
+                .publish(DeviceEvent {
+                    timestamp: std::time::SystemTime::now(),
+                    device_id: member.clone(),
+                    event_type: EventType::AttributeChanged {
+                        attribute: "state".to_string(),
+                        old_value: serde_json::to_value(&ours).unwrap(),
+                        new_value: serde_json::to_value(&hub_view).unwrap(),
+                    },
+                })
+                .await;
+            let events = pump(&home, &mut rx).await;
 
-        let group = light(&home.store, GROUP).await;
-        assert_eq!(
-            (group.is_on, group.brightness),
-            (true, Some(50)),
-            "group was re-derived from a colour-only difference"
-        );
-        assert!(echoes(&events, GROUP).is_empty(), "group re-echoed");
+            let group = light(&home.store, GROUP).await;
+            assert_eq!(
+                (group.is_on, group.brightness),
+                (true, Some(50)),
+                "{kind:?}: group was re-derived from a colour-only difference"
+            );
+            assert!(
+                echoes(&events, GROUP).is_empty(),
+                "{kind:?}: group re-echoed"
+            );
+        }
     }
 
     /// The shipped `virtual_devices/button_ctrl.toml`, read from the file

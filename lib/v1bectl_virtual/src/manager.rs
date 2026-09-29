@@ -3603,26 +3603,107 @@ mod tests {
         bus.publish(state_event(&id, Some(&old), &state)).await;
     }
 
-    /// A `LightGroupLinear` named `device_id` over two lights, with ranges
-    /// (80-100 and 0-50) that make re-deriving it lossy: set to 50, it
-    /// reads back as 57.
-    fn lossy_group(
-        device_id: &str,
-        [e, f]: [&str; 2],
-        store: &Arc<StateStore>,
-    ) -> LightGroupLinear {
+    /// A `LightGroup` named `device_id` over two lights, with curves (80-100
+    /// and 0-50) that make re-deriving it lossy: set to 50, it reads back as
+    /// 57. A curved group re-derives from its members' own levels, so only
+    /// the skip of its own echoes (`accounts_for`) keeps it at its level. A
+    /// linear group inverts its ranges and would read back 50 either way
+    /// (#10).
+    fn lossy_group(device_id: &str, [e, f]: [&str; 2], store: &Arc<StateStore>) -> LightGroup {
+        let curves = serde_json::json!({
+            e: { "breakpoints": [[0, 80], [100, 100]] },
+            f: { "breakpoints": [[0, 0], [100, 50]] },
+        });
         let config = VirtualDeviceConfig {
             device_id: device_id.to_string(),
-            device_type: VirtualDeviceType::LightGroupLinear,
+            device_type: VirtualDeviceType::LightGroup,
             name: device_id.to_string(),
             description: None,
             enabled: true,
-            config: serde_json::json!({}),
+            config: serde_json::json!({ "lights": [e, f], "brightness_curves": curves }),
         };
-        let members = [e, f].map(|id| (id.to_string(), id.to_string()));
-        let ranges = HashMap::from([(e.to_string(), (80, 100)), (f.to_string(), (0, 50))]);
-        LightGroupLinear::new(config, HashMap::from(members), ranges, store.clone())
-            .expect("lossy group")
+        LightGroup::new(config, store.clone()).expect("lossy group")
+    }
+
+    /// [`lossy_group`] `k` over `e` and `f`, both off, set to 50 (so `e` at
+    /// 90 and `f` at 25), with tracking caught up. No sync engine: the
+    /// manager echoes the members itself.
+    async fn lossy_group_at_50() -> (
+        VirtualDeviceManager,
+        Arc<StateStore>,
+        Arc<EventBus>,
+        broadcast::Receiver<DeviceEvent>,
+        Vec<DeviceEvent>,
+    ) {
+        let store = StateStore::new();
+        for id in ["e", "f"] {
+            store.add_device(light_info(id), off()).await;
+        }
+        let bus = Arc::new(EventBus::new(100));
+        let manager = VirtualDeviceManager::new(store.clone(), bus.clone());
+        manager
+            .add_virtual_device(Box::new(lossy_group("k", ["e", "f"], &store)))
+            .await
+            .expect("register");
+        let mut rx = bus.subscribe();
+        manager
+            .set_virtual_device_state(&"k".to_string(), light(true, 50))
+            .await
+            .expect("k to 50");
+        let events = pump(&manager, &mut rx).await;
+        for (id, level) in [("e", 90), ("f", 25)] {
+            assert_eq!(stored(&store, id).await, light(true, level), "{id} at 50");
+        }
+        (manager, store, bus, rx, events)
+    }
+
+    /// #22: the echoes of a curved group's own write don't re-derive it,
+    /// since it accounts for them. Re-deriving it from its members' own
+    /// levels is lossy (set to 50, it reads 57), so only that skip keeps it
+    /// where it was set. Two writes before tracking sees the first one's
+    /// echoes end at the last (#14 review, finding 1): the stale echoes are
+    /// judged by the store, which holds the second write's members. (A
+    /// linear group re-derives exactly and can't tell, #10.)
+    #[tokio::test]
+    async fn a_curved_group_is_not_re_derived_from_its_own_echoes() {
+        let (manager, store, _bus, mut rx, events) = lossy_group_at_50().await;
+        assert_eq!(stored(&store, "k").await, light(true, 50), "k at 50");
+        assert_eq!(echoes(&events, "k"), vec![light(true, 50)], "k's echo");
+
+        let k = "k".to_string();
+        for level in [80, 30] {
+            manager
+                .set_virtual_device_state(&k, light(true, level))
+                .await
+                .expect("k's write");
+        }
+        let events = pump(&manager, &mut rx).await;
+        // Re-derived, `e` at 86 and `f` at 15 would read 50.
+        assert_eq!(stored(&store, "k").await, light(true, 30), "k at 30");
+        assert_eq!(
+            echoes(&events, "k"),
+            vec![light(true, 80), light(true, 30)],
+            "one echo of k per write, and no re-derived one"
+        );
+    }
+
+    /// #14 review, finding 4b: a member the hub reports its own way (a bulb
+    /// without colour temperature has none) is still where its curved group
+    /// put it, so the group isn't re-derived. That would read 57, not 50.
+    #[tokio::test]
+    async fn a_member_colour_the_hub_normalised_does_not_re_derive_a_curved_group() {
+        let (manager, store, bus, mut rx, _) = lossy_group_at_50().await;
+        let hub_view = DeviceStateValue::Light(LightState {
+            is_on: true,
+            brightness: Some(90),
+            color_temp: None,
+            rgb_color: None,
+        });
+        moved(&store, &bus, "e", hub_view).await;
+        let events = pump(&manager, &mut rx).await;
+
+        assert_eq!(stored(&store, "k").await, light(true, 50), "k re-derived");
+        assert!(echoes(&events, "k").is_empty(), "k re-echoed: {events:?}");
     }
 
     /// A bus small enough for a test to overflow: a subscriber lags once it
@@ -3642,7 +3723,7 @@ mod tests {
     /// `g` (curves) must follow `a` to `{on, 40}`, and `h` (linear) go off
     /// with its level kept when `c` and `d` go off (#16), each echoed once
     /// and no more. `k`'s members didn't move, and it accounts for them
-    /// (#22): re-deriving it anyway would be lossy (set to 50, its ranges
+    /// (#22): re-deriving it anyway would be lossy (set to 50, its curves
     /// read back as 57), so it must keep 50 and not echo.
     ///
     /// The last event buffered is a press of `btn`, whose controller turns

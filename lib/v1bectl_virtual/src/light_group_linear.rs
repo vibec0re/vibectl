@@ -530,6 +530,30 @@ mod tests {
         }
     }
 
+    /// #65 review, finding 2: a group that finds every lit member where one
+    /// level puts them (rule 1 of [`invert`]) takes that level as its set
+    /// level, as a write would have. Bedroom Lights starts on members where
+    /// 50 put them (`top` 90, `main` 65, `bed` 25), and reads 50. Dimming
+    /// `bed` to 11 at the wall then inverts `top` (48 to 52) and `main` (49,
+    /// 50) to 50, the level found, and `bed` (21, 22) to 22: (50 + 50 + 22)
+    /// / 3 is 40. Inverting towards the level it started at, 100, instead
+    /// would put `top` at 52 and read 41.
+    #[tokio::test]
+    async fn a_group_inverts_towards_the_level_it_found_its_members_at() {
+        let (mut group, store) = group_over(&bedroom_lights()).await;
+        let at_50 = DeviceStateValue::Light(light(true, 50));
+        commit_members(&store, group.plan_write(at_50.clone()).await.expect("plan")).await;
+        group.seed_from_inputs().await.expect("seed");
+        assert_eq!(group.current_state(), at_50, "started on members at 50");
+
+        moved(&mut group, &store, "bed", light(true, 11)).await;
+        assert_eq!(
+            group.current_state(),
+            DeviceStateValue::Light(light(true, 40)),
+            "bed dimmed to 11"
+        );
+    }
+
     /// #10: Bedroom Lights at 50 puts `top` at 90, `main` at 65 and `bed` at
     /// 25. Dimming `bed` to 10 at the wall re-derives the group: `top` and
     /// `main` are still where 50 put them and invert to it, and 10 is where
