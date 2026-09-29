@@ -1,7 +1,7 @@
 // 🔥 LINEAR LIGHT GROUP - IMPROVED BRIGHTNESS MAPPING! 💖
 
 use crate::light_group::{
-    fanned_out, initial_group_state, re_derive, resolve_write, DEFAULT_GROUP_LEVEL,
+    fanned_out, initial_group_state, invert, re_derive, resolve_write, Levels, DEFAULT_GROUP_LEVEL,
 };
 use crate::virtual_device::{
     VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType, VirtualWrite,
@@ -29,98 +29,6 @@ pub struct LightGroupLinear {
     /// group's own level does.
     set_level: u8,
     state_store: Arc<StateStore>,
-}
-
-/// A set of group levels, 1..=100 (bit `n` is level `n`): the levels a
-/// member's level can invert to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Levels(u128);
-
-impl Levels {
-    /// Every level a lit group can be at.
-    const ALL: Self = Self(((1 << 101) - 1) & !1);
-
-    /// The group levels whose fan-out `fan_out` lights a member at `level`,
-    /// or nearest to it if none does. So a member dimmed below its range
-    /// inverts to the levels that put it at the bottom of it, one turned up
-    /// past its range to those that put it at the top. Never empty.
-    ///
-    /// It scans the fan-out itself, so it holds for any shape of it: rising,
-    /// falling (a range with `min > max`), flat, or neither.
-    fn inverting(level: u8, fan_out: impl Fn(u8) -> u8) -> Self {
-        let mut nearest = u8::MAX;
-        let mut levels = 0;
-        for group_level in 1..=100 {
-            let off_by = fan_out(group_level).abs_diff(level);
-            if off_by < nearest {
-                nearest = off_by;
-                levels = 0;
-            }
-            if off_by == nearest {
-                levels |= 1 << group_level;
-            }
-        }
-        Self(levels)
-    }
-
-    /// The levels in both.
-    fn and(self, other: Self) -> Self {
-        Self(self.0 & other.0)
-    }
-
-    /// The level nearest `target` of these, the lower of two as near. None
-    /// if there are none.
-    fn nearest(self, target: u8) -> Option<u8> {
-        (1..=100)
-            .filter(|&level| self.0 & (1 << level) != 0)
-            .min_by_key(|&level: &u8| (level.abs_diff(target), level))
-    }
-}
-
-/// The group level each lit member's level inverts to, for [`re_derive`] to
-/// average as it averaged their raw levels before (#10), and the level they
-/// all invert to, if they do. `lit` holds, for each member that's lit, the
-/// levels that light it where it is ([`Levels::inverting`]). `set_level` is
-/// the group's (see [`LightGroupLinear`]).
-///
-/// Rounding and clamping give most members several candidates: a range
-/// narrower than 0..=100 lights one at the same level for neighbouring group
-/// levels, one that ends above 100 is flat at the top, and one with
-/// `min == max` is flat throughout. Which one a member inverts to:
-///
-/// 1. If some level is a candidate of every lit member, they are exactly
-///    where that level puts them, and each inverts to the one of those
-///    levels nearest `set_level`. The group reads it, and it becomes the set
-///    level. So a group set to a level reads that level back, and one that
-///    starts on members some level put where they are reads a level that
-///    puts them there.
-/// 2. Otherwise each inverts on its own, to its candidate nearest
-///    `set_level`. A member still where the group put it inverts to the set
-///    level itself, and one moved away (dimmed at the wall) to the level
-///    nearest it that puts the member where it is now.
-///
-/// Ties go to the lower level. A linear range is monotonic, but nothing
-/// here relies on that: a fan-out that rises and falls again gives a member
-/// candidates on both sides, and it still inverts to the nearest.
-///
-/// The result depends only on the members and `set_level`, and rule 1 moves
-/// the set level to a level that's still a candidate of each. So
-/// re-deriving from members that haven't moved lands on the same state.
-fn invert(lit: &[Levels], set_level: u8) -> (Vec<u8>, Option<u8>) {
-    if lit.is_empty() {
-        return (Vec::new(), None);
-    }
-    let every = lit
-        .iter()
-        .fold(Levels::ALL, |every, levels| every.and(*levels));
-    if let Some(level) = every.nearest(set_level) {
-        return (vec![level; lit.len()], Some(level));
-    }
-    let levels = lit
-        .iter()
-        .filter_map(|levels| levels.nearest(set_level))
-        .collect();
-    (levels, None)
 }
 
 impl LightGroupLinear {
@@ -601,7 +509,7 @@ mod tests {
     /// (80-100) moves one level for every five of the group's.
     #[tokio::test]
     async fn a_member_level_inverts_to_the_group_levels_that_light_it_there() {
-        let levels = |set: &[u8]| Levels(set.iter().fold(0, |bits, &level| bits | 1 << level));
+        let levels = Levels::of;
         let (group, _store) = group_over(&bedroom_lights()).await;
         let top = |level| group.map_brightness("top", level);
 
@@ -609,31 +517,5 @@ mod tests {
         assert_eq!(Levels::inverting(81, top), levels(&[3, 4, 5, 6, 7]));
         assert_eq!(Levels::inverting(30, top), levels(&[1, 2]), "below");
         assert_eq!(Levels::inverting(100, top), levels(&[98, 99, 100]));
-    }
-
-    /// A fan-out that falls and rises again (a V, dimmest at 50) gives a
-    /// member candidates on both sides. It inverts to the one nearest the
-    /// set level, the lower of two as near. A linear range can't do this,
-    /// but nothing in the inversion relies on that.
-    #[test]
-    fn a_fan_out_that_falls_and_rises_inverts_to_the_nearest_candidate() {
-        let v = |level: u8| level.abs_diff(50) * 2;
-        let at_20 = Levels::inverting(20, v);
-        assert_eq!(at_20, Levels(1 << 40 | 1 << 60));
-        assert_eq!(at_20.nearest(55), Some(60));
-        assert_eq!(at_20.nearest(50), Some(40), "a tie goes to the lower");
-        assert_eq!(at_20.nearest(0), Some(40));
-        // Out of reach: 98 (at levels 1 and 99) and 100 (at level 100) are
-        // as near. Levels 1 and 99 are as near 50, too.
-        let at_99 = Levels::inverting(99, v);
-        assert_eq!(at_99, Levels(1 << 1 | 1 << 99 | 1 << 100));
-        assert_eq!(at_99.nearest(50), Some(1));
-        assert_eq!(at_99.nearest(100), Some(100));
-
-        assert_eq!(invert(&[at_20], 55), (vec![60], Some(60)));
-        // Nothing lights both where they are: each on its own.
-        let at_100 = Levels::inverting(100, v);
-        assert_eq!(invert(&[at_20, at_100], 55), (vec![60, 100], None));
-        assert_eq!(invert(&[], 55), (vec![], None));
     }
 }

@@ -1124,7 +1124,8 @@ mod tests {
         Capability, DeviceId, DeviceType, GatewayError, GatewayHealth, SwitchState, SyncStatus,
     };
     use v1bectl_virtual::{
-        ButtonController, DummyGateway, LightGroupLinear, VirtualDevice, VirtualDeviceTomlConfig,
+        ButtonController, DummyGateway, LightGroupLinear, VirtualDevice, VirtualDeviceError,
+        VirtualDeviceTomlConfig, VirtualWrite,
     };
 
     const GROUP: &str = "virtual_bedroom_lights";
@@ -1158,15 +1159,126 @@ mod tests {
         Linear,
         /// A `LightGroup` over the same members, with curves that light
         /// them exactly as those ranges do (so at [`MEMBERS_AT_50`] and
-        /// [`MEMBERS_AT_80`]). A curved group re-derives from its members'
-        /// own levels, so re-deriving it is lossy: at 50 it reads back 60.
-        /// A linear group inverts its ranges and reads back 50 (#10). So
-        /// only over this one can a test tell whether the members' echoes
-        /// re-derived the group (`accounts_for`).
+        /// [`MEMBERS_AT_80`]).
         Curves,
+        /// Bedroom Lights in a [`LossyGroup`], which re-derives lossily: at
+        /// 50 it would read back 49. Both light group types read back the
+        /// level they were set to (#10, #66), so only over this one can a
+        /// test tell whether the members' echoes re-derived the group
+        /// (`accounts_for`).
+        Lossy,
     }
 
-    const KINDS: [Kind; 2] = [Kind::Linear, Kind::Curves];
+    const KINDS: [Kind; 3] = [Kind::Linear, Kind::Curves, Kind::Lossy];
+
+    /// `level` rounded down to an odd level: the steps a [`LossyGroup`]
+    /// reads its level back in. The even levels the guards over it set
+    /// (50, 80) read back one lower.
+    fn coarse(level: u8) -> u8 {
+        if level.is_multiple_of(2) {
+            level.saturating_sub(1)
+        } else {
+            level
+        }
+    }
+
+    /// A group that fans out, and accounts for its members, exactly as the
+    /// group it wraps, but re-derives lossily: it reads its level back in
+    /// steps of two, [`coarse`]. Set to 50, it would read 49 once its
+    /// members' echoes re-derived it. It's `v1bectl_virtual`'s test
+    /// `LossyGroup` again: a test module can't share one across crates.
+    ///
+    /// Its async methods are written out the way `#[async_trait]` expands
+    /// them: `v1bectl_api` has no `async-trait` dependency of its own.
+    struct LossyGroup(Box<dyn VirtualDevice>);
+
+    /// What an async method of [`VirtualDevice`] returns, expanded.
+    type Planned<'a, T> = Pin<Box<dyn Future<Output = Result<T, VirtualDeviceError>> + Send + 'a>>;
+
+    impl LossyGroup {
+        /// Take the state the wrapped group just re-derived, coarsened.
+        fn coarsen(&mut self) {
+            if let DeviceStateValue::Light(mut group) = self.0.current_state() {
+                group.brightness = group.brightness.map(coarse);
+                self.0.take_state(DeviceStateValue::Light(group));
+            }
+        }
+    }
+
+    impl VirtualDevice for LossyGroup {
+        fn device_id(&self) -> &DeviceId {
+            self.0.device_id()
+        }
+
+        fn device_type(&self) -> VirtualDeviceType {
+            self.0.device_type()
+        }
+
+        fn config(&self) -> &VirtualDeviceConfig {
+            self.0.config()
+        }
+
+        fn plan_write<'life0, 'async_trait>(
+            &'life0 self,
+            new_state: DeviceStateValue,
+        ) -> Planned<'async_trait, VirtualWrite>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.0.plan_write(new_state)
+        }
+
+        fn take_state(&mut self, state: DeviceStateValue) {
+            self.0.take_state(state);
+        }
+
+        fn seed_from_inputs<'life0, 'async_trait>(&'life0 mut self) -> Planned<'async_trait, ()>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                self.0.seed_from_inputs().await?;
+                self.coarsen();
+                Ok(())
+            })
+        }
+
+        fn on_input_changed<'life0, 'life1, 'life2, 'async_trait>(
+            &'life0 mut self,
+            device_id: &'life1 DeviceId,
+            new_state: &'life2 DeviceState,
+        ) -> Planned<'async_trait, ()>
+        where
+            'life0: 'async_trait,
+            'life1: 'async_trait,
+            'life2: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                self.0.on_input_changed(device_id, new_state).await?;
+                self.coarsen();
+                Ok(())
+            })
+        }
+
+        fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool {
+            self.0.accounts_for(input, state)
+        }
+
+        fn current_state(&self) -> DeviceStateValue {
+            self.0.current_state()
+        }
+
+        fn input_devices(&self) -> Vec<DeviceId> {
+            self.0.input_devices()
+        }
+
+        fn output_devices(&self) -> Vec<DeviceId> {
+            self.0.output_devices()
+        }
+    }
 
     /// [`home_with`] Bedroom Lights, the shipped linear group.
     async fn home() -> Home {
@@ -1202,28 +1314,28 @@ mod tests {
             ("main", "light_living_room", (40, 90)),
             ("bed", "light_kitchen", (0, 50)),
         ];
+        let bedroom_lights = || {
+            let config = VirtualDeviceConfig {
+                device_id: GROUP.to_string(),
+                device_type: VirtualDeviceType::LightGroupLinear,
+                name: "Bedroom Lights".to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({}),
+            };
+            let members = ranges
+                .iter()
+                .map(|(name, id, _)| ((*name).to_string(), (*id).to_string()))
+                .collect();
+            let ranges = ranges
+                .iter()
+                .map(|(name, _, range)| ((*name).to_string(), *range))
+                .collect();
+            LightGroupLinear::new(config, members, ranges, store.clone()).expect("group")
+        };
         let group: Box<dyn VirtualDevice> = match kind {
-            Kind::Linear => {
-                let config = VirtualDeviceConfig {
-                    device_id: GROUP.to_string(),
-                    device_type: VirtualDeviceType::LightGroupLinear,
-                    name: "Bedroom Lights".to_string(),
-                    description: None,
-                    enabled: true,
-                    config: serde_json::json!({}),
-                };
-                let members = ranges
-                    .iter()
-                    .map(|(name, id, _)| ((*name).to_string(), (*id).to_string()))
-                    .collect();
-                let ranges = ranges
-                    .iter()
-                    .map(|(name, _, range)| ((*name).to_string(), *range))
-                    .collect();
-                Box::new(
-                    LightGroupLinear::new(config, members, ranges, store.clone()).expect("group"),
-                )
-            }
+            Kind::Linear => Box::new(bedroom_lights()),
+            Kind::Lossy => Box::new(LossyGroup(Box::new(bedroom_lights()))),
             Kind::Curves => {
                 let lights: Vec<&str> = ranges.iter().map(|(_, id, _)| *id).collect();
                 let curves: serde_json::Map<String, serde_json::Value> = ranges
@@ -1351,8 +1463,8 @@ mod tests {
 
     /// #1: a virtual group write must echo the group and every member it
     /// changed, exactly once each, with the state the store now holds. For
-    /// both kinds of group: over curves, a re-derive from the members'
-    /// echoes would echo the group a second time, at 60.
+    /// each kind of group: over the lossy one, a re-derive from the
+    /// members' echoes would echo the group a second time, at 49.
     #[tokio::test]
     async fn virtual_group_write_echoes_group_and_members() {
         for kind in KINDS {
@@ -1407,8 +1519,8 @@ mod tests {
 
     /// The members' echoes of our own fan-out must not re-derive the group.
     /// If they did, an off would store brightness 0 and the next plain `on`
-    /// would light nothing, and over curves the group would forget 50 for
-    /// the 60 it re-derives. Here tracking keeps up with every write.
+    /// would light nothing, and the lossy group would forget 50 for the 49
+    /// it re-derives. Here tracking keeps up with every write.
     #[tokio::test]
     async fn group_off_then_on_restores_members() {
         for kind in KINDS {
@@ -1438,35 +1550,42 @@ mod tests {
     /// #14 review, finding 1: two writes before tracking sees the first
     /// one's echoes (a double toggle, two frames in one WS read, a busy
     /// tracker). By the time tracking reads the first write's member echoes,
-    /// they are stale, and they must not re-derive the group.
+    /// they are stale, and they must not re-derive the group: the lossy
+    /// group would go off at 49.
     #[tokio::test]
     async fn back_to_back_on_then_off_keeps_the_level() {
-        let home = home().await;
-        let mut rx = home.bus.subscribe();
+        for kind in KINDS {
+            let home = home_with(kind).await;
+            let mut rx = home.bus.subscribe();
 
-        set_light(&home.server, GROUP, Some(true), Some(50)).await;
-        set_light(&home.server, GROUP, Some(false), None).await;
-        let events = pump(&home, &mut rx).await;
+            set_light(&home.server, GROUP, Some(true), Some(50)).await;
+            set_light(&home.server, GROUP, Some(false), None).await;
+            let events = pump(&home, &mut rx).await;
 
-        let group = light(&home.store, GROUP).await;
-        assert!(!group.is_on, "group should be off: {group:?}");
-        assert_eq!(group.brightness, Some(50), "group forgot its level");
-        assert_eq!(
-            levels(&events, GROUP),
-            vec![(true, Some(50)), (false, Some(50))],
-            "one group echo per write, and no re-derived one"
-        );
-        assert_members_off(&home.store).await;
+            let group = light(&home.store, GROUP).await;
+            assert!(!group.is_on, "{kind:?}: group should be off: {group:?}");
+            assert_eq!(
+                group.brightness,
+                Some(50),
+                "{kind:?}: group forgot its level"
+            );
+            assert_eq!(
+                levels(&events, GROUP),
+                vec![(true, Some(50)), (false, Some(50))],
+                "{kind:?}: one group echo per write, and no re-derived one"
+            );
+            assert_members_off(&home.store).await;
 
-        // The next plain `on` (the widget's toggle) lights them again.
-        set_light(&home.server, GROUP, Some(true), None).await;
-        pump(&home, &mut rx).await;
-        assert_members(&home.store, MEMBERS_AT_50).await;
+            // The next plain `on` (the widget's toggle) lights them again.
+            set_light(&home.server, GROUP, Some(true), None).await;
+            pump(&home, &mut rx).await;
+            assert_members(&home.store, MEMBERS_AT_50).await;
+        }
     }
 
     /// #14 review, finding 1: two level changes in a row (a slider drag)
-    /// end at the last one, not at a re-derived average of the members
-    /// (72, over curves).
+    /// end at the last one, not at a level re-derived from the members (79,
+    /// over the lossy group).
     #[tokio::test]
     async fn back_to_back_level_changes_end_at_the_last_level() {
         for kind in KINDS {
@@ -1560,8 +1679,8 @@ mod tests {
     /// (a bulb without colour temperature has none, the RGB bulb its hue).
     /// When that view lands in the store (`GatewayWins`, after the protection
     /// window), the member is still where the group put it. So the group
-    /// must not be re-derived. For both kinds of group: over curves,
-    /// re-deriving is lossy, and the group at 50 would read back as 60.
+    /// must not be re-derived. For each kind of group: re-deriving the
+    /// lossy one at 50 would read back 49.
     #[tokio::test]
     async fn hub_normalised_member_colour_does_not_re_derive_the_group() {
         for kind in KINDS {

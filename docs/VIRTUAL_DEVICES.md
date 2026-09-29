@@ -45,7 +45,9 @@ trait VirtualDevice: Send + Sync {
     async fn on_input_changed(&mut self, device_id: &DeviceId, new_state: &DeviceState) -> Result<(), VirtualDeviceError> { Ok(()) }
 
     // Whether its state already accounts for `input` at `state`: the echo
-    // of its own write, which must not re-derive it (lossy!)
+    // of its own write, which the manager then doesn't re-derive it from.
+    // A light group would read back the level it was set to anyway (#10,
+    // #66); a device whose re-derive is lossy would drift.
     fn accounts_for(&self, input: &DeviceId, state: &DeviceStateValue) -> bool { false }
 
     // The writes it asks for in reaction to an input's event (a button
@@ -228,6 +230,7 @@ struct LightGroup {
     lights: Vec<DeviceId>,
     brightness_curves: HashMap<DeviceId, BrightnessCurve>,
     current_state: LightState,
+    set_level: u8,                // what its lights' levels invert towards (#66)
     state_store: Arc<StateStore>, // read-only: derives the group from its lights
 }
 
@@ -270,11 +273,42 @@ impl VirtualDevice for LightGroup {
     fn take_state(&mut self, state: DeviceStateValue) {
         // Every light is committed: the group is where the write put it
         if let DeviceStateValue::Light(group) = state {
+            if let Some(level) = group.brightness.filter(|&level| level > 0) {
+                self.set_level = level;
+            }
             self.current_state = group;
         }
     }
 }
 ```
+
+#### 🎚️ Reading the level back (#10, #66)
+
+When a member changes from outside (a wall switch, the hub app), the manager
+re-derives the group from its members: on if any is lit, at the average
+level of those that are. Each lit member counts at the **group** level its
+curve (or, for `LightGroupLinear`, its range) inverts its own level to, not
+at its own level. Averaging the raw levels mixed member and group units, so
+a group drifted off the level it was set to after any member change.
+
+A member usually has several candidates (a curve that climbs slower than the
+group lights it at the same level for neighbouring group levels, a flat
+stretch for many). The group picks among them towards its `set_level`: the
+level it last took from a write, or found every lit member at.
+
+1. If some level is a candidate of every lit member, each inverts to the one
+   of those nearest `set_level`, and that becomes the set level.
+2. Otherwise each inverts to its own candidate nearest `set_level`.
+3. Ties go to the lower level.
+
+So a group set to a level reads that level back, a member turned off at the
+wall leaves it there, and a member dimmed at the wall moves it only by that
+member's share. Over the curves `[[0, 10], [100, 60]]`, `[[0, 0], [30, 40],
+[60, 40], [100, 100]]` and 1:1, a group at 50 puts its members at 35, 40 and
+50. Turning the 1:1 one off keeps it at 50 (the raw average read 37), and
+dimming the first to 20 reads (20 + 50 + 50) / 3 = 40 (the raw average read
+36). `lib/v1bectl_virtual/tests/light_group_levels.rs` drives that case end
+to end, and `linear_group_levels.rs` the shipped Bedroom Lights.
 
 ### 2. Scene Controller
 **Purpose**: Activate predefined multi-device scenes with smooth transitions
@@ -677,7 +711,8 @@ same way, since the file has no way to give a curve to an id it doesn't
 name. A curve with `min` or `max` over 100 fails the whole group, logged
 like any other creation failure.
 
-`LightGroup` itself always averages the levels of the members that are on
+`LightGroup` itself always averages over the members that are on, each at
+the group level its curve inverts its own level to (see 🎚️ above, #66),
 and writes every member instantly (like `light_group_linear` above,
 `transition_time` isn't wired up on either type yet), so
 `settings.aggregation` other than `"average"` and a `settings.transition_time`
