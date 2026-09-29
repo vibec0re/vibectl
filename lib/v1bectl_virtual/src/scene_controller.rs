@@ -27,6 +27,16 @@ pub struct Scene {
 }
 
 impl Scene {
+    /// Its devices and their targets, in the order of the devices' ids: the
+    /// order activating it sets them in (and a sequence's delays go by).
+    /// `device_states` is a `HashMap`, whose own order changes from one
+    /// server start to the next (#58 review, finding 1).
+    fn targets(&self) -> Vec<(&DeviceId, &DeviceStateValue)> {
+        let mut targets: Vec<_> = self.device_states.iter().collect();
+        targets.sort_by_key(|(device_id, _)| *device_id);
+        targets
+    }
+
     /// Whether activating it waits: a fade of at least one step, or a
     /// sequence with a delay before one of its devices.
     fn waits(&self) -> bool {
@@ -46,8 +56,14 @@ impl Scene {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransitionType {
     Instant,
-    Fade { duration_ms: u64 },
-    Sequence { delays_ms: Vec<u64> },
+    Fade {
+        duration_ms: u64,
+    },
+    /// The i-th delay goes before the i-th device, in the order of the
+    /// devices' ids.
+    Sequence {
+        delays_ms: Vec<u64>,
+    },
 }
 
 /// What a write to a scene controller asks of it.
@@ -389,7 +405,7 @@ impl SceneController {
         match scene.transition_type {
             TransitionType::Instant => {
                 // Set all devices immediately
-                for (device_id, target) in &scene.device_states {
+                for (device_id, target) in scene.targets() {
                     if !Self::stage_target(store, &mut staged, device_id, target).await {
                         break;
                     }
@@ -402,7 +418,7 @@ impl SceneController {
 
                 if steps == 0 {
                     // Just set immediately if duration too short
-                    for (device_id, target) in &scene.device_states {
+                    for (device_id, target) in scene.targets() {
                         if !Self::stage_target(store, &mut staged, device_id, target).await {
                             break;
                         }
@@ -426,7 +442,7 @@ impl SceneController {
                     )]
                     let progress = step as f32 / steps as f32;
 
-                    for (device_id, target_state) in &scene.device_states {
+                    for (device_id, target_state) in scene.targets() {
                         let started = staged.get(device_id).cloned();
                         let (current_state, target) =
                             match started.zip(targets.get(device_id).cloned()) {
@@ -466,7 +482,7 @@ impl SceneController {
             }
             TransitionType::Sequence { ref delays_ms } => {
                 // Activate devices in sequence with specified delays
-                for (i, (device_id, target)) in scene.device_states.iter().enumerate() {
+                for (i, (device_id, target)) in scene.targets().into_iter().enumerate() {
                     if let Some(&delay_ms) = delays_ms.get(i) {
                         if delay_ms > 0 {
                             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
@@ -1096,13 +1112,15 @@ mod tests {
     }
 
     /// The scene's devices in the order its transition takes them: the
-    /// order of its `device_states`.
+    /// order of their ids (#58 review, finding 1), not their `HashMap`'s.
     fn order(controller: &SceneController) -> Vec<DeviceId> {
-        controller.scenes["evening"]
+        let mut ids: Vec<DeviceId> = controller.scenes["evening"]
             .device_states
             .keys()
             .cloned()
-            .collect()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// #58: a sequence takes its devices in order, the i-th after the i-th

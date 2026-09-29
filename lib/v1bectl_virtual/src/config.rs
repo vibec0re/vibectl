@@ -189,9 +189,11 @@ pub async fn load_virtual_devices_from_dir(
     }
 
     // Read all .toml files, in the order of their names. `read_dir` gives
-    // them in whatever order the filesystem keeps them, and though nothing a
-    // file loads to depends on which loaded before it (#58), the log should
-    // read the same on every start.
+    // them in whatever order the filesystem keeps them. The devices the
+    // files load to end up the same in any order (#58: virtual members are
+    // resolved when a write reaches them, and a group catches up with a
+    // member registered after it), but the log, and which of two files
+    // with one `device_id` wins, should be the same on every start.
     let mut paths = Vec::new();
     for entry in fs::read_dir(dir)? {
         paths.push(entry?.path());

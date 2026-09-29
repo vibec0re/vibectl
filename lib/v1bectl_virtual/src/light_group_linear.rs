@@ -144,7 +144,7 @@ impl VirtualDevice for LightGroupLinear {
     }
 
     /// Each member at its range's level for the group state the write
-    /// resolves to (`resolve_write`).
+    /// resolves to (`resolve_write`), in the order of their device ids.
     async fn plan_write(
         &self,
         new_state: DeviceStateValue,
@@ -153,7 +153,7 @@ impl VirtualDevice for LightGroupLinear {
             return Err(VirtualDeviceError::InvalidStateType);
         };
         let group = resolve_write(&self.current_state, asked);
-        let members = self
+        let mut members: Vec<(DeviceId, DeviceStateValue)> = self
             .members
             .iter()
             .map(|(name, device_id)| {
@@ -168,6 +168,9 @@ impl VirtualDevice for LightGroupLinear {
                 (device_id.clone(), DeviceStateValue::Light(state))
             })
             .collect();
+        // In the order of their ids, not the `HashMap`'s, which changes
+        // from one server start to the next (#58 review, finding 1).
+        members.sort_by(|(a, _), (b, _)| a.cmp(b));
         Ok(VirtualWrite {
             members,
             state: DeviceStateValue::Light(group),

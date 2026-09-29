@@ -5,8 +5,6 @@ use crate::virtual_device::{
 };
 use crate::write_queue::{WriteQueue, WriteTurn};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{RwLock, RwLockWriteGuard};
@@ -99,50 +97,47 @@ fn state_event(
 /// ([`VirtualDeviceError::Cycle`]).
 pub const MAX_NESTING: usize = 4;
 
-/// A virtual write with each of its virtual members expanded into that
-/// member's own write, all the way down (see
-/// [`VirtualDeviceManager::expand`]): everything committing it takes,
-/// planned before any of it is committed.
-struct Expanded {
-    /// The virtual device whose write it is.
-    device_id: DeviceId,
-    /// In the order they're committed, each once (see
-    /// [`VirtualDeviceManager::expand`]).
-    members: Vec<Member>,
-    /// The device's own state once every member is committed.
+/// A write planned all the way down through its virtual members (see
+/// [`VirtualDeviceManager::expand`]): one plan in which each device the
+/// write reaches appears once, with the one state it's written to.
+struct Expansion {
+    /// The device written.
+    root: DeviceId,
+    /// Each virtual device the write reaches, the device written included.
+    planned: HashMap<DeviceId, Planned>,
+    /// The physical writes, each device once, in the order they're
+    /// committed.
+    physical: Vec<(DeviceId, DeviceStateValue)>,
+    /// The virtual devices, in the order they take their new states: each
+    /// after every virtual device its plan lists. The device written is
+    /// last.
+    order: Vec<DeviceId>,
+}
+
+/// A virtual device's part of an [`Expansion`].
+struct Planned {
+    /// Its own state, once the members it writes are committed.
     state: DeviceStateValue,
+    /// The members its plan lists, each once, in the plan's order.
+    members: Vec<DeviceId>,
+    /// Those of them a more direct path of the write sets instead (see
+    /// [`VirtualDeviceManager::expand`]): this device's plan doesn't write
+    /// them.
+    overridden: Vec<DeviceId>,
+    /// The device whose plan set it: `None` for the device written.
+    parent: Option<DeviceId>,
 }
 
-/// A member of an [`Expanded`] write.
-enum Member {
-    /// One the manager doesn't have: a physical device (or one the store
-    /// doesn't have either), committed through the sync engine.
-    Physical(DeviceId, DeviceStateValue),
-    /// A virtual device: its own write, expanded.
-    Virtual(Expanded),
-}
-
-impl Expanded {
-    /// Every device it writes: each member, virtual or not, at every
-    /// level. (Not the device whose write it is.)
+impl Expansion {
+    /// Every device it writes, at every level. (Not the device written.)
     fn writes(&self) -> Vec<&DeviceId> {
-        let mut writes = Vec::new();
-        for member in &self.members {
-            match member {
-                Member::Physical(id, _) => writes.push(id),
-                Member::Virtual(inner) => {
-                    writes.push(&inner.device_id);
-                    writes.extend(inner.writes());
-                }
-            }
-        }
-        writes
+        self.planned
+            .keys()
+            .filter(|id| **id != self.root)
+            .chain(self.physical.iter().map(|(id, _)| id))
+            .collect()
     }
 }
-
-/// What an expansion or a commit of one returns: boxed, since it recurses
-/// into the virtual members.
-type Boxed<'a, T> = Pin<Box<dyn Future<Output = Result<T, VirtualDeviceError>> + Send + 'a>>;
 
 fn warn_dangling(virtual_id: &DeviceId, device_id: &DeviceId) {
     tracing::warn!(
@@ -189,26 +184,28 @@ impl VirtualDeviceManager {
 
     /// Store `state` as virtual device `device_id`'s and echo it. If the
     /// store already holds exactly that, do neither, unless `even_unchanged`.
+    /// Returns whether the store held something else before.
     async fn store_state(
         &self,
         device_id: &DeviceId,
         state: DeviceStateValue,
         even_unchanged: bool,
-    ) -> Result<(), StateError> {
+    ) -> Result<bool, StateError> {
         let old_state = self
             .state_store
             .get_device(device_id)
             .await
             .map(|d| d.state);
-        if !even_unchanged && old_state.as_ref() == Some(&state) {
-            return Ok(());
+        let moved = old_state.as_ref() != Some(&state);
+        if !even_unchanged && !moved {
+            return Ok(false);
         }
         self.state_store
             .update_device_state(device_id, state.clone())
             .await?;
         self.publish_state(device_id, old_state.as_ref(), &state)
             .await;
-        Ok(())
+        Ok(moved)
     }
 
     /// Queue a write on the devices `keys` names (see
@@ -410,140 +407,304 @@ impl VirtualDeviceManager {
         writes
     }
 
-    /// Expand `write`, the write planned for the last device on `path`, into
-    /// everything committing it takes (#58). `path` runs from the device
-    /// written down to that one. `devices` is what the `virtual_devices`
-    /// lock guards, which the caller holds.
+    /// Plan `write`, the write `root` planned, all the way down through its
+    /// virtual members (#58): one plan in which each device the write
+    /// reaches appears once, with one state. `devices` is what the
+    /// `virtual_devices` lock guards, which the caller holds.
     ///
-    /// - A member listed more than once is committed once, where it first
-    ///   comes, at the last state it's listed with.
-    /// - A member the manager doesn't have is physical, and committed as
+    /// It goes level by level: `root`'s members (level 1), then the members
+    /// of those that are virtual (level 2), and so on.
+    ///
+    /// - A member the manager doesn't have is physical, and written as
     ///   listed.
-    /// - A virtual member plans its part of the write:
-    ///   [`VirtualDevice::plan_write`], with the state listed for it, from
-    ///   its state before the write, in the same hold of the lock. That
-    ///   plan is expanded the same way, so the write reaches the physical
-    ///   lights of a scene's group, or of a group's groups.
+    /// - A virtual member plans its part of the write, once:
+    ///   [`VirtualDevice::plan_write`] with the state listed for it, from
+    ///   its state before the write, in the same hold of the lock. Its plan
+    ///   is the next level's.
+    /// - **Each device is written once, by the most direct path to it.** A
+    ///   device a plan lists that an earlier level reached already is that
+    ///   plan's *overridden* member: a scene that sets group `g` to 30 and
+    ///   `g`'s lamp `l` to 5 puts `l` at 5, whatever order its devices come
+    ///   in, and `g` only writes its other lights. Between two paths of the
+    ///   same length (a light in two groups of a scene, a group in two
+    ///   groups of a group), the one through the device whose id sorts
+    ///   first wins. So the outcome never depends on the order a plan lists
+    ///   its members in, which for a scene or a linear group comes from a
+    ///   `HashMap`.
+    /// - A member listed twice in one plan counts once, at the last state
+    ///   it's listed with.
     ///
-    /// It fails before anything is committed: on a virtual member already
-    /// on `path` ([`VirtualDeviceError::Cycle`]), on one more than
-    /// [`MAX_NESTING`] levels below the device written
-    /// ([`VirtualDeviceError::TooDeep`]), and on one whose plan fails
-    /// ([`VirtualDeviceError::Member`]). A device reached through two
-    /// different members (a light in two of a scene's groups) is no cycle:
-    /// it's written each time, in order.
-    fn expand(
+    /// It fails before anything is committed: on a virtual member more than
+    /// [`MAX_NESTING`] levels below `root` ([`VirtualDeviceError::TooDeep`]),
+    /// on one whose plan fails ([`VirtualDeviceError::Member`]), and on
+    /// virtual devices whose plans list each other in a cycle
+    /// ([`VirtualDeviceError::Cycle`]).
+    async fn expand(
         devices: &HashMap<DeviceId, Box<dyn VirtualDevice>>,
-        path: Vec<DeviceId>,
+        root: &DeviceId,
         write: VirtualWrite,
-    ) -> Boxed<'_, Expanded> {
-        Box::pin(async move {
-            let mut members = Vec::new();
-            for (id, state) in Self::once_each(write.members) {
-                let Some(member) = devices.get(&id) else {
-                    members.push(Member::Physical(id, state));
-                    continue;
-                };
-                let mut inner_path = path.clone();
-                inner_path.push(id.clone());
-                if path.contains(&id) {
-                    return Err(VirtualDeviceError::Cycle(inner_path));
-                }
-                // `path` holds the device written (level 0) down to this
-                // member's parent, so this member is at level `path.len()`.
-                if path.len() > MAX_NESTING {
-                    return Err(VirtualDeviceError::TooDeep {
-                        path: inner_path,
-                        max: MAX_NESTING,
-                    });
-                }
-                let planned =
-                    member
-                        .plan_write(state)
-                        .await
-                        .map_err(|e| VirtualDeviceError::Member {
-                            device_id: id.clone(),
-                            error: Box::new(e),
-                        })?;
-                members.push(Member::Virtual(
-                    Self::expand(devices, inner_path, planned).await?,
-                ));
-            }
-            let device_id = path.last().cloned().unwrap_or_default();
-            Ok(Expanded {
-                device_id,
-                members,
+    ) -> Result<Expansion, VirtualDeviceError> {
+        let mut planned: HashMap<DeviceId, Planned> = HashMap::new();
+        // Each physical device reached: the device whose plan writes it,
+        // and its state.
+        let mut physical: HashMap<DeviceId, (DeviceId, DeviceStateValue)> = HashMap::new();
+        // The member writes of each virtual device planned, not yet reached.
+        let mut pending: HashMap<DeviceId, Vec<(DeviceId, DeviceStateValue)>> = HashMap::new();
+        planned.insert(
+            root.clone(),
+            Planned {
                 state: write.state,
-            })
+                members: Vec::new(),
+                overridden: Vec::new(),
+                parent: None,
+            },
+        );
+        pending.insert(root.clone(), Self::once_each(write.members));
+
+        // The virtual devices planned at the level above `depth`.
+        let mut level = vec![root.clone()];
+        let mut depth = 0;
+        while !level.is_empty() {
+            depth += 1;
+            // Two paths of the same length: through the first id wins.
+            level.sort();
+            let mut next = Vec::new();
+            for parent in level {
+                for (id, state) in pending.remove(&parent).unwrap_or_default() {
+                    let reached = planned.contains_key(&id) || physical.contains_key(&id);
+                    if let Some(listing) = planned.get_mut(&parent) {
+                        listing.members.push(id.clone());
+                        if reached {
+                            listing.overridden.push(id);
+                            continue;
+                        }
+                    }
+                    let Some(member) = devices.get(&id) else {
+                        physical.insert(id, (parent.clone(), state));
+                        continue;
+                    };
+                    if depth > MAX_NESTING {
+                        let mut path = Self::path_to(&planned, &parent);
+                        path.push(id);
+                        return Err(VirtualDeviceError::TooDeep {
+                            path,
+                            max: MAX_NESTING,
+                        });
+                    }
+                    let write =
+                        member
+                            .plan_write(state)
+                            .await
+                            .map_err(|e| VirtualDeviceError::Member {
+                                device_id: id.clone(),
+                                error: Box::new(e),
+                            })?;
+                    planned.insert(
+                        id.clone(),
+                        Planned {
+                            state: write.state,
+                            members: Vec::new(),
+                            overridden: Vec::new(),
+                            parent: Some(parent.clone()),
+                        },
+                    );
+                    pending.insert(id.clone(), Self::once_each(write.members));
+                    next.push(id);
+                }
+            }
+            level = next;
+        }
+
+        let order = Self::take_order(&planned, root)?;
+        let mut ordered = Vec::with_capacity(physical.len());
+        Self::physical_order(&planned, &mut physical, root, &mut ordered);
+        Ok(Expansion {
+            root: root.clone(),
+            planned,
+            physical: ordered,
+            order,
         })
     }
 
-    /// Commit `expanded`: its members, in order, then its device's own new
-    /// state, stored and echoed. `devices` is what the `virtual_devices`
-    /// lock guards, which the caller holds, and which has that device.
-    ///
-    /// - A physical member goes through [`Self::commit_physical`].
-    /// - A virtual member is committed the same way, recursively: its own
-    ///   members, then its new state ([`VirtualDevice::take_state`]),
-    ///   stored, and echoed if the write changed it, as a physical member
-    ///   is. So a group a write fans out through ends up where the write
-    ///   put it, the level it's set to included, and input tracking finds
-    ///   that it accounts for its members' echoes: they don't re-derive it
-    ///   (see [`VirtualDevice::accounts_for`]).
-    /// - The device written is echoed even if it's unchanged
-    ///   (`echo_unchanged`), as it always was.
-    ///
-    /// The first member that fails, such as one the store doesn't have
-    /// (#2), ends the write there: the ones before it stay committed, and
-    /// the ones after it are never made. Each virtual device on the way down
-    /// to it keeps its old state (the store is kept level with it), and
-    /// input tracking re-derives it from the members that did change.
-    fn commit_expanded<'a>(
-        &'a self,
-        devices: &'a mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
-        expanded: Expanded,
-        echo_unchanged: bool,
-    ) -> Boxed<'a, ()> {
-        Box::pin(async move {
-            let Expanded {
-                device_id,
-                members,
-                state,
-            } = expanded;
-            let mut committed = Ok(());
+    /// The path from the device written down to `id`, a virtual device in
+    /// `planned`, through the plans that set each one.
+    fn path_to(planned: &HashMap<DeviceId, Planned>, id: &DeviceId) -> Vec<DeviceId> {
+        let mut path = vec![id.clone()];
+        let mut at = id;
+        while let Some(parent) = planned.get(at).and_then(|part| part.parent.as_ref()) {
+            path.push(parent.clone());
+            at = parent;
+        }
+        path.reverse();
+        path
+    }
+
+    /// The virtual devices in `planned` in the order they take their new
+    /// states: each after every virtual device its plan lists, the ones it
+    /// writes and the ones a more direct path writes alike, so each sees its
+    /// members where the write leaves them. `root`, the device written, is
+    /// last. Fails on plans that list each other in a cycle, with the path
+    /// from `root` round it.
+    fn take_order(
+        planned: &HashMap<DeviceId, Planned>,
+        root: &DeviceId,
+    ) -> Result<Vec<DeviceId>, VirtualDeviceError> {
+        fn visit(
+            planned: &HashMap<DeviceId, Planned>,
+            id: &DeviceId,
+            path: &mut Vec<DeviceId>,
+            order: &mut Vec<DeviceId>,
+        ) -> Result<(), VirtualDeviceError> {
+            path.push(id.clone());
+            let members = planned.get(id).map_or(&[][..], |part| &part.members);
             for member in members {
-                committed = match member {
-                    Member::Physical(id, state) => self.commit_physical(&id, &state).await,
-                    Member::Virtual(inner) => self.commit_expanded(devices, inner, false).await,
-                };
-                if committed.is_err() {
-                    break;
+                if !planned.contains_key(member) || order.contains(member) {
+                    continue;
                 }
+                if path.contains(member) {
+                    let mut cycle = path.clone();
+                    cycle.push(member.clone());
+                    return Err(VirtualDeviceError::Cycle(cycle));
+                }
+                visit(planned, member, path, order)?;
+            }
+            path.pop();
+            order.push(id.clone());
+            Ok(())
+        }
+
+        let mut order = Vec::with_capacity(planned.len());
+        visit(planned, root, &mut Vec::new(), &mut order)?;
+        Ok(order)
+    }
+
+    /// Move the physical writes of `id`'s plan, and of every virtual device
+    /// it writes in turn, from `physical` to `out`, in the order the plans
+    /// list them: the order they're committed in.
+    fn physical_order(
+        planned: &HashMap<DeviceId, Planned>,
+        physical: &mut HashMap<DeviceId, (DeviceId, DeviceStateValue)>,
+        id: &DeviceId,
+        out: &mut Vec<(DeviceId, DeviceStateValue)>,
+    ) {
+        let members = planned.get(id).map_or(&[][..], |part| &part.members);
+        for member in members {
+            if planned
+                .get(member)
+                .is_some_and(|inner| inner.parent.as_ref() == Some(id))
+            {
+                Self::physical_order(planned, physical, member, out);
+            } else if physical.get(member).is_some_and(|(writer, _)| writer == id) {
+                if let Some((_, state)) = physical.remove(member) {
+                    out.push((member.clone(), state));
+                }
+            }
+        }
+    }
+
+    /// Commit `expansion` (see [`Self::expand`]). `devices` is what the
+    /// `virtual_devices` lock guards, which the caller holds.
+    ///
+    /// 1. Each physical write goes through [`Self::commit_physical`], in
+    ///    the order the plans list them. The first that fails, such as one
+    ///    the store doesn't have (#2), ends the write there: the ones before
+    ///    it stay committed, and the ones after it are never made.
+    /// 2. Then each virtual device, members before the devices that list
+    ///    them, the device written last. One whose members are all
+    ///    committed takes its new state ([`VirtualDevice::take_state`], so a
+    ///    group's set level moves too). If its new state doesn't account for
+    ///    one of its inputs as the write left it (see
+    ///    [`VirtualDevice::accounts_for`]), because a more direct path set
+    ///    it, or it re-derived itself just before, it re-derives from it
+    ///    ([`VirtualDevice::on_input_changed`]), as input tracking would
+    ///    once it got to the echoes: a group whose lamp a scene set on its
+    ///    own shows its lights as they are. Then it's stored and echoed,
+    ///    once: an inner device only if the write changed it, the device
+    ///    written always, as it always was. One whose members didn't all get
+    ///    committed keeps its old state (the store is kept level with it),
+    ///    and input tracking re-derives it from the ones that did change.
+    ///
+    /// Everything is in its final state before any virtual device takes
+    /// its own, so input tracking finds each one already accounting for
+    /// what the write did: its members' echoes don't re-derive it.
+    async fn commit_expansion(
+        &self,
+        devices: &mut HashMap<DeviceId, Box<dyn VirtualDevice>>,
+        expansion: Expansion,
+    ) -> Result<(), VirtualDeviceError> {
+        let Expansion {
+            root,
+            mut planned,
+            physical,
+            order,
+        } = expansion;
+        let mut failed = None;
+        // The physical members committed, and the virtual ones that took
+        // their new state.
+        let mut done: HashSet<DeviceId> = HashSet::new();
+        for (id, state) in physical {
+            if let Err(e) = self.commit_physical(&id, &state).await {
+                failed = Some(e);
+                break;
+            }
+            done.insert(id);
+        }
+
+        for id in order {
+            let Some(part) = planned.remove(&id) else {
+                continue;
+            };
+            let Some(virtual_device) = devices.get_mut(&id) else {
+                failed.get_or_insert(VirtualDeviceError::DeviceNotFound(id));
+                continue;
+            };
+            let committed = part
+                .members
+                .iter()
+                .filter(|member| !part.overridden.contains(member))
+                .all(|member| done.contains(member));
+            if !committed {
+                // A device keeps its state on failure, but the store must
+                // not be left behind it.
+                let current_state = virtual_device.current_state();
+                if let Err(store_error) = self.store_state(&id, current_state, false).await {
+                    tracing::error!("Failed to update virtual device state: {}", store_error);
+                }
+                continue;
             }
 
-            let Some(virtual_device) = devices.get_mut(&device_id) else {
-                return Err(VirtualDeviceError::DeviceNotFound(device_id));
-            };
-            match committed {
-                Ok(()) => {
-                    virtual_device.take_state(state);
-                    self.store_state(&device_id, virtual_device.current_state(), echo_unchanged)
-                        .await?;
-                    Ok(())
+            virtual_device.take_state(part.state);
+            // Every member is where the write leaves it now. One this device
+            // takes as an input, and whose state its new one doesn't account
+            // for (a more direct path set it, or it re-derived itself just
+            // now), is what input tracking would re-derive it from, once it
+            // got to the echoes: do it here, so the one echo shows it.
+            let inputs = virtual_device.input_devices();
+            for member in part.members.iter().filter(|member| inputs.contains(member)) {
+                let Some(input) = self.state_store.get_device(member).await else {
+                    continue;
+                };
+                if virtual_device.accounts_for(member, &input.state) {
+                    continue;
                 }
-                Err(e) => {
-                    // A device keeps its state on failure, but the store must
-                    // not be left behind it.
-                    let current_state = virtual_device.current_state();
-                    if let Err(store_error) =
-                        self.store_state(&device_id, current_state, false).await
-                    {
-                        tracing::error!("Failed to update virtual device state: {}", store_error);
-                    }
-                    Err(e)
+                if let Err(e) = virtual_device.on_input_changed(member, &input).await {
+                    tracing::warn!("Virtual device {} failed to handle input change: {}", id, e);
                 }
             }
-        })
+            let echo_unchanged = id == root;
+            match self
+                .store_state(&id, virtual_device.current_state(), echo_unchanged)
+                .await
+            {
+                Ok(_) => {
+                    done.insert(id);
+                }
+                Err(e) => {
+                    failed.get_or_insert(e.into());
+                }
+            }
+        }
+        failed.map_or(Ok(()), Err)
     }
 
     /// Commit `new_state` for `member_id`, a member of a write that the
@@ -579,10 +740,13 @@ impl VirtualDeviceManager {
     /// event announces it, so clients pick it up without a refetch (#16).
     ///
     /// A member may be a virtual device that isn't registered yet: whether
-    /// it's virtual is only resolved when a write reaches it (#58). But a
-    /// device whose members lead back to it (a group in a group that
-    /// contains it) is [`VirtualDeviceError::Cycle`], and isn't added:
-    /// whichever of the two comes second.
+    /// it's virtual is only resolved when a write reaches it (#58). When it
+    /// is registered, every group that has it as a member, directly or
+    /// through others, catches up with it (see `catch_up_with`), so a group
+    /// of groups registered first shows its lit members as soon as its
+    /// inner group is in. But a device whose members lead back to it (a
+    /// group in a group that contains it) is [`VirtualDeviceError::Cycle`],
+    /// and isn't added: whichever of the two comes second.
     pub async fn add_virtual_device(
         &self,
         mut device: Box<dyn VirtualDevice>,
@@ -662,6 +826,9 @@ impl VirtualDeviceManager {
         // Announced the way the server announces a discovered device.
         self.publish_lifecycle(&device_id, EventType::DeviceAdded { device_type })
             .await;
+        // A group already registered with it as a member (a group of groups
+        // whose file sorts first) seeded without it: catch it up now.
+        self.catch_up_with(&device_id).await;
         Ok(())
     }
 
@@ -701,6 +868,32 @@ impl VirtualDeviceManager {
         }
         dangling.sort();
         dangling
+    }
+
+    /// Every `(virtual device, virtual device it writes)` pair where the
+    /// second can't be set like a light: a scene that sets another scene
+    /// controller, a group with a button controller among its members.
+    /// Every write that reaches such a target fails
+    /// ([`VirtualDeviceError::Member`], #58), or, for a button action,
+    /// does nothing. A scene's checks can't tell at load, since its target
+    /// may load after it, so [`Self::start`] logs these once everything is
+    /// in.
+    pub async fn unsupported_targets(&self) -> Vec<(DeviceId, DeviceId)> {
+        let devices = self.virtual_devices.read().await;
+        let mut unsupported = Vec::new();
+        for device in devices.values() {
+            for output in device.output_devices() {
+                let Some(target) = devices.get(&output) else {
+                    continue;
+                };
+                if !matches!(target.current_state(), DeviceStateValue::Light(_)) {
+                    unsupported.push((device.device_id().clone(), output));
+                }
+            }
+        }
+        unsupported.sort();
+        unsupported.dedup();
+        unsupported
     }
 
     /// Every button that more than one button controller binds, with those
@@ -890,17 +1083,21 @@ impl VirtualDeviceManager {
         device_id: &DeviceId,
         new_state: &DeviceState,
     ) -> Result<(), VirtualDeviceError> {
-        self.track_input(device_id, Some(new_state)).await
+        self.track_input(device_id, Some(new_state))
+            .await
+            .map(|_moved| ())
     }
 
     /// [`Self::handle_device_state_change`], with `fallback` as the input
     /// for a device the store doesn't have. With none, such an input is
     /// skipped ([`Self::resync`] has nothing else to go on).
+    ///
+    /// Returns the virtual devices it moved (their stored state changed).
     async fn track_input(
         &self,
         device_id: &DeviceId,
         fallback: Option<&DeviceState>,
-    ) -> Result<(), VirtualDeviceError> {
+    ) -> Result<Vec<DeviceId>, VirtualDeviceError> {
         // Find virtual devices that depend on this physical device
         let virtual_device_ids = {
             let input_map = self.input_mappings.read().await;
@@ -908,7 +1105,7 @@ impl VirtualDeviceManager {
         };
 
         if virtual_device_ids.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Take the lock before reading the input, so no virtual write is
@@ -916,8 +1113,9 @@ impl VirtualDeviceManager {
         let mut devices = self.virtual_devices.write().await;
         let stored = self.state_store.get_device(device_id).await;
         let Some(input) = stored.as_ref().or(fallback) else {
-            return Ok(());
+            return Ok(Vec::new());
         };
+        let mut moved = Vec::new();
 
         // Notify all dependent virtual devices
         for virtual_id in virtual_device_ids {
@@ -943,15 +1141,49 @@ impl VirtualDeviceManager {
 
             // Update virtual device state in store, and echo it if it moved
             let new_virtual_state = virtual_device.current_state();
-            if let Err(e) = self
+            match self
                 .store_state(&virtual_id, new_virtual_state, false)
                 .await
             {
-                tracing::error!("Failed to update virtual device state: {}", e);
+                Ok(true) => moved.push(virtual_id),
+                Ok(false) => {}
+                Err(e) => tracing::error!("Failed to update virtual device state: {}", e),
             }
         }
 
-        Ok(())
+        Ok(moved)
+    }
+
+    /// Catch up every virtual device that takes `device_id` as an input,
+    /// directly or through others, with it as the store holds it now: each
+    /// one that doesn't already account for it is re-derived (see
+    /// [`Self::track_input`]), and so, in turn, is each device that takes a
+    /// device that moved as an input.
+    ///
+    /// [`Self::add_virtual_device`] does this for the device it adds (#58
+    /// review, finding 2). A group of groups registered before its inner
+    /// group (its file sorts first, or the API created it first) seeded
+    /// without it, and stayed that way until one of the inner group's lights
+    /// changed: a toggle of it at startup lit a lit room to 100 % instead of
+    /// switching it off. It doesn't wait for input tracking, which may not
+    /// be running yet while the server loads its devices.
+    async fn catch_up_with(&self, device_id: &DeviceId) {
+        // A device that moves goes back in, so what depends on it catches
+        // up in turn. The nesting is acyclic (registration rejects a cycle),
+        // so it ends; the bound is only a backstop.
+        let mut inputs = std::collections::VecDeque::from([device_id.clone()]);
+        let mut rounds = 0;
+        while let Some(input) = inputs.pop_front() {
+            rounds += 1;
+            if rounds > 1000 {
+                tracing::warn!("⚠️ Gave up catching up the devices that depend on {device_id}");
+                break;
+            }
+            match self.track_input(&input, None).await {
+                Ok(moved) => inputs.extend(moved),
+                Err(e) => tracing::error!("Failed to catch virtual devices up with {input}: {e}"),
+            }
+        }
     }
 
     /// Make the writes the virtual devices that `event` is an input of ask
@@ -1085,14 +1317,19 @@ impl VirtualDeviceManager {
     /// sets a light group ("movie: the living room at 30 %"), a group in a
     /// group. The write reaches that member's lights through its own plan:
     /// the manager asks it for its [`VirtualDevice::plan_write`] of the
-    /// state listed for it, and commits that the same way, recursively,
-    /// down to the physical lights (`expand`). The member then
-    /// takes its new state, level and all, is stored, and is echoed if the
-    /// write changed it, like a physical member. Each physical light is
-    /// committed through the sync engine as before. It all happens in the
-    /// same hold of the `virtual_devices` lock as the rest of the commit,
-    /// so input tracking finds each group already where the write put it:
-    /// its members' echoes are its own write, and don't re-derive it.
+    /// state listed for it, and plans its members the same way, level by
+    /// level, down to the physical lights (`expand`). That's one plan in
+    /// which each device appears once: the most direct path to a device
+    /// sets it, so a scene that sets a group to 30 % and one of the group's
+    /// lamps to 5 % puts the lamp at 5 %, every time. Each physical light is
+    /// committed through the sync engine as before. Then each virtual
+    /// member takes its new state, level and all, is stored, and is echoed
+    /// if the write changed it, like a physical member (re-derived first
+    /// from a lamp a more direct path set, so it shows its lights as they
+    /// are). It all happens in the same hold of the `virtual_devices` lock
+    /// as the rest of the commit, so input tracking finds each group
+    /// already where the write put it: its members' echoes are its own
+    /// write, and don't re-derive it.
     ///
     /// The whole expansion is planned before any of it is committed, so a
     /// write that can't be made fails with nothing committed: one whose
@@ -1233,9 +1470,10 @@ impl VirtualDeviceManager {
     }
 
     /// Commit `planned`, the write `device_id` planned (or the error its
-    /// plan failed with): expanded through its virtual members, all the way
-    /// down ([`Self::expand`]), then committed ([`Self::commit_expanded`]):
-    /// its members, in order, then its own new state, stored and echoed.
+    /// plan failed with): planned all the way down through its virtual
+    /// members, each device once ([`Self::expand`]), then committed
+    /// ([`Self::commit_expansion`]): the physical members, then each
+    /// virtual device's new state, stored and echoed, `device_id`'s last.
     /// `devices` is what the `virtual_devices` lock guards, which the
     /// caller holds, and which has `device_id`. `turn` is the write's place
     /// in the write queue, which the caller holds too.
@@ -1249,21 +1487,21 @@ impl VirtualDeviceManager {
         device_id: &DeviceId,
         planned: Result<VirtualWrite, VirtualDeviceError>,
     ) -> Result<(), VirtualDeviceError> {
-        let expanded = match planned {
-            Ok(write) => Self::expand(devices, vec![device_id.clone()], write).await,
+        let expansion = match planned {
+            Ok(write) => Self::expand(devices, device_id, write).await,
             Err(e) => Err(e),
         };
-        match expanded {
-            Ok(expanded) => {
+        match expansion {
+            Ok(expansion) => {
                 // A device the write wasn't queued on could be written while
                 // another write to it is in flight: a `writes_to` (or, for a
                 // virtual member, an `output_devices`) listed too few.
                 debug_assert!(
-                    turn.covers(expanded.writes()),
+                    turn.covers(expansion.writes()),
                     "{device_id} planned a write outside the devices it queued on: {:?}",
-                    expanded.writes()
+                    expansion.writes()
                 );
-                self.commit_expanded(devices, expanded, true).await
+                self.commit_expansion(devices, expansion).await
             }
             Err(e) => {
                 let Some(virtual_device) = devices.get(device_id) else {
@@ -1320,9 +1558,10 @@ impl VirtualDeviceManager {
     /// Start the manager: input tracking runs [`Self::handle_event`] for
     /// every event on the bus, in a background task, and [`Self::resync`]
     /// whenever it has fallen behind the bus and missed some. It also logs
-    /// every dangling reference (see [`Self::dangling_references`]), and
-    /// every button more than one controller binds (see
-    /// [`Self::shared_buttons`]).
+    /// every dangling reference (see [`Self::dangling_references`]), every
+    /// virtual target that can't be set like a light (see
+    /// [`Self::unsupported_targets`]), and every button more than one
+    /// controller binds (see [`Self::shared_buttons`]).
     /// The server calls this once all virtual devices are loaded.
     pub async fn start(&self) -> Result<(), VirtualDeviceError> {
         let manager = Arc::new(self.clone());
@@ -1334,6 +1573,13 @@ impl VirtualDeviceManager {
         self.tracking.store(true, Ordering::Release);
         for (virtual_id, missing) in self.dangling_references().await {
             warn_dangling(&virtual_id, &missing);
+        }
+        for (virtual_id, target) in self.unsupported_targets().await {
+            tracing::warn!(
+                "⚠️ Virtual device {} sets {}, a virtual device that can't be set like a light: every write that reaches it fails",
+                virtual_id,
+                target
+            );
         }
         for (button, controllers) in self.shared_buttons().await {
             tracing::warn!(
