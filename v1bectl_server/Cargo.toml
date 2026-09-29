@@ -24,5 +24,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+# ⏱️ A paused clock (`tokio::time::pause`) for the TOML scene tests (#10): a
+# fade's delays pass in virtual time, exactly and at once.
+tokio = { workspace = true, features = ["test-util"] }
+
 [lints]
 workspace = true

@@ -1,0 +1,28 @@
+# 🎬 SCENE CONTROLLER - a test fixture (#10), not a shipped default.
+# See living_room_scenes.toml for how it's loaded.
+#
+# Its device is the dummy `basic_home` scenario's bedroom light. Its scenes
+# fade over transition_duration: 2 s.
+
+type = "scene_controller"
+device_id = "scene_bedroom"
+name = "Bedroom Scenes"
+
+[[scenes]]
+name = "wake_up"
+display_name = "Wake Up"
+
+[[scenes.devices]]
+device_id = "light_bedroom"
+state = { type = "light", is_on = true, brightness = 80, color_temp = 4000 }
+
+[[scenes]]
+name = "sleep"
+display_name = "Sleep"
+
+[[scenes.devices]]
+device_id = "light_bedroom"
+state = { type = "light", is_on = false, brightness = 0 }
+
+[settings]
+transition_duration = 2000

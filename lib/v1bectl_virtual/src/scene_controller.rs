@@ -1,3 +1,4 @@
+use crate::config::{SceneControllerConfig, SceneDeviceState};
 use crate::virtual_device::{
     DetachedPlan, VirtualDevice, VirtualDeviceConfig, VirtualDeviceError, VirtualDeviceType,
     VirtualWrite,
@@ -8,7 +9,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use v1bectl_sync::{
-    DeviceId, DeviceStateValue, LightState, SceneState, SensorState, StateStore, SwitchState,
+    DeviceId, DeviceStateValue, LightState, OutletState, SceneState, SensorState, StateStore,
+    SwitchState,
 };
 
 /// How long each step of a fade is.
@@ -130,6 +132,141 @@ impl SceneController {
             },
             state_store,
         })
+    }
+
+    /// A scene controller from its TOML config (`type = "scene_controller"`
+    /// in `virtual_devices/*.toml`), as the server loads one (#10), with a
+    /// line for each part of that config it can't honour, for the loader to
+    /// warn about.
+    ///
+    /// The TOML maps onto the config [`Self::new`] takes, the one the API's
+    /// `CreateVirtualDevice` sends:
+    /// - Each `[[scenes]]` is a scene of its `name`. Its `display_name` is
+    ///   kept in the config, but nothing at runtime reads it.
+    /// - Each of its `devices` is a target, in the shape the store holds
+    ///   that device in (see `toml_target`).
+    /// - `settings.transition_duration` is every scene's transition (see
+    ///   `toml_transition`): a fade over it, or instant for 0. The TOML
+    ///   has no transition per scene, and no sequence.
+    /// - `settings.default_scene` is kept in the config, with a warning:
+    ///   nothing activates a default scene. Activating it on load would
+    ///   switch the lights on every restart of the server.
+    ///
+    /// It fails on a config that is ambiguous or can't work: two scenes of
+    /// one name, a scene named `none` or with no name (a write of either
+    /// deactivates the current scene, so it could never be activated), a
+    /// device twice in one scene, a brightness over 100, or a device the
+    /// store holds as something a scene can't set (a switch, a sensor).
+    ///
+    /// A device the store doesn't have is no error, as for the other
+    /// virtual devices: it may be a virtual device that loads later. The
+    /// manager warns about each one still missing once all are loaded (see
+    /// [`crate::VirtualDeviceManager::dangling_references`]), and activating
+    /// a scene that sets one fails at it.
+    pub async fn from_toml(
+        toml: &SceneControllerConfig,
+        state_store: Arc<StateStore>,
+    ) -> Result<(Self, Vec<String>), VirtualDeviceError> {
+        let mut warnings = Vec::new();
+        let transition = toml_transition(toml.settings.transition_duration, &mut warnings);
+        if toml.scenes.is_empty() {
+            warnings.push("it has no scenes: there is nothing to activate".to_string());
+        }
+
+        let mut scenes = serde_json::Map::new();
+        for scene in &toml.scenes {
+            let name = &scene.name;
+            if name.is_empty() || name == "none" {
+                return Err(VirtualDeviceError::Config(format!(
+                    "a scene can't be named {name:?}: activating `none` or no name deactivates the current scene"
+                )));
+            }
+            if scenes.contains_key(name) {
+                return Err(VirtualDeviceError::Config(format!(
+                    "two scenes are named {name}"
+                )));
+            }
+            if scene.devices.is_empty() {
+                warnings.push(format!(
+                    "scene {name} sets no devices: activating it only marks it active"
+                ));
+            }
+
+            let mut device_states = HashMap::new();
+            for device in &scene.devices {
+                let current = state_store
+                    .get_device(&device.device_id)
+                    .await
+                    .map(|d| d.state);
+                let target = toml_target(
+                    name,
+                    &device.device_id,
+                    &device.state,
+                    current.as_ref(),
+                    &mut warnings,
+                )?;
+                if device_states
+                    .insert(device.device_id.clone(), target)
+                    .is_some()
+                {
+                    return Err(VirtualDeviceError::Config(format!(
+                        "scene {name} sets {} twice",
+                        device.device_id
+                    )));
+                }
+            }
+
+            let runtime = Scene {
+                name: name.clone(),
+                device_states,
+                transition_type: transition.clone(),
+            };
+            let mut value = serde_json::to_value(&runtime).map_err(|e| {
+                VirtualDeviceError::Config(format!("scene {name} doesn't serialize: {e}"))
+            })?;
+            if let Some(fields) = value.as_object_mut() {
+                fields.insert(
+                    "display_name".to_string(),
+                    scene.display_name.clone().into(),
+                );
+            }
+            scenes.insert(name.clone(), value);
+        }
+
+        if let Some(default_scene) = &toml.settings.default_scene {
+            let unknown = if scenes.contains_key(default_scene) {
+                ""
+            } else {
+                " (and it isn't one of its scenes)"
+            };
+            warnings.push(format!(
+                "default_scene {default_scene} is not activated{unknown}: nothing activates a default scene, so activate it through the API"
+            ));
+        }
+
+        let mut config = serde_json::json!({
+            "scenes": scenes,
+            "default_transition_ms": toml.settings.transition_duration,
+        });
+        if let Some(default_scene) = &toml.settings.default_scene {
+            config["default_scene"] = default_scene.clone().into();
+        }
+
+        let controller = Self::new(
+            VirtualDeviceConfig {
+                device_id: toml.device_id.clone(),
+                name: toml.name.clone(),
+                description: Some(format!(
+                    "Scene controller with {} scenes",
+                    toml.scenes.len()
+                )),
+                enabled: true,
+                device_type: VirtualDeviceType::SceneController,
+                config,
+            },
+            state_store,
+        )?;
+        Ok((controller, warnings))
     }
 
     /// What writing `new_state` asks of this controller. It only looks the
@@ -379,6 +516,117 @@ impl SceneController {
             }
         }
         devices.into_iter().collect()
+    }
+}
+
+/// The transition of every scene of a TOML scene controller, from its
+/// `transition_duration` in ms: a fade over it, or instant for 0.
+///
+/// A fade runs in whole [`FADE_STEP`]s. So one shorter than a step would
+/// set its devices at once, and is instant, with a warning. One between
+/// steps ends at the step before it, with a warning too.
+fn toml_transition(duration_ms: u32, warnings: &mut Vec<String>) -> TransitionType {
+    let step_ms = FADE_STEP.as_millis();
+    let requested = u128::from(duration_ms);
+    if duration_ms == 0 {
+        return TransitionType::Instant;
+    }
+    if requested < step_ms {
+        warnings.push(format!(
+            "transition_duration {duration_ms} ms is shorter than one fade step ({step_ms} ms): its scenes are set instantly"
+        ));
+        return TransitionType::Instant;
+    }
+    let faded = requested / step_ms * step_ms;
+    if faded != requested {
+        warnings.push(format!(
+            "transition_duration {duration_ms} ms fades in whole {step_ms} ms steps: {faded} ms"
+        ));
+    }
+    TransitionType::Fade {
+        duration_ms: u64::from(duration_ms),
+    }
+}
+
+/// The state TOML scene `scene` sets `device_id` to, `state`, as a scene
+/// writes it: in the shape the store holds the device in, `current`.
+///
+/// So a scene writes what the device's gateway can push, and doesn't
+/// change the kind of state the store holds for it:
+/// - A light is a light. `rgb_color` isn't in the TOML, and is unset.
+/// - An outlet is an outlet if the store holds it as one, as the dummy
+///   does, and a light that is only on or off if it holds it as a light.
+///   That is how a Dirigera hub's outlets are read, and the only kind of
+///   state its gateway writes to one.
+/// - A light the store holds as an outlet is on or off only. Its
+///   `brightness` and `color_temp` are dropped, with a warning.
+/// - A device the store holds as anything else (a switch, a sensor) fails:
+///   a scene can't set it.
+/// - A device the store doesn't have is taken at its word.
+fn toml_target(
+    scene: &str,
+    device_id: &DeviceId,
+    state: &SceneDeviceState,
+    current: Option<&DeviceStateValue>,
+    warnings: &mut Vec<String>,
+) -> Result<DeviceStateValue, VirtualDeviceError> {
+    let (is_on, brightness, color_temp) = match *state {
+        SceneDeviceState::Light {
+            is_on,
+            brightness,
+            color_temp,
+        } => (is_on, brightness, color_temp),
+        SceneDeviceState::Outlet { is_on } => (is_on, None, None),
+    };
+    if let Some(level) = brightness.filter(|&level| level > 100) {
+        return Err(VirtualDeviceError::Config(format!(
+            "scene {scene} sets {device_id} to brightness {level}, over 100"
+        )));
+    }
+    let light = DeviceStateValue::Light(LightState {
+        is_on,
+        brightness,
+        color_temp,
+        rgb_color: None,
+    });
+    let outlet = DeviceStateValue::Outlet(OutletState {
+        is_on,
+        power_consumption: None,
+        total_energy: None,
+    });
+
+    match current {
+        Some(DeviceStateValue::Light(_)) => Ok(light),
+        Some(DeviceStateValue::Outlet(_)) => {
+            if brightness.is_some() || color_temp.is_some() {
+                warnings.push(format!(
+                    "scene {scene}: {device_id} is an outlet, so only whether it's on is set (not its brightness or color_temp)"
+                ));
+            }
+            Ok(outlet)
+        }
+        Some(other) => Err(VirtualDeviceError::Config(format!(
+            "scene {scene} sets {device_id}, a {}: a scene sets only lights and outlets",
+            state_kind(other)
+        ))),
+        None => Ok(match state {
+            SceneDeviceState::Light { .. } => light,
+            SceneDeviceState::Outlet { .. } => outlet,
+        }),
+    }
+}
+
+/// What kind of device holds `state`, for an error message.
+fn state_kind(state: &DeviceStateValue) -> &'static str {
+    match state {
+        DeviceStateValue::Light(_) => "light",
+        DeviceStateValue::Outlet(_) => "outlet",
+        DeviceStateValue::Switch(_) => "switch",
+        DeviceStateValue::Sensor(_) => "sensor",
+        DeviceStateValue::MotionSensor(_) => "motion sensor",
+        DeviceStateValue::Scene(_) => "scene controller",
+        DeviceStateValue::Timer(_) => "timer",
+        DeviceStateValue::Empty => "device without a state (a button controller)",
     }
 }
 

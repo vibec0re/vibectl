@@ -7,7 +7,7 @@ use v1bectl_gateway::{DirigeraGateway, Gateway};
 use v1bectl_sync::{
     recv_lossy, DeviceEvent, DeviceStateValue, EventBus, EventType, StateStore, SyncEngine,
 };
-use v1bectl_virtual::DummyGateway;
+use v1bectl_virtual::{DummyGateway, VirtualDeviceManager};
 
 #[derive(Parser)]
 #[command(name = "v1bectl_server")]
@@ -77,109 +77,19 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> {
-    info!("🚀 VIBEC0RE SERVER STARTING - PURE ASYNC WEBSOCKET POWER! 🔥");
-
-    // Initialize components
-    let state_store = StateStore::new();
-    let event_bus = Arc::new(EventBus::new(1000)); // Keep last 1000 events
-
-    // 🔥 START GATEWAY EVENT STREAM FOR REAL-TIME EVENTS! 💖
-    // This connects the gateway's WebSocket events to our EventBus
-    match gateway.event_stream().await {
-        Ok(mut gateway_events) => {
-            let event_bus_clone = event_bus.clone();
-            tokio::spawn(async move {
-                info!("🎯 Gateway event stream connected - forwarding to EventBus!");
-                // `Lagged` events are intentionally just skipped (with a warning) here:
-                // the sync engine's periodic pull worker re-reads hub state on its own
-                // schedule, so a skipped gateway event self-heals instead of leaving the
-                // server permanently blind like the old `while let Ok` did on any lag.
-                while let Some(event) =
-                    recv_lossy(&mut gateway_events, "gateway event stream").await
-                {
-                    // Forward gateway events to our main EventBus
-                    event_bus_clone.publish(event).await;
-                }
-                warn!("⚠️ Gateway event stream ended");
-            });
-        }
-        Err(e) => {
-            warn!("⚠️ Gateway does not support event stream: {}", e);
-        }
-    }
-
-    // Initialize sync engine
-    let sync_engine = Arc::new(SyncEngine::new(
-        state_store.clone(),
-        event_bus.clone(),
-        gateway.clone(),
-        None, // Use default config - VIBEOPTIMIZED! 🔥
-    ));
-
-    // Discover and populate initial devices - VIBEC0RE AUTODISCOVERY! 🔍
-    info!("🔍 Discovering devices from gateway...");
-    let devices = gateway.discover_devices().await?;
-    info!("🎯 Found {} devices from gateway!", devices.len());
-
-    for device_info in devices {
-        // Get initial state from gateway
-        match gateway.get_device_state(&device_info.device_id).await {
-            Ok(initial_state) => {
-                state_store
-                    .add_device(device_info.clone(), initial_state)
-                    .await;
-                info!(
-                    "✅ Added device: {} ({}) - {:?}",
-                    device_info.name, device_info.device_id, device_info.device_type
-                );
-
-                // Publish device added event
-                event_bus
-                    .publish(DeviceEvent {
-                        timestamp: std::time::SystemTime::now(),
-                        device_id: device_info.device_id.clone(),
-                        event_type: EventType::DeviceAdded {
-                            device_type: format!("{:?}", device_info.device_type),
-                        },
-                    })
-                    .await;
-            }
-            Err(e) => {
-                warn!(
-                    "❌ Failed to get initial state for device {}: {}",
-                    device_info.device_id, e
-                );
-            }
-        }
-    }
-
-    info!("🔥 VIBEC0RE SERVER READY! 🔥");
-    info!("📊 Stats:");
-    info!("  - Total devices: {}", state_store.device_count().await);
-    info!(
-        "  - Reachable devices: {}",
-        state_store.reachable_device_count().await
-    );
-    info!("  - Server port: {}", port);
-    info!("  - WebSocket endpoint: ws://0.0.0.0:{}/", port);
-
-    // Start Axum WebSocket-ONLY server on VIBEC0RE port 🔥
-    let axum_server = AxumServer::new(
-        port,
-        state_store.clone(),
-        event_bus.clone(),
-        gateway.clone(),
-    )
-    .with_sync_engine(sync_engine.clone()); // 🔥 ENABLE OPTIMISTIC UPDATES FOR INSTANT UI!
-
-    // 🔥 GET VIRTUAL DEVICE MANAGER BEFORE STARTING SERVER! 💖
-    let virtual_device_manager = axum_server.virtual_device_manager();
-
-    // 🔥 LOAD VIRTUAL DEVICES FROM TOML CONFIGS! 💖
-    info!("📁 Loading virtual devices from virtual_devices/*.toml...");
-    let virtual_dir = std::path::Path::new("virtual_devices");
-
+/// Load every virtual device `virtual_dir/*.toml` configures, over the
+/// devices `state_store` holds, and register it with
+/// `virtual_device_manager`. One that fails to parse, to be created or to
+/// be registered is logged (❌) and skipped, and the others still load.
+#[expect(
+    clippy::too_many_lines,
+    reason = "run_server's virtual device loading, moved here as it was so tests can load a fixture dir the way the server does (#10); one arm per config type"
+)]
+async fn load_virtual_devices(
+    virtual_dir: &std::path::Path,
+    state_store: &Arc<StateStore>,
+    virtual_device_manager: &VirtualDeviceManager,
+) {
     match v1bectl_virtual::load_virtual_devices_from_dir(virtual_dir).await {
         Ok(configs) => {
             info!("🔥 Found {} virtual device configs!", configs.len());
@@ -412,9 +322,46 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
                             "🎬 Creating scene controller: {} ({})",
                             cfg.name, cfg.device_id
                         );
+                        let scene_names: Vec<&str> =
+                            cfg.scenes.iter().map(|s| s.name.as_str()).collect();
+                        info!("  Scenes: {:?}", scene_names);
+                        info!("  Transition: {} ms", cfg.settings.transition_duration);
 
-                        // TODO: Implement scene controller creation
-                        info!("⚠️ Scene controllers not yet implemented!");
+                        // Create and register the scene controller (#10)
+                        match v1bectl_virtual::SceneController::from_toml(&cfg, state_store.clone())
+                            .await
+                        {
+                            Ok((scene_controller, warnings)) => {
+                                // What of the config it can't honour
+                                for warning in warnings {
+                                    warn!("⚠️ Scene controller {}: {}", cfg.device_id, warning);
+                                }
+                                // 🔥 REGISTER WITH VIRTUAL DEVICE MANAGER! 💖
+                                match virtual_device_manager
+                                    .add_virtual_device(Box::new(scene_controller))
+                                    .await
+                                {
+                                    Ok(()) => {
+                                        info!(
+                                            "✅ Scene controller {} registered successfully!",
+                                            cfg.device_id
+                                        );
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "❌ Failed to register scene controller {}: {}",
+                                            cfg.device_id, e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    "❌ Failed to create scene controller {}: {}",
+                                    cfg.device_id, e
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -423,6 +370,111 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
             warn!("⚠️ Failed to load virtual devices: {}", e);
         }
     }
+}
+
+async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> {
+    info!("🚀 VIBEC0RE SERVER STARTING - PURE ASYNC WEBSOCKET POWER! 🔥");
+
+    // Initialize components
+    let state_store = StateStore::new();
+    let event_bus = Arc::new(EventBus::new(1000)); // Keep last 1000 events
+
+    // 🔥 START GATEWAY EVENT STREAM FOR REAL-TIME EVENTS! 💖
+    // This connects the gateway's WebSocket events to our EventBus
+    match gateway.event_stream().await {
+        Ok(mut gateway_events) => {
+            let event_bus_clone = event_bus.clone();
+            tokio::spawn(async move {
+                info!("🎯 Gateway event stream connected - forwarding to EventBus!");
+                // `Lagged` events are intentionally just skipped (with a warning) here:
+                // the sync engine's periodic pull worker re-reads hub state on its own
+                // schedule, so a skipped gateway event self-heals instead of leaving the
+                // server permanently blind like the old `while let Ok` did on any lag.
+                while let Some(event) =
+                    recv_lossy(&mut gateway_events, "gateway event stream").await
+                {
+                    // Forward gateway events to our main EventBus
+                    event_bus_clone.publish(event).await;
+                }
+                warn!("⚠️ Gateway event stream ended");
+            });
+        }
+        Err(e) => {
+            warn!("⚠️ Gateway does not support event stream: {}", e);
+        }
+    }
+
+    // Initialize sync engine
+    let sync_engine = Arc::new(SyncEngine::new(
+        state_store.clone(),
+        event_bus.clone(),
+        gateway.clone(),
+        None, // Use default config - VIBEOPTIMIZED! 🔥
+    ));
+
+    // Discover and populate initial devices - VIBEC0RE AUTODISCOVERY! 🔍
+    info!("🔍 Discovering devices from gateway...");
+    let devices = gateway.discover_devices().await?;
+    info!("🎯 Found {} devices from gateway!", devices.len());
+
+    for device_info in devices {
+        // Get initial state from gateway
+        match gateway.get_device_state(&device_info.device_id).await {
+            Ok(initial_state) => {
+                state_store
+                    .add_device(device_info.clone(), initial_state)
+                    .await;
+                info!(
+                    "✅ Added device: {} ({}) - {:?}",
+                    device_info.name, device_info.device_id, device_info.device_type
+                );
+
+                // Publish device added event
+                event_bus
+                    .publish(DeviceEvent {
+                        timestamp: std::time::SystemTime::now(),
+                        device_id: device_info.device_id.clone(),
+                        event_type: EventType::DeviceAdded {
+                            device_type: format!("{:?}", device_info.device_type),
+                        },
+                    })
+                    .await;
+            }
+            Err(e) => {
+                warn!(
+                    "❌ Failed to get initial state for device {}: {}",
+                    device_info.device_id, e
+                );
+            }
+        }
+    }
+
+    info!("🔥 VIBEC0RE SERVER READY! 🔥");
+    info!("📊 Stats:");
+    info!("  - Total devices: {}", state_store.device_count().await);
+    info!(
+        "  - Reachable devices: {}",
+        state_store.reachable_device_count().await
+    );
+    info!("  - Server port: {}", port);
+    info!("  - WebSocket endpoint: ws://0.0.0.0:{}/", port);
+
+    // Start Axum WebSocket-ONLY server on VIBEC0RE port 🔥
+    let axum_server = AxumServer::new(
+        port,
+        state_store.clone(),
+        event_bus.clone(),
+        gateway.clone(),
+    )
+    .with_sync_engine(sync_engine.clone()); // 🔥 ENABLE OPTIMISTIC UPDATES FOR INSTANT UI!
+
+    // 🔥 GET VIRTUAL DEVICE MANAGER BEFORE STARTING SERVER! 💖
+    let virtual_device_manager = axum_server.virtual_device_manager();
+
+    // 🔥 LOAD VIRTUAL DEVICES FROM TOML CONFIGS! 💖
+    info!("📁 Loading virtual devices from virtual_devices/*.toml...");
+    let virtual_dir = std::path::Path::new("virtual_devices");
+    load_virtual_devices(virtual_dir, &state_store, &virtual_device_manager).await;
 
     info!("📊 Updated Stats:");
     info!("  - Total devices: {}", state_store.device_count().await);
@@ -605,3 +657,6 @@ async fn run_server(gateway: Arc<dyn Gateway>, port: u16) -> anyhow::Result<()> 
     info!("✅ VIBEC0RE SERVER SHUTDOWN COMPLETE! 🔥");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;
