@@ -625,8 +625,8 @@ like any other creation failure.
 `LightGroup` itself always averages the levels of the members that are on
 and writes every member instantly (like `light_group_linear` above,
 `transition_time` isn't wired up on either type yet), so
-`settings.aggregation` other than `"average"` and any
-`settings.transition_time` are not honoured — each logs a `warn!` once at
+`settings.aggregation` other than `"average"` and a `settings.transition_time`
+other than its 500 ms default are not honoured — each logs a `warn!` once at
 load rather than being silently dropped. `settings.exclude` *is* honoured,
 since it's applied to the wildcard match itself, before the group is built.
 

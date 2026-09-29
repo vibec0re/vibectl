@@ -192,10 +192,15 @@ async fn load_virtual_devices(
                                 cfg.device_id, cfg.settings.aggregation
                             );
                         }
-                        warn!(
-                            "⚠️ Light group {}: settings.transition_time ({} ms) isn't applied — LightGroup writes its members instantly, with no fade",
-                            cfg.device_id, cfg.settings.transition_time
-                        );
+                        // Only when the file sets it: the field defaults to 500 ms
+                        // (`default_transition_time` in v1bectl_virtual's config), and
+                        // warning about a default nobody wrote is noise on every start.
+                        if cfg.settings.transition_time != 500 {
+                            warn!(
+                                "⚠️ Light group {}: settings.transition_time ({} ms) isn't applied — LightGroup writes its members instantly, with no fade",
+                                cfg.device_id, cfg.settings.transition_time
+                            );
+                        }
 
                         let vd_config = v1bectl_virtual::VirtualDeviceConfig {
                             device_id: cfg.device_id.clone(),
