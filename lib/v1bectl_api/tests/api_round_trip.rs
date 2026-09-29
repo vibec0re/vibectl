@@ -546,6 +546,46 @@ async fn a_light_group_write_comes_back_over_the_socket() {
     }
 }
 
+/// #71: the API's `CreateVirtualDevice` used to take a `LightGroup`
+/// breakpoint over 100 straight from the client. Set to 60, `[[0, 0], [100,
+/// 200]]` would have planned its member at 120. `LightGroup::new` now
+/// checks breakpoints the way the TOML path's `min`/`max` check does
+/// (#67), so the API rejects it too, and nothing is registered.
+#[tokio::test]
+async fn a_light_group_breakpoint_over_100_is_not_created() {
+    const GROUP: &str = "virtual_curve_over_100";
+    let home = serve_dummy_home().await;
+    let mut client = Client::connect(home.addr).await;
+
+    let config = VirtualDeviceConfig {
+        device_id: GROUP.to_string(),
+        device_type: VirtualDeviceType::LightGroup,
+        name: "Over 100".to_string(),
+        description: None,
+        enabled: true,
+        config: serde_json::json!({
+            "lights": [LIGHT],
+            "brightness_curves": { LIGHT: { "breakpoints": [[0, 0], [100, 200]] } },
+        }),
+    };
+    let payload = client
+        .request_payload(&ApiRequest::CreateVirtualDevice { config })
+        .await;
+    let (code, message) = match decode(&payload) {
+        ApiResponse::Error { code, message } => (code, message),
+        ApiResponse::VirtualDeviceCreated { device_id } => {
+            panic!("the API created {device_id}")
+        }
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(code, "CREATE_FAILED");
+    assert!(message.contains("out of range"), "{message}");
+    assert!(
+        home.store.get_device(&GROUP.to_string()).await.is_none(),
+        "{GROUP} was registered"
+    );
+}
+
 /// #8 (from the #49 review): the answer to a request carries the request's
 /// correlation id, which the server copies from the envelope. The CLI
 /// matches answers by it, and so does the web UI's tab-return probe. Two
