@@ -159,11 +159,13 @@ fn light(is_on: bool, brightness: Option<u8>, color_temp: Option<u16>) -> Device
     })
 }
 
+/// The dummy's `outlet_tv`, on or off. A scene changes only the fields it
+/// names (#64), so it keeps the dummy's readings.
 fn outlet(is_on: bool) -> DeviceStateValue {
     DeviceStateValue::Outlet(OutletState {
         is_on,
-        power_consumption: None,
-        total_energy: None,
+        power_consumption: Some(45.5),
+        total_energy: Some(123.4),
     })
 }
 
@@ -243,15 +245,21 @@ async fn an_instant_toml_scene_sets_its_devices_at_once() {
             "movie",
             [
                 ("light_living_room", light(true, Some(20), Some(2200))),
-                ("light_kitchen", light(false, None, None)),
+                // The scene names only `is_on`: it keeps its level (#64).
+                ("light_kitchen", light(false, Some(75), None)),
+                // Already on: the scene names only `is_on`, so it's left
+                // as it is (#64).
                 ("outlet_tv", outlet(true)),
             ],
         ),
         (
             "lights_out",
             [
-                ("light_living_room", light(false, None, None)),
-                ("light_kitchen", light(false, None, None)),
+                // The scene names only `is_on`: it keeps the level and
+                // colour `movie` set (#64).
+                ("light_living_room", light(false, Some(20), Some(2200))),
+                // The scene names only `is_on`: it keeps its level (#64).
+                ("light_kitchen", light(false, Some(75), None)),
                 ("outlet_tv", outlet(false)),
             ],
         ),
@@ -263,14 +271,23 @@ async fn an_instant_toml_scene_sets_its_devices_at_once() {
         for (id, target) in &targets {
             let echoed = echoes(&events, id);
             assert_eq!(&server.stored(id).await, target, "{scene}: {id}");
-            // The kitchen light is off with no level after `movie`, so
-            // `lights_out` leaves it as it is, and has nothing to echo.
-            let want = if scene == "lights_out" && *id == "light_kitchen" {
+            // A scene changes only the fields it names (#64), so what it
+            // leaves as it is has nothing to echo: the kitchen light, off
+            // at its level after `movie`, in `lights_out`, and the TV,
+            // already on, in `movie`.
+            let unchanged = (scene == "lights_out" && *id == "light_kitchen")
+                || (scene == "movie" && *id == "outlet_tv");
+            let want = if unchanged {
                 Vec::new()
             } else {
                 vec![target.clone()]
             };
             assert_eq!(echoed, want, "{scene}: {id}'s echoes");
+            // The TV isn't written by `movie` (#64), so nothing is queued
+            // for it yet.
+            if scene == "movie" && *id == "outlet_tv" {
+                continue;
+            }
             let status = server.engine.get_sync_status(&id.to_string()).await;
             assert!(
                 matches!(status, Some(SyncStatus::PendingSync { .. })),
@@ -302,7 +319,8 @@ async fn a_fading_toml_scene_ends_at_its_targets_after_its_transition() {
 
     for (scene, target) in [
         ("wake_up", light(true, Some(80), Some(4000))),
-        ("sleep", light(false, Some(0), None)),
+        // The scene names no colour: it keeps `wake_up`'s (#64).
+        ("sleep", light(false, Some(0), Some(4000))),
     ] {
         let elapsed = server.activate(BEDROOM, scene).await;
         assert_eq!(elapsed, Duration::from_secs(2), "{scene}: the fade's time");

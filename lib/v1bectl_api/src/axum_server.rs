@@ -731,12 +731,19 @@ impl AxumServer {
                         }
                     }
                     VirtualDeviceType::SceneController => {
-                        match SceneController::new(config.clone(), Arc::clone(&self.state_store)) {
-                            Ok(scene_controller) => self
-                                .virtual_device_manager
-                                .add_virtual_device(Box::new(scene_controller))
-                                .await
-                                .map_err(|e| format!("Failed to add virtual device: {e}")),
+                        // Checked as a TOML one is (#64)
+                        match SceneController::create(config.clone(), Arc::clone(&self.state_store))
+                            .await
+                        {
+                            Ok((scene_controller, warnings)) => {
+                                for warning in warnings {
+                                    warn!("⚠️ Scene controller {}: {}", config.device_id, warning);
+                                }
+                                self.virtual_device_manager
+                                    .add_virtual_device(Box::new(scene_controller))
+                                    .await
+                                    .map_err(|e| format!("Failed to add virtual device: {e}"))
+                            }
                             Err(e) => Err(format!("Failed to create scene controller: {e}")),
                         }
                     }

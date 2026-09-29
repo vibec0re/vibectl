@@ -39,8 +39,10 @@ use v1bectl_sync::{
     SyncEngine,
 };
 use v1bectl_virtual::{
-    load_virtual_devices_from_dir, DummyGateway, LightGroup, LightGroupLinear, VirtualDevice,
-    VirtualDeviceConfig, VirtualDeviceTomlConfig, VirtualDeviceType,
+    load_virtual_devices_from_dir, DummyGateway, LightGroup, LightGroupLinear, SceneConfig,
+    SceneController, SceneControllerConfig, SceneControllerSettings, SceneDeviceConfig,
+    SceneDeviceState, VirtualDevice, VirtualDeviceConfig, VirtualDeviceTomlConfig,
+    VirtualDeviceType,
 };
 
 // ── The wire, as a client sees it ────────────────────────────────────────────
@@ -73,6 +75,9 @@ enum ApiRequest {
         color_temp: Option<u16>,
         rgb_color: Option<RgbColor>,
     },
+    CreateVirtualDevice {
+        config: VirtualDeviceConfig,
+    },
     Ping,
 }
 
@@ -85,6 +90,9 @@ enum ApiResponse {
     },
     LightUpdated {
         new_state: LightState,
+    },
+    VirtualDeviceCreated {
+        device_id: String,
     },
     Pong,
     Error {
@@ -557,4 +565,84 @@ async fn a_device_state_answer_names_its_device() {
         let OlderClientResponse::DeviceState { state: older } = decode(&payload);
         assert_eq!(older, state, "an older client decodes the same state");
     }
+}
+
+/// #64: `CreateVirtualDevice` checks a scene controller the way the server
+/// checks one from TOML, by the same checks, and answers a config they
+/// reject with the same message. Here a scene that sets the kitchen light
+/// to a brightness over 100, which the API used to create. Nothing is
+/// registered.
+#[tokio::test]
+async fn a_scene_controller_the_toml_checks_reject_is_not_created() {
+    const CONTROLLER: &str = "scene_too_bright";
+    let home = serve_dummy_home().await;
+    let mut client = Client::connect(home.addr).await;
+
+    // What the server says to the same scene in a `virtual_devices/*.toml`.
+    let toml = SceneControllerConfig {
+        device_id: CONTROLLER.to_string(),
+        name: "Too Bright".to_string(),
+        scenes: vec![SceneConfig {
+            name: "glare".to_string(),
+            display_name: "Glare".to_string(),
+            devices: vec![SceneDeviceConfig {
+                device_id: LIGHT.to_string(),
+                state: SceneDeviceState::Light {
+                    is_on: true,
+                    brightness: Some(101),
+                    color_temp: None,
+                },
+            }],
+        }],
+        settings: SceneControllerSettings::default(),
+    };
+    let Err(rejected) = SceneController::from_toml(&toml, Arc::clone(&home.store)).await else {
+        panic!("the TOML path created it");
+    };
+    assert!(
+        rejected.to_string().contains("brightness 101, over 100"),
+        "{rejected}"
+    );
+
+    let target = DeviceStateValue::Light(LightState {
+        is_on: true,
+        brightness: Some(101),
+        color_temp: None,
+        rgb_color: None,
+    });
+    let config = VirtualDeviceConfig {
+        device_id: CONTROLLER.to_string(),
+        device_type: VirtualDeviceType::SceneController,
+        name: "Too Bright".to_string(),
+        description: None,
+        enabled: true,
+        config: serde_json::json!({ "scenes": { "glare": {
+            "name": "glare",
+            "device_states": { LIGHT: target },
+            "transition_type": "Instant",
+        } } }),
+    };
+    let payload = client
+        .request_payload(&ApiRequest::CreateVirtualDevice { config })
+        .await;
+    let (code, message) = match decode(&payload) {
+        ApiResponse::Error { code, message } => (code, message),
+        ApiResponse::VirtualDeviceCreated { device_id } => {
+            panic!("the API created {device_id}")
+        }
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(code, "CREATE_FAILED");
+    assert_eq!(
+        message,
+        format!("Failed to create scene controller: {rejected}"),
+        "the TOML path's message"
+    );
+    assert!(
+        home.store
+            .get_device(&CONTROLLER.to_string())
+            .await
+            .is_none(),
+        "{CONTROLLER} was registered"
+    );
 }
