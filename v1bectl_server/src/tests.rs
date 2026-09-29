@@ -105,6 +105,43 @@ fn active(scene: &str) -> DeviceStateValue {
     })
 }
 
+/// #62: `virtual_devices_light_group/lg_curves.toml`, loaded the way the
+/// server loads `virtual_devices/`. A separate fixture dir from the scene
+/// controllers' above, so its light group's members don't collide with
+/// theirs.
+async fn light_group_server() -> Server {
+    let store = StateStore::new();
+    let bus = Arc::new(EventBus::new(1000));
+    let gateway: Arc<dyn Gateway> = Arc::new(DummyGateway::new("basic_home"));
+    for info in gateway.discover_devices().await.expect("discover") {
+        let state = gateway
+            .get_device_state(&info.device_id)
+            .await
+            .expect("initial state");
+        store.add_device(info, state).await;
+    }
+    let engine = Arc::new(SyncEngine::new(
+        store.clone(),
+        bus.clone(),
+        gateway.clone(),
+        None,
+    ));
+    let axum_server =
+        AxumServer::new(0, store.clone(), bus.clone(), gateway).with_sync_engine(engine.clone());
+    let manager = axum_server.virtual_device_manager();
+    let events = bus.subscribe();
+
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/virtual_devices_light_group");
+    load_virtual_devices(&fixtures, &store, &manager).await;
+    Server {
+        store,
+        engine,
+        manager,
+        events,
+    }
+}
+
 /// A scene controller's state before any of its scenes is set.
 fn inactive() -> DeviceStateValue {
     DeviceStateValue::Scene(SceneState {
@@ -284,4 +321,37 @@ async fn a_fading_toml_scene_ends_at_its_targets_after_its_transition() {
             "{scene}: the controller's echo"
         );
     }
+}
+
+/// #62: a `light_group`'s `brightness_curves` are mapped into the
+/// `LightGroup` it builds, instead of every member getting a forced 1:1
+/// curve. `lg_curves.toml` gives `light_living_room` a curve (group 100 ->
+/// member 60) and leaves `light_kitchen` without one, so it falls back to
+/// 1:1.
+///
+/// Mutant: force every member back to a 1:1 curve (the pre-#62 behaviour)
+/// and `light_living_room` comes out at 100, not 60 — red.
+#[tokio::test(start_paused = true)]
+async fn a_toml_light_groups_brightness_curve_is_used() {
+    let server = light_group_server().await;
+
+    server
+        .manager
+        .set_virtual_device_state(
+            &"lg_test_curves".to_string(),
+            light(true, Some(100), Some(2700)),
+        )
+        .await
+        .expect("setting the light group to 100");
+
+    assert_eq!(
+        server.stored("light_living_room").await,
+        light(true, Some(60), Some(2700)),
+        "light_living_room has a curve capping it at 60"
+    );
+    assert_eq!(
+        server.stored("light_kitchen").await,
+        light(true, Some(100), Some(2700)),
+        "light_kitchen has no curve, so it falls back to 1:1"
+    );
 }

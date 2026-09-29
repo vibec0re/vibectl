@@ -132,16 +132,73 @@ async fn load_virtual_devices(
 
                         info!("  Members: {:?}", resolved_members);
 
-                        // Create VirtualDeviceConfig
-                        // 🔥 CREATE DEFAULT BRIGHTNESS CURVES FOR EACH LIGHT! 💖
+                        // 🎚️ MAP EACH MEMBER'S BRIGHTNESS CURVE FROM THE TOML (#62)!
+                        // `min`/`max` become the curve's two breakpoints: group 0 ->
+                        // `min`, group 100 -> `max`. A member the file gives no curve
+                        // for — including one only reached through a `*` wildcard,
+                        // since the format has no default curve for those — falls
+                        // back to a 1:1 curve, logged at debug.
                         let mut brightness_curves = serde_json::Map::new();
+                        let mut curve_fallbacks = Vec::new();
+                        let mut invalid_curve = None;
                         for member in &resolved_members {
-                            // Linear 1:1 mapping - group brightness = device brightness
-                            brightness_curves.insert(
-                                member.clone(),
-                                serde_json::json!({
-                                    "breakpoints": [[0, 0], [100, 100]]
-                                }),
+                            if let Some(curve) = cfg.brightness_curves.get(member) {
+                                if curve.min > 100 || curve.max > 100 {
+                                    invalid_curve = Some(format!(
+                                        "{member}'s brightness curve is out of range (min={}, max={}; both must be 0-100)",
+                                        curve.min, curve.max
+                                    ));
+                                    break;
+                                }
+                                brightness_curves.insert(
+                                    member.clone(),
+                                    serde_json::json!({
+                                        "breakpoints": [[0, curve.min], [100, curve.max]]
+                                    }),
+                                );
+                            } else {
+                                curve_fallbacks.push(member.clone());
+                                brightness_curves.insert(
+                                    member.clone(),
+                                    serde_json::json!({
+                                        "breakpoints": [[0, 0], [100, 100]]
+                                    }),
+                                );
+                            }
+                        }
+
+                        if let Some(reason) = invalid_curve {
+                            error!(
+                                "❌ Failed to create light group {}: {}",
+                                cfg.device_id, reason
+                            );
+                            continue;
+                        }
+                        if !curve_fallbacks.is_empty() {
+                            debug!(
+                                "🔧 Light group {}: no brightness curve for {:?}, using a 1:1 fallback",
+                                cfg.device_id, curve_fallbacks
+                            );
+                        }
+
+                        // ⚠️ SETTINGS LightGroup CAN'T HONOUR — NO SILENT DROPS (#62)!
+                        // It always averages the levels of the members that are on
+                        // (`re_derive`), and writes them instantly: `aggregation`
+                        // only matches that when it's left at its default, and
+                        // `transition_time` never does.
+                        if cfg.settings.aggregation != "average" {
+                            warn!(
+                                "⚠️ Light group {}: settings.aggregation = {:?} isn't applied — LightGroup always averages the levels of the members that are on",
+                                cfg.device_id, cfg.settings.aggregation
+                            );
+                        }
+                        // Only when the file sets it: the field defaults to 500 ms
+                        // (`default_transition_time` in v1bectl_virtual's config), and
+                        // warning about a default nobody wrote is noise on every start.
+                        if cfg.settings.transition_time != 500 {
+                            warn!(
+                                "⚠️ Light group {}: settings.transition_time ({} ms) isn't applied — LightGroup writes its members instantly, with no fade",
+                                cfg.device_id, cfg.settings.transition_time
                             );
                         }
 
@@ -156,7 +213,6 @@ async fn load_virtual_devices(
                             device_type: v1bectl_virtual::VirtualDeviceType::LightGroup,
                             config: serde_json::json!({
                                 "lights": resolved_members,
-                                "aggregation": cfg.settings.aggregation,
                                 "brightness_curves": brightness_curves,
                             }),
                         };
