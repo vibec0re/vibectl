@@ -160,14 +160,19 @@ impl VirtualDeviceManager {
     /// for its turn without the `virtual_devices` lock, which nothing holds
     /// while it waits in the queue, so the two can't deadlock.
     ///
-    /// A write ahead of it in the queue can change the devices it names (an
-    /// add or remove of its target, which queues on the target too). So it
-    /// reads `keys` again under the lock, and if that names a device it
-    /// wasn't queued on, it leaves the queue and joins again with the new
-    /// devices, **at the back**: it's asked again, against the devices as
-    /// they are now. It can't keep its old place. That would have it wait
-    /// for writes that asked after it (on the devices it now names), while
-    /// others that asked after it wait for it, and that can deadlock.
+    /// A write ahead of it in the queue can change the devices it names: its
+    /// target *replaced* (removed and re-added under the same id, which
+    /// queues on the target too, as a config reload does) can add ones it
+    /// wasn't queued on. A removal alone never does: it only drops devices
+    /// from what a write names, and those are already covered. So it reads
+    /// `keys` again under the lock, and if that names a device it wasn't
+    /// queued on, it leaves the queue and joins again with the new devices,
+    /// **at the back**: it's asked again, against the devices as they are
+    /// now. It can't keep its old place, even on a device it already held,
+    /// so an older write can end up landing last. Keeping its place would
+    /// risk a deadlock instead: it would wait for writes that asked after it
+    /// (on the devices it now names), while others that asked after it wait
+    /// for it.
     async fn lock_for_write(
         &self,
         keys: impl Fn(&HashMap<DeviceId, Box<dyn VirtualDevice>>) -> Vec<DeviceId>,
@@ -2443,6 +2448,43 @@ mod tests {
 
         fade.await.expect("fade task").expect("fade");
         assert_eq!(stored(&store, "a").await, light(true, 80), "a: the fade");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #60 re-check (nit): a write whose commit fails leaves the queue just
+    /// as one that succeeds does. A mutant that skips that cleanup only on
+    /// the error path survives the rest of this suite, since every other
+    /// write here succeeds: only a write queued behind the failed one, and
+    /// left waiting on a "done" signal it never sends, catches it (the
+    /// reviewer's stress test deadlocked on it).
+    ///
+    /// `g` is a group over `a` and `missing`, and `missing` isn't in the
+    /// store yet, so writing `g` fails partway (`a` commits, `missing`
+    /// doesn't). A second write to `g` — it overlaps the first on `g`
+    /// itself — must not wait on the failed write's queue entry: bounded by
+    /// a timeout, it must land promptly once `missing` is there to commit.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_still_leaves_the_queue() {
+        let (manager, store, _bus) = manager_with_group(&["a", "missing"]).await;
+        store.add_device(light_info("a"), off()).await;
+
+        let failed = manager
+            .set_virtual_device_state(&"g".to_string(), light(true, 60))
+            .await;
+        assert!(failed.is_err(), "the missing member must fail the write");
+
+        // Now that `missing` exists, an overlapping write must go through: a
+        // failed write's queue entry left behind would hang it forever.
+        store.add_device(light_info("missing"), off()).await;
+        let overlapping = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.set_virtual_device_state(&"g".to_string(), light(true, 40)),
+        )
+        .await
+        .expect("the failed write left its place in the queue");
+        overlapping.expect("the overlapping write");
+
+        assert_eq!(stored(&store, "g").await, light(true, 40), "g");
         assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
     }
 
