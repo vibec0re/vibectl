@@ -114,6 +114,12 @@ of turning on `debug` everywhere:
 RUST_LOG=v1bectl_sync=debug,v1bectl_gateway=debug cargo run -p v1bectl_server -- dummy --scenario basic_home
 ```
 
+The TUI draws over the whole terminal, so it never sends its logs to
+stdout/stderr — they're appended to `<state dir>/v1bectl/tui.log` (next to
+`favorites.json`; typically `~/.local/state/v1bectl/tui.log`) instead. If
+that file can't be opened, logging is disabled for the run and one line is
+printed to stderr before the TUI takes over the screen, saying so.
+
 ### Clients
 
 ```bash

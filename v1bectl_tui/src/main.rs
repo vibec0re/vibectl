@@ -23,7 +23,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tui_scrollview::ScrollViewState; // 🔥 FOR SCROLLVIEW DASHBOARD! 💖
@@ -37,6 +38,13 @@ use v1bectl_virtual::VirtualDeviceConfig;
 #[derive(Parser)]
 #[command(name = "v1bectl_tui")]
 #[command(about = "🔥 VIBEC0RE TUI - Ultimate Home Automation Interface! 🚀")]
+#[command(
+    after_help = "Logging: RUST_LOG controls the level (see the top-level README), but \
+    since the TUI draws over the whole terminal, its logs never go to stdout/stderr — they're \
+    appended to a log file (<state dir>/v1bectl/tui.log, next to favorites.json; typically \
+    ~/.local/state/v1bectl/tui.log). If that file can't be opened, logging is silently \
+    disabled for the run and one line is printed to stderr first, saying so."
+)]
 struct Cli {
     /// Server address
     #[arg(short, long, default_value = "127.0.0.1:31337")]
@@ -194,11 +202,7 @@ impl App {
 
     // 🔥 XDG STATE DIR HELPERS! 💖
     fn get_favorites_path() -> PathBuf {
-        let state_dir = dirs::state_dir()
-            .or_else(dirs::data_local_dir)
-            .unwrap_or_else(|| PathBuf::from("."));
-
-        let v1bectl_dir = state_dir.join("v1bectl");
+        let v1bectl_dir = state_dir();
         fs::create_dir_all(&v1bectl_dir).ok();
 
         v1bectl_dir.join("favorites.json")
@@ -458,16 +462,67 @@ fn log_filter(env: Option<&str>) -> tracing_subscriber::EnvFilter {
     }
 }
 
+/// The XDG state directory the TUI keeps its own files in: favorites
+/// (`favorites.json`) and, since #75, its own log file (`tui.log`) —
+/// `$XDG_STATE_HOME/v1bectl`, falling back to the platform's local-data dir
+/// and finally `.` if neither resolves. Doesn't create the directory;
+/// callers that need it to exist (favorites, the log file) do that
+/// themselves.
+fn state_dir() -> PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("v1bectl")
+}
+
+/// The TUI's own log file name, inside [`state_dir`].
+const LOG_FILE_NAME: &str = "tui.log";
+
+/// Opens `<dir>/tui.log` in append mode for the TUI's tracing output,
+/// creating `dir` first if it doesn't exist yet (#75). Takes the directory
+/// as a parameter, rather than calling [`state_dir`] itself, so it can be
+/// unit-tested against a throwaway directory instead of the user's real
+/// state dir.
+///
+/// `main` decides what to do when this fails (fall back to discarding
+/// logs and say so on stderr) — this function only knows how to open the
+/// file.
+fn open_log_file(dir: &Path) -> io::Result<fs::File> {
+    fs::create_dir_all(dir)?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(LOG_FILE_NAME))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing. Same writer as before (default: stdout) — the TUI
-    // only reaches stdout with tracing output before it enters the
-    // alternate screen below; nothing in its own render loop logs. Only the
-    // filter changes here.
+    // Initialize tracing (#75). The TUI draws over the whole terminal, so
+    // its tracing output — including debug-level dependency noise (e.g.
+    // tungstenite) once #74's RUST_LOG lets someone turn that on — must
+    // never land on stdout/stderr while it's running. Write to a log file
+    // next to favorites.json instead; if that can't be opened, discard the
+    // logs for this run rather than block startup, but say so on stderr
+    // *before* the alternate screen goes up, so the message is seen.
+    let log_dir = state_dir();
+    let log_path = log_dir.join(LOG_FILE_NAME);
+    let log_writer: Box<dyn io::Write + Send> = match open_log_file(&log_dir) {
+        Ok(file) => Box::new(file),
+        Err(err) => {
+            eprintln!(
+                "⚠️ couldn't open log file {} ({err}) — logs are off for this run",
+                log_path.display()
+            );
+            Box::new(io::sink())
+        }
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(log_filter(std::env::var("RUST_LOG").ok().as_deref()))
+        .with_writer(Mutex::new(log_writer))
+        .with_ansi(false)
         .init();
 
     // Setup terminal
@@ -1826,5 +1881,72 @@ mod log_filter_tests {
     #[test]
     fn invalid_directive_falls_back_to_info() {
         assert_eq!(log_filter(Some("!!not-a-directive!!")).to_string(), "info");
+    }
+}
+
+#[cfg(test)]
+mod log_file_tests {
+    use super::{open_log_file, LOG_FILE_NAME};
+    use std::fs;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A directory under `std::env::temp_dir()` that this test owns end to
+    /// end — never the user's real state dir (#75's test rail requires
+    /// this). Unique per call (process id + a monotonic counter + a
+    /// timestamp) so parallel test threads and repeated runs never
+    /// collide; the `pr75-` prefix marks it as this fix's scratch space.
+    fn scratch_dir(label: &str) -> PathBuf {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "pr75-v1bectl_tui-{label}-{pid}-{n}-{nanos}",
+            pid = std::process::id()
+        ))
+    }
+
+    #[test]
+    fn opens_and_appends_creating_the_directory() {
+        let dir = scratch_dir("open");
+        assert!(!dir.exists(), "precondition: scratch dir starts absent");
+
+        {
+            let mut file = open_log_file(&dir).expect("opens on first call, creating dir");
+            file.write_all(b"first\n").unwrap();
+        }
+        {
+            let mut file = open_log_file(&dir).expect("opens (append) on second call");
+            file.write_all(b"second\n").unwrap();
+        }
+
+        let contents = fs::read_to_string(dir.join(LOG_FILE_NAME)).unwrap();
+        assert_eq!(contents, "first\nsecond\n", "append mode, not truncate");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The fallback case (#75): a directory that can never be created —
+    /// here, because one of its ancestors already exists as a plain file —
+    /// makes `open_log_file` return an `Err` instead of panicking or
+    /// blocking, so `main` can fall back to discarding logs.
+    #[test]
+    fn fails_cleanly_when_the_directory_cannot_be_created() {
+        let parent = scratch_dir("blocked-parent");
+        fs::write(&parent, b"not a directory").expect("create the blocking file");
+        let dir = parent.join("v1bectl");
+
+        let result = open_log_file(&dir);
+        assert!(
+            result.is_err(),
+            "a directory nested under a file must fail to open, got {result:?}"
+        );
+
+        fs::remove_file(&parent).ok();
     }
 }
