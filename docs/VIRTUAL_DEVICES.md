@@ -384,6 +384,8 @@ async fn plan_transition(store: &StateStore, scene: &Scene) -> Vec<(DeviceId, De
                 }
                 if step < steps {
                     tokio::time::sleep(Duration::from_millis(100)).await;
+                } else {
+                    merge_at_end(store, scene, &mut staged).await; // the store as it is NOW
                 }
             }
         }
@@ -394,9 +396,19 @@ async fn plan_transition(store: &StateStore, scene: &Scene) -> Vec<(DeviceId, De
                 }
                 staged.set(device_id, merged(target, &stored(store, device_id).await));
             }
+            merge_at_end(store, scene, &mut staged).await; // the store as it is NOW
         }
     }
     staged.into_members() // each light once, at its last state
+}
+
+// Where a transition that waited ends: each staged light at its target,
+// merged again with the light as the store has it now. What changed while it
+// waited (a direct write, a change on the hub) is kept, not reverted.
+async fn merge_at_end(store: &StateStore, scene: &Scene, staged: &mut Staged) {
+    for (device_id, state) in staged.iter_mut() {
+        *state = merged(&scene.device_states[device_id], &stored(store, device_id).await);
+    }
 }
 ```
 
@@ -414,9 +426,16 @@ target with the device as the store has it (`merged` in
 - The target takes the shape the store holds the device in: an outlet the
   store holds as a light (a Dirigera hub's) is written as a light that is
   only on or off, and a light the store holds as an outlet as an outlet.
-- A fade merges each target with where it starts the device, so what the
-  target leaves out stays where it is at every step, and the fade ends at the
-  merged target. A sequence merges each device as it reaches it.
+- **When:** an instant scene merges as it plans, and the manager commits it
+  in the same hold of its lock. A fade or a sequence waits before the
+  commit, and two writers don't queue behind it: a direct write through the
+  API (`SetLightState`), and a change on the hub (the IKEA app, a remote)
+  that a pull brings in. So where it ends, it merges each device **again**,
+  with the store as it is then (`merge_at_end`). A field it doesn't name
+  that changed while it ran keeps its new value, instead of being put back
+  to where the transition started (and pushed to the hub like that). A
+  fade's steps interpolate toward the target merged with where it starts
+  the device, so what the target leaves out stays where it is at every step.
 - A device the store doesn't have is staged as the target says, and the
   manager's commit fails at it, as before.
 

@@ -20,8 +20,8 @@ const FADE_STEP: Duration = Duration::from_millis(100);
 pub struct Scene {
     pub name: String,
     /// Each device's target. What one leaves out (a light's `brightness`,
-    /// its colour) keeps the device's value when the scene is activated: a
-    /// scene only changes what it names (#64).
+    /// its colour) keeps the device's value, as the store has it where the
+    /// scene's transition ends: a scene only changes what it names (#64).
     pub device_states: HashMap<DeviceId, DeviceStateValue>,
     pub transition_type: TransitionType,
 }
@@ -361,8 +361,16 @@ impl SceneController {
     /// there.
     ///
     /// Each target is merged with the device as the store has it (see
-    /// [`merged`]), so a scene only changes what it names (#64): as it sets
-    /// the device, or, for a fade, where the fade starts it.
+    /// [`merged`]), so a scene only changes what it names (#64). For an
+    /// instant scene, that's the store as the manager commits it: it plans
+    /// and commits in one hold of its lock. A fade or a sequence waits
+    /// before the commit, and a write that doesn't queue behind it (a direct
+    /// write through the API, a change on the hub that a pull brings in)
+    /// can change a field it doesn't name meanwhile. So where it ends, each
+    /// device is merged again, with the store as it is then (see
+    /// [`Self::merge_at_end`]): that change is kept, not reverted to where
+    /// the transition started it. A fade's steps interpolate toward its
+    /// targets merged with where it starts them.
     async fn plan_activation(
         store: &StateStore,
         scene: &Scene,
@@ -393,8 +401,10 @@ impl SceneController {
                 }
 
                 // Each device's target, merged with where the fade starts
-                // it, at its first step. So the fade and its end agree on
-                // what the scene leaves out: it stays where it is.
+                // it, at its first step: what its steps interpolate toward,
+                // so what the scene leaves out stays where it is at every
+                // step. Where the fade ends, that's merged again, with the
+                // store as it is then.
                 let mut targets = Staged::default();
                 'fade: for step in 0..=steps {
                     // `steps` is a fade duration in 100ms increments; not
@@ -437,6 +447,10 @@ impl SceneController {
 
                     if step < steps {
                         tokio::time::sleep(FADE_STEP).await;
+                    } else {
+                        // Where it ends, what the scene leaves out is where
+                        // the device is now.
+                        Self::merge_at_end(store, scene, &mut staged).await;
                     }
                 }
             }
@@ -452,10 +466,35 @@ impl SceneController {
                         break;
                     }
                 }
+                // A device it reached before a delay is merged again: what
+                // the scene leaves out is where the device is now.
+                Self::merge_at_end(store, scene, &mut staged).await;
             }
         }
 
         staged.0
+    }
+
+    /// Each device `staged` holds, at its target in `scene` merged with the
+    /// device as the store has it now (see [`merged`]): where a transition
+    /// that waited ends, right before the manager commits it (#64). A field
+    /// the scene doesn't name that changed while it waited, by a write that
+    /// doesn't queue behind it (a direct write through the API, a change on
+    /// the hub that a pull brought in), keeps its new value. Merged where
+    /// the transition started, or where a sequence reached the device, the
+    /// commit would put the old one back, on the hub too.
+    ///
+    /// A device the store doesn't have stays at the scene's target as it
+    /// is, for the manager's commit of it to fail at.
+    async fn merge_at_end(store: &StateStore, scene: &Scene, staged: &mut Staged) {
+        for (device_id, state) in &mut staged.0 {
+            let Some(target) = scene.device_states.get(device_id) else {
+                continue;
+            };
+            if let Some(device) = store.get_device(device_id).await {
+                *state = merged(target, &device.state);
+            }
+        }
     }
 
     /// Stage `target` for `device_id`, merged with the device as the store
@@ -1272,8 +1311,8 @@ mod tests {
     }
 
     /// #64: a fade whose target leaves a field out keeps it where the fade
-    /// starts it, at every step, and ends at the target merged with that
-    /// start: the fade and its end agree.
+    /// starts it, at every step, and ends at the target merged with the
+    /// device where it ends: here, where it started, as nothing changed it.
     #[tokio::test(start_paused = true)]
     async fn a_fade_keeps_what_its_target_leaves_out() {
         let store = store_with(&["a"]).await;
@@ -1306,6 +1345,53 @@ mod tests {
                 (step.brightness, step.color_temp),
                 (Some(70), Some(2200)),
                 "{progress}"
+            );
+        }
+    }
+
+    /// #64 review: a fade or a sequence merges what its targets leave out
+    /// again where it ends, with the store as it is then. A colour changed
+    /// while it waits, by a write that doesn't queue behind it, is kept, not
+    /// put back to where the transition started (or where the sequence
+    /// reached the device). A paused clock: the change lands halfway,
+    /// exactly.
+    #[tokio::test(start_paused = true)]
+    async fn a_transition_keeps_what_changes_while_it_waits() {
+        let brighter = lamp(true, Some(80), None, None);
+        for transition in [
+            TransitionType::Fade { duration_ms: 1000 },
+            TransitionType::Sequence {
+                delays_ms: vec![0, 1000],
+            },
+        ] {
+            let store = store_with(&["a", "b"]).await;
+            let set_all = |state: DeviceStateValue| {
+                let store = Arc::clone(&store);
+                async move {
+                    for id in ["a", "b"] {
+                        store
+                            .update_device_state(&id.to_string(), state.clone())
+                            .await
+                            .expect(id);
+                    }
+                }
+            };
+            set_all(lamp(true, Some(50), Some(2700), None)).await;
+            let targets = [("a", brighter.clone()), ("b", brighter.clone())];
+            let controller = controller(&store, &targets, &transition);
+
+            let recolour = async {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                set_all(lamp(true, Some(50), Some(4000), None)).await;
+            };
+            let (write, ()) = tokio::join!(controller.plan_write(evening()), recolour);
+            let mut members = write.expect("plan").members;
+            members.sort_by(|(a, _), (b, _)| a.cmp(b));
+            let ends = lamp(true, Some(80), Some(4000), None);
+            assert_eq!(
+                members,
+                vec![("a".to_string(), ends.clone()), ("b".to_string(), ends)],
+                "{transition:?}"
             );
         }
     }
