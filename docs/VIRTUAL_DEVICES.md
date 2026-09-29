@@ -80,23 +80,24 @@ struct VirtualWrite {
    (A plan that waits runs without the lock: see ⏱️ below.)
 3. A member that is a virtual device itself (a scene's light group, a group
    in a group) plans its own part of the write, and so on down: the manager
-   **expands** the whole write before it commits any of it (see 🪆 below).
-4. The manager commits each member write, in order:
-   - **A physical member, with the sync engine attached:** the write goes
-     through `SyncEngine::apply_optimistic_update`, the call a direct write
-     to that light makes. It arms the light's 🛡️ protection window, then
-     writes the store, echoes the change and queues the push to the hub.
-   - **A physical member with no engine** (the dummy and test setups): the
-     manager writes the store and echoes it itself.
-   - **A virtual member:** its own members first, the same way, then it
-     takes its new state, is stored, and is echoed if the write changed it.
-   - A physical member the write leaves as it is is skipped. A member the
-     store doesn't have fails the write right there: the members before it
-     stay committed, and the ones after it are never written.
-5. Every member committed: the manager hands the device its new state
-   (`take_state`), stores it and echoes it. If a member failed, the device
-   (and every group on the way down to that member) keeps its old state, and
-   input tracking re-derives it from what actually happened.
+   plans the whole write, **each device once**, before it commits any of it
+   (see 🪆 below).
+4. The manager commits each physical member write, in order:
+   - **With the sync engine attached:** the write goes through
+     `SyncEngine::apply_optimistic_update`, the call a direct write to that
+     light makes. It arms the light's 🛡️ protection window, then writes the
+     store, echoes the change and queues the push to the hub.
+   - **With no engine** (the dummy and test setups): the manager writes the
+     store and echoes it itself.
+   - A member the write leaves as it is is skipped. A member the store
+     doesn't have fails the write right there: the members before it stay
+     committed, and the ones after it are never written.
+5. Then each virtual member takes its new state, is stored, and is echoed
+   if the write changed it, and last the device written: the manager hands
+   it its new state (`take_state`), stores it and echoes it. If a member
+   failed, the device (and every group on the way down to that member)
+   keeps its old state, and input tracking re-derives it from what actually
+   happened.
 
 #### 🛡️ Why a device must never write the store itself (#55)
 
@@ -191,52 +192,78 @@ light group ("movie: the living room at 30 %"), a group that has groups
 among its members, a button action on a group of groups. The write reaches
 that member's lights **through the member's own plan**:
 
-1. **Expansion.** Before anything is committed, the manager asks each
-   virtual member for its `plan_write` of the state listed for it, and
-   expands that plan the same way, down to the physical lights
-   (`VirtualDeviceManager::expand`). A member is planned from its state
-   before the write, in the same hold of the lock as the commit: only the
-   device written may plan without the lock (⏱️ above).
-2. **Commit.** Each physical light goes through the engine as always. Each
-   virtual member, once its own members are committed, takes its new state
-   (`take_state`, so a group's `set_level` moves to the level it was set
-   to), is stored, and is echoed if the write changed it, like a physical
-   member. The device written is echoed as always. So a scene over a group
+1. **One plan, each device once.** Before anything is committed, the
+   manager plans the whole write, level by level
+   (`VirtualDeviceManager::expand`): the device's members (level 1), then,
+   for each member that is virtual, its `plan_write` of the state listed for
+   it (level 2), and so on down to the physical lights. Each virtual member
+   is planned once, from its state before the write, in the same hold of the
+   lock as the commit (only the device written may plan without the lock,
+   ⏱️ above). **Each device the write reaches is written once, by the most
+   direct path to it:** a scene that sets group `g` to 30 % and one of
+   `g`'s lamps to 5 % puts the lamp at 5 %, and `g` only writes its other
+   lights. Between two paths of the same length (a light in two groups of a
+   scene, a group in two groups of a group), the one through the device
+   whose id sorts first wins. So the outcome never depends on the order a
+   plan lists its members in (a scene's devices and a linear group's members
+   are `HashMap`s, whose order changes with every server start; both now
+   plan in the order of their ids too).
+2. **Commit.** Each physical light goes through the engine as always, once.
+   Then each virtual member, after every virtual device its plan lists,
+   takes its new state (`take_state`, so a group's `set_level` moves to the
+   level it was set to). If that doesn't account for one of its inputs as
+   the write left it (a more direct path set its lamp, or an inner group
+   re-derived itself just before), it re-derives from it
+   (`on_input_changed`), as input tracking would once it got to the echoes:
+   the group above shows the lamp at 5 % and its other light at 30 % as
+   (5 + 30) / 2 = 17 %. Then it's stored, and echoed if the write changed
+   it, like a physical member. The device written is echoed as always. So
+   every device is echoed at most once per write: a scene over a group
    echoes each light once, the group once and the scene once.
 3. **Echoes.** It all happens in one hold of the lock, so by the time input
-   tracking sees the lights' echoes, the group already accounts for them
+   tracking sees the lights' echoes, each group already accounts for them
    (`accounts_for`): they're its own write, and don't re-derive it. Nor does
-   the group's echo re-derive an outer group: the outer one's state already
+   a group's echo re-derive an outer group: the outer one's state already
    puts it there.
 4. **The queue.** A write joins the 🚦 queue with its whole transitive device
    set up front (`write_keys`): the device, the members its plan may write
    (`writes_to`), and every device each virtual one among them can write
    (its `output_devices`, since its state isn't known until its parent
-   plans it), and theirs. So a scene that sets group `g` waits for a fade of
-   one of `g`'s lights, and a later write to that light alone waits for the
-   scene: they land in the order they asked, and the newest shows. #60's
-   retry works on the same set: if a group the write reaches is replaced
-   while it waits, it rejoins with the group's new members.
-5. **Cycles and depth.** A write that would reach a virtual device already
-   on its path (`A` contains `B` contains `A`) fails with
-   `VirtualDeviceError::Cycle`, and one that would go more than
-   `MAX_NESTING` (4) levels below the device written fails with
+   plans it), and theirs, however many levels down. So a scene that sets
+   group `g` waits for a fade of one of `g`'s lights, and a later write to
+   that light alone waits for the scene: they land in the order they asked,
+   and the newest shows. #60's retry works on the same set: if a group the
+   write reaches is replaced while it waits, it rejoins with the group's new
+   members.
+5. **Cycles and depth.** Virtual devices whose plans list each other in a
+   cycle (`A` contains `B` contains `A`) fail the write with
+   `VirtualDeviceError::Cycle`, and a virtual member more than
+   `MAX_NESTING` (4) levels below the device written fails it with
    `VirtualDeviceError::TooDeep`. A virtual member whose plan fails (a scene
    that sets another scene controller as if it were a light) fails the write
    with `VirtualDeviceError::Member`. All three fail **before anything is
    committed**. A device whose members would lead back to it isn't even
    registered: `add_virtual_device` rejects it with the cycle, whichever of
-   the two comes second. A device reached through two different members (a
-   light in two groups of one scene) is no cycle: it's written each time, in
-   order.
+   the two comes second. A device reached through two different members is
+   no cycle: it's written once (see 1).
 6. **Load order doesn't matter.** Whether a member is virtual is resolved
    when a write reaches it, not when the device naming it loads. The files
-   in `virtual_devices/` load in name order, but a scene or a group may name
-   a group from a file that loads after it, and a scene's checks and its
-   TOML mapping treat a virtual device the store already has as one it
-   doesn't have yet. So both orders give the same devices, from TOML and
-   through the API alike. The manager's "references unknown device" warning
-   at `start` is the only load-time signal.
+   in `virtual_devices/` load in name order, and a scene or a group may name
+   a group from a file that loads after it:
+   - A scene's checks and its TOML mapping treat a virtual device the store
+     already has as one it doesn't have yet, so both orders make the same
+     scene, from TOML and through the API alike.
+   - When a device is registered, every group that has it as a member,
+     directly or through others, catches up with it (`catch_up_with`). A
+     group of groups whose file sorts before its inner group's (the example
+     below, named after their ids) shows its lit lights as soon as the inner
+     group is in, instead of starting off and switching them up to 100 % at
+     the first toggle.
+   - The manager's `start` warns about each device a virtual device names
+     that's still missing ("references unknown device"), and about each
+     virtual device it sets that can't be set like a light ("can't be set
+     like a light": a scene that sets another scene controller). Those are
+     the only load-time signals.
 
 Nesting a group is naming it as a member. Here the downstairs group has the
 living room's curved group (`living_room_lights`, the `light_group` example
@@ -274,26 +301,29 @@ impl VirtualDeviceManager {
         let mut devices = self.virtual_devices.write().await;
         let device = devices.get(device_id).ok_or(VirtualDeviceError::DeviceNotFound(device_id.clone()))?;
         let write = device.plan_write(new_state).await?; // writes nothing
-        // 🪆 each virtual member plans its part, down to the lights; a cycle,
-        // too deep a nesting or a member that can't plan fails here, with
-        // nothing committed (#58)
-        let expanded = Self::expand(&devices, vec![device_id.clone()], write).await?;
-        self.commit_expanded(&mut devices, expanded).await
+        // 🪆 each virtual member plans its part, level by level, down to the
+        // lights: one plan, each device once, by its most direct path. A
+        // cycle, too deep a nesting or a member that can't plan fails here,
+        // with nothing committed (#58)
+        let expansion = Self::expand(&devices, device_id, write).await?;
+        self.commit_expansion(&mut devices, expansion).await
     }
 
-    // Commit an expanded write: each member in order, then the device's own state
-    async fn commit_expanded(&self, devices: &mut Devices, expanded: Expanded) -> Result<(), VirtualDeviceError> {
-        for member in expanded.members {
-            match member {
-                // 🛡️ the engine arms protection, THEN writes the store
-                Member::Physical(member_id, state) => self.commit_member_write(&member_id, state).await?,
-                // its lights first, then it takes its state (store + echo)
-                Member::Virtual(inner) => self.commit_expanded(devices, inner).await?,
-            }
+    // Commit a write planned all the way down
+    async fn commit_expansion(&self, devices: &mut Devices, expansion: Expansion) -> Result<(), VirtualDeviceError> {
+        for (light_id, state) in expansion.physical {
+            // 🛡️ the engine arms protection, THEN writes the store
+            self.commit_member_write(&light_id, state).await?;
         }
-        let device = devices.get_mut(&expanded.device_id).unwrap();
-        device.take_state(expanded.state);
-        self.store_state(&expanded.device_id, device.current_state()).await // store + echo
+        // Inner devices first, the device written last
+        for id in expansion.order {
+            let device = devices.get_mut(&id).unwrap();
+            device.take_state(expansion.planned[&id].state.clone());
+            // re-derive from an input its new state doesn't account for
+            // (a lamp a more direct path set), as tracking would
+            self.store_state(&id, device.current_state()).await; // store + echo
+        }
+        Ok(())
     }
 
     // Input tracking: called for every state echo on the event bus
@@ -705,8 +735,8 @@ manager commits them. It never writes a light, or the store, itself. 🛡️
 
 The server loads every `*.toml` file under `virtual_devices/` at startup, in
 the order of their names (`v1bectl_virtual::load_virtual_devices_from_dir`,
-in `lib/v1bectl_virtual/src/config.rs`; nothing a file loads to depends on
-that order, see 🪆 above): each file holds one
+in `lib/v1bectl_virtual/src/config.rs`; the devices a file loads to end up
+the same whichever order they load in, see 🪆 above): each file holds one
 `VirtualDeviceTomlConfig`, tagged by its `type` field. A file that fails to
 parse is logged and skipped; the rest still load. Parsing a file is only
 half the story — building the registered device from it is
@@ -892,9 +922,10 @@ types:
   that sets a light group loads whether the group's file comes before it or
   after, and the group's lights get the scene's level through the group when
   it's set. A target that isn't a light's to take (another scene
-  controller) is only found out then: setting the scene fails, with nothing
-  committed. It used to be rejected at load, but only if that controller's
-  file happened to load first (#63 review, finding 2).
+  controller) isn't rejected at load either: the manager's `start` warns
+  about it ("can't be set like a light"), and setting the scene fails, with
+  nothing committed. It used to be rejected at load, but only if that
+  controller's file happened to load first (#63 review, finding 2).
 
 ✅ **The API checks a scene controller the same way (#64).** Its
 `CreateVirtualDevice` builds one with `SceneController::create`, which runs
@@ -912,7 +943,9 @@ maps, which keep only the last of each.
 (`v1bectl_server/tests/fixtures/virtual_devices/`) the way the server does,
 and sets their scenes against the dummy hub: an instant one and a 2 s fade.
 It also loads `virtual_devices_nested/`, where a scene's file sorts before
-the file of the light group it sets, and sets that scene through the group.
+the file of the light group it sets, and sets that scene through the group,
+and `virtual_devices_group_of_groups/`, the nesting example above, where the
+group of groups loads before the group it nests.
 
 ## API Integration
 
