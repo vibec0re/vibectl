@@ -1,0 +1,11 @@
+# 💡 THE GROUP A GROUP OF GROUPS NESTS - a test fixture (#58), not a shipped default.
+#
+# `v1bectl_server/src/tests.rs` loads this directory the way the server loads
+# `virtual_devices/`. It sorts after `downstairs_lights.toml`, the group that
+# nests it. Its lights are the dummy `basic_home` scenario's, and the dummy
+# starts with `light_kitchen` on at 75.
+
+type = "light_group"
+device_id = "living_room_lights"
+name = "Living Room Lights"
+members = ["light_living_room", "light_kitchen"]

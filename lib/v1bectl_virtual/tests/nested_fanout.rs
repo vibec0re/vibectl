@@ -2,7 +2,9 @@
 //! scene that sets a light group reaches the group's lights, through the
 //! group's own plan, and so does a group that has a group among its
 //! members. It used to write the inner group's state into the store and
-//! stop there: no light moved, and the hub saw nothing.
+//! stop there: no light moved, and the hub saw nothing. A light reached
+//! through two paths of one write is sent one PATCH, by the most direct
+//! path (#72 review), and a write that can't be made sends none.
 //!
 //! The rig is the sync engine's (`lib/v1bectl_sync/tests/common`): a fake
 //! hub whose traffic is logged, and pulls on demand. The steps are ordered on
@@ -340,6 +342,148 @@ async fn a_group_of_groups_reaches_the_lights_of_its_groups() {
             echoes(&tracked, id).is_empty(),
             "{id} re-derived: {tracked:?}"
         );
+    }
+    rig.shutdown().await;
+}
+
+// ---------------------------------------------------------------------
+// #72 review: one plan per write, each device once
+// ---------------------------------------------------------------------
+
+/// A 1:1 `LightGroup` named `device_id` over `lights`.
+fn group(device_id: &str, lights: &[&str], rig: &Rig) -> Box<dyn VirtualDevice> {
+    let curves: serde_json::Map<String, serde_json::Value> = lights
+        .iter()
+        .map(|id| {
+            let curve = serde_json::json!({ "breakpoints": [[0, 0], [100, 100]] });
+            ((*id).to_string(), curve)
+        })
+        .collect();
+    let config = config(
+        device_id,
+        VirtualDeviceType::LightGroup,
+        serde_json::json!({ "lights": lights, "brightness_curves": curves }),
+    );
+    Box::new(LightGroup::new(config, Arc::clone(&rig.store)).expect("group"))
+}
+
+/// Scene controller `device_id`, made as the API makes one, with the
+/// scene `movie`: each of `targets` at its state, instantly.
+async fn scenes(
+    device_id: &str,
+    targets: &[(&str, DeviceStateValue)],
+    rig: &Rig,
+) -> Box<dyn VirtualDevice> {
+    let scene = Scene {
+        name: "movie".to_string(),
+        device_states: targets
+            .iter()
+            .map(|(id, state)| ((*id).to_string(), state.clone()))
+            .collect(),
+        transition_type: TransitionType::Instant,
+    };
+    let config = config(
+        device_id,
+        VirtualDeviceType::SceneController,
+        serde_json::json!({ "scenes": { "movie": scene } }),
+    );
+    let (controller, _) = SceneController::create(config, Arc::clone(&rig.store))
+        .await
+        .expect("scene controller");
+    Box::new(controller)
+}
+
+fn movie() -> DeviceStateValue {
+    DeviceStateValue::Scene(SceneState {
+        scene_name: "movie".to_string(),
+        is_active: true,
+    })
+}
+
+/// #72 review, finding 1, at the hub: a scene that sets group `g` to 30
+/// and `g`'s lamp to 5 sends the lamp one PATCH, at 5, and `g`'s other
+/// light one, at 30, on every fresh rig (fresh `HashMap`s for the scene
+/// each time). The lamp used to get a PATCH through each path, and the hub
+/// ended at 30 in about half the runs. `g` reports its lights as they are:
+/// (5 + 30) / 2 = 17.
+#[tokio::test]
+async fn a_scene_over_a_group_and_one_of_its_lamps_patches_the_lamp_once() {
+    for run in 0..10 {
+        let rig = Rig::new(
+            &["lamp", "other"],
+            TestHub::new(OnSet::Apply, false),
+            Pulls::OnDemand,
+            SyncConfig::default(),
+        )
+        .await;
+        let manager = manager(&rig);
+        register(&manager, group("g", &["lamp", "other"], &rig)).await;
+        let targets = [("g", lit(30)), ("lamp", lit(5))];
+        register(&manager, scenes(CONTROLLER, &targets, &rig).await).await;
+
+        manager
+            .set_virtual_device_state(&CONTROLLER.to_string(), movie())
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: movie: {e}"));
+        patched(&rig, &[("lamp", lit(5)), ("other", lit(30))]).await;
+        assert_eq!(rig.stored("g").await, lit(17), "run {run}: g");
+        rig.shutdown().await;
+    }
+}
+
+/// A write that can't be made (a group nested too deep, a scene that sets
+/// another scene controller as a light) fails before anything is
+/// committed: nothing is stored, echoed or queued, and no PATCH reaches
+/// the hub, not even for the physical light the same write sets.
+#[tokio::test]
+async fn a_write_that_fails_its_expansion_sends_the_hub_nothing() {
+    let rig = Rig::new(
+        &["a", "x"],
+        TestHub::new(OnSet::Apply, false),
+        Pulls::OnDemand,
+        SyncConfig::default(),
+    )
+    .await;
+    let manager = manager(&rig);
+    // g0 > g1 > ... > g5 > x: a scene that sets g0 reaches g5 six levels
+    // down.
+    let chain = ["g0", "g1", "g2", "g3", "g4", "g5"];
+    for (level, id) in chain.iter().enumerate().rev() {
+        let member = chain.get(level + 1).copied().unwrap_or("x");
+        register(&manager, group(id, &[member], &rig)).await;
+    }
+    let deep = [("a", lit(50)), ("g0", lit(50))];
+    register(&manager, scenes("deep", &deep, &rig).await).await;
+    register(&manager, scenes("other", &[("a", lit(10))], &rig).await).await;
+    let bad = [("a", lit(50)), ("other", lit(50))];
+    register(&manager, scenes("bad", &bad, &rig).await).await;
+    let mut rx = rig.bus.subscribe();
+
+    for controller in ["deep", "bad"] {
+        let result = manager
+            .set_virtual_device_state(&controller.to_string(), movie())
+            .await;
+        assert!(result.is_err(), "{controller}: {result:?}");
+    }
+    assert!(
+        !rig.hub
+            .within(Duration::from_millis(300), |log| !log
+                .sets_started
+                .is_empty())
+            .await,
+        "a PATCH went out: {:?}",
+        rig.hub.log()
+    );
+    let stats = rig.engine.get_sync_stats().await;
+    assert_eq!(
+        (stats.pending_sync_devices, stats.pending_sync_tasks),
+        (0, 0),
+        "{stats:?}"
+    );
+    let events = drain(&mut rx);
+    assert!(events.is_empty(), "{events:?}");
+    for id in ["a", "x"] {
+        assert_eq!(rig.stored(id).await, off(), "{id}");
     }
     rig.shutdown().await;
 }

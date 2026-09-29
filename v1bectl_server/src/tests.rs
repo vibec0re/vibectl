@@ -440,3 +440,73 @@ async fn a_toml_light_groups_wildcard_matches_no_virtual_device() {
     assert!(!lights.is_empty(), "the dummy has lights");
     assert_eq!(members, lights, "light_* matched a virtual device");
 }
+
+/// #72 review, finding 2: `virtual_devices_group_of_groups/`, the nesting
+/// example of `docs/VIRTUAL_DEVICES.md` over the dummy's lights, with each
+/// file named after its id. So the outer group, `downstairs_lights`, loads
+/// before `living_room_lights`, the group it nests.
+///
+/// It catches up with the inner group once that's loaded: it shows its lit
+/// members (the dummy's kitchen light, on at 75, puts `living_room_lights`
+/// at 75, which `downstairs_lights`' range of 20-100 for it inverts to 69).
+/// So a click of the switch that toggles it switches the lit room off. It
+/// used to seed without the inner group, as off at 100, and stay so: the
+/// toggle then lit every light at 100.
+#[tokio::test(start_paused = true)]
+async fn a_toml_group_of_groups_that_loads_first_starts_with_its_lit_members() {
+    const OUTER: &str = "downstairs_lights";
+    const INNER: &str = "living_room_lights";
+    let mut server = server_over("virtual_devices_group_of_groups").await;
+    let loaded: Vec<String> = server
+        .drain()
+        .into_iter()
+        .filter(|e| matches!(e.event_type, EventType::DeviceAdded { .. }))
+        .map(|e| e.device_id)
+        .filter(|id| [OUTER, INNER].contains(&id.as_str()))
+        .collect();
+    assert_eq!(loaded, [OUTER, INNER], "the outer group loads first");
+
+    assert_eq!(
+        server.stored(INNER).await,
+        light(true, Some(75), Some(2700))
+    );
+    let outer = light(true, Some(69), Some(2700));
+    assert_eq!(server.stored(OUTER).await, outer, "the outer group");
+    let own = server
+        .manager
+        .get_virtual_device_state(&OUTER.to_string())
+        .await
+        .expect(OUTER);
+    assert_eq!(own, outer, "its own state");
+
+    let click = DeviceEvent {
+        timestamp: std::time::SystemTime::now(),
+        device_id: "switch_hallway".to_string(),
+        event_type: EventType::ButtonPressed {
+            button_id: "main".to_string(),
+            press_type: v1bectl_sync::ButtonPressType::SinglePress,
+        },
+    };
+    server
+        .manager
+        .handle_event(&click)
+        .await
+        .expect("the click");
+    for id in [
+        "light_living_room",
+        "light_kitchen",
+        "light_bedroom",
+        INNER,
+        OUTER,
+    ] {
+        let state = server.stored(id).await;
+        assert!(
+            matches!(&state, DeviceStateValue::Light(light) if !light.is_on),
+            "{id} is on after the toggle: {state:?}"
+        );
+    }
+    assert_eq!(
+        server.stored(OUTER).await,
+        light(false, Some(69), Some(2700))
+    );
+}

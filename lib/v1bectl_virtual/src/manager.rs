@@ -5340,4 +5340,405 @@ mod tests {
             );
         }
     }
+
+    // -----------------------------------------------------------------
+    // #72 review: one plan per write, each device once; groups of groups
+    // catch up with a group registered after them
+    // -----------------------------------------------------------------
+
+    /// A `LightGroup` named `device_id` over `member` alone, with the
+    /// curve `[[0, lo], [100, hi]]`.
+    fn curved_group(
+        device_id: &str,
+        member: &str,
+        (lo, hi): (u8, u8),
+        store: &Arc<StateStore>,
+    ) -> LightGroup {
+        let curves = serde_json::json!({ member: { "breakpoints": [[0, lo], [100, hi]] } });
+        LightGroup::new(
+            VirtualDeviceConfig {
+                device_id: device_id.to_string(),
+                device_type: VirtualDeviceType::LightGroup,
+                name: device_id.to_string(),
+                description: None,
+                enabled: true,
+                config: serde_json::json!({ "lights": [member], "brightness_curves": curves }),
+            },
+            store.clone(),
+        )
+        .expect("curved group")
+    }
+
+    /// #72 review, finding 1: a scene that sets group `g` (over the lamp
+    /// and `m`) to 30 and the lamp itself to 5 puts the lamp at 5 every
+    /// time: the scene's own target is the most direct path to it. It used
+    /// to be written through both paths, in the order of the scene's
+    /// `HashMap`, which changes with every new map: the lamp ended at 30 in
+    /// about 40 % of runs, and `g` re-derived to 17 in the others.
+    ///
+    /// 60 fresh managers, each with scenes of fresh `HashMap`s. The lamp's
+    /// id sorts after `g`'s (`l`), then before it (`a`), and the scene
+    /// lists the two one way round, then the other. Every run: the lamp is
+    /// at 5 and `m` at 30, each echoed once. `g` took 30, then re-derived
+    /// from its lights as they are, (5 + 30) / 2 = 17, in the same commit:
+    /// echoed once, at 17, and tracking leaves it there.
+    #[tokio::test]
+    async fn a_scene_over_a_group_and_one_of_its_lamps_sets_the_lamp_every_time() {
+        for run in 0..60 {
+            let lamp = if run % 2 == 0 { "l" } else { "a" };
+            let (manager, store, bus) = manager_over(&[lamp, "m"]).await;
+            register(&manager, group("g", &[lamp, "m"], &store)).await;
+            let mut targets = vec![("g", light(true, 30)), (lamp, light(true, 5))];
+            if run % 4 >= 2 {
+                targets.reverse();
+            }
+            let order: Vec<&str> = targets.iter().map(|(id, _)| *id).collect();
+            let case = format!("run {run}, the scene lists {order:?}");
+            register(
+                &manager,
+                scene(&store, &targets, &serde_json::json!("Instant")),
+            )
+            .await;
+            let mut rx = bus.subscribe();
+
+            write(&manager, "scene", evening()).await.expect("evening");
+            assert_eq!(stored(&store, lamp).await, light(true, 5), "{case}: lamp");
+            assert_eq!(stored(&store, "g").await, light(true, 17), "{case}: g");
+            assert_eq!(own_state(&manager, "g").await, light(true, 17), "{case}");
+            let events = pump(&manager, &mut rx).await;
+
+            for (id, state) in [
+                (lamp, light(true, 5)),
+                ("m", light(true, 30)),
+                ("g", light(true, 17)),
+            ] {
+                assert_eq!(stored(&store, id).await, state, "{case}: {id}");
+                assert_eq!(echoes(&events, id), vec![state], "{case}: {id}'s echoes");
+            }
+            assert_eq!(echoes(&events, "scene"), vec![evening()], "{case}");
+        }
+    }
+
+    /// #72 review, finding 3: a group reached through two groups of the
+    /// device written is planned once, and it and its light are written
+    /// and echoed once. `O` (1:1) is over `A` (1:1) and `B` (a curve from
+    /// 50 to 100), and both are over `G`, over `l`. `O` at 40 would put `G`
+    /// at 40 through `A`, and at 70 through `B`: two paths of the same
+    /// length, so the one through the id that sorts first, `A`, sets it,
+    /// however `O` lists them. `G` and `l` go to 40, once each; it used to
+    /// be planned and committed through both (`l` echoed 40, then 70).
+    ///
+    /// `B` can't show `G` at 40 (its curve starts at 50), so it re-derives
+    /// in the same commit, to the level that puts `G` nearest 40 (1 and 2
+    /// both put it at 51, and 2 is nearer the 40 it was set to). `O` then
+    /// follows its members to (40 + 2) / 2 = 21. Each is echoed once, where
+    /// input tracking leaves it.
+    #[tokio::test]
+    async fn a_group_reached_through_two_groups_is_planned_and_echoed_once() {
+        for listed in [["A", "B"], ["B", "A"]] {
+            let (manager, store, bus) = manager_over(&["l"]).await;
+            register(&manager, group("G", &["l"], &store)).await;
+            register(&manager, group("A", &["G"], &store)).await;
+            register(&manager, curved_group("B", "G", (50, 100), &store)).await;
+            register(&manager, group("O", &listed, &store)).await;
+            let mut rx = bus.subscribe();
+
+            write(&manager, "O", light(true, 40))
+                .await
+                .expect("O at 40");
+            let events = pump(&manager, &mut rx).await;
+
+            for (id, level) in [("l", 40), ("G", 40), ("A", 40), ("B", 2), ("O", 21)] {
+                let want = light(true, level);
+                assert_eq!(stored(&store, id).await, want, "O lists {listed:?}: {id}");
+                assert_eq!(echoes(&events, id), vec![want], "O lists {listed:?}: {id}");
+            }
+        }
+    }
+
+    /// #72 review, finding 2: a group of groups registered before its inner
+    /// group (its file sorts first) catches up with it as soon as the inner
+    /// one is registered. It used to seed without it, as off, and stay so
+    /// until one of the inner group's lights changed. Both orders end the
+    /// same: `downstairs` on at 80, where `living` puts it.
+    ///
+    /// And through three levels, registered outermost first: each catch-up
+    /// moves the group above it, up to the top.
+    #[tokio::test]
+    async fn a_group_of_groups_registered_before_its_inner_group_catches_up_with_it() {
+        let mut seeded = Vec::new();
+        for inner_first in [true, false] {
+            let (manager, store, _bus) = manager_over(&["a", "h"]).await;
+            store
+                .update_device_state(&"a".to_string(), light(true, 80))
+                .await
+                .expect("a");
+            let inner = group("living", &["a"], &store);
+            let outer = group("downstairs", &["living", "h"], &store);
+            if inner_first {
+                register(&manager, inner).await;
+                register(&manager, outer).await;
+            } else {
+                register(&manager, outer).await;
+                register(&manager, inner).await;
+            }
+            let state = stored(&store, "downstairs").await;
+            assert_eq!(own_state(&manager, "downstairs").await, state);
+            seeded.push((inner_first, state));
+        }
+        assert_eq!(
+            seeded,
+            vec![(true, light(true, 80)), (false, light(true, 80))],
+            "downstairs, registered after its inner group and before it"
+        );
+
+        let (manager, store, _bus) = manager_over(&["a"]).await;
+        store
+            .update_device_state(&"a".to_string(), light(true, 80))
+            .await
+            .expect("a");
+        for (id, member) in [("top", "mid"), ("mid", "low"), ("low", "a")] {
+            register(&manager, group(id, &[member], &store)).await;
+        }
+        for id in ["low", "mid", "top"] {
+            assert_eq!(stored(&store, id).await, light(true, 80), "{id}");
+            assert_eq!(own_state(&manager, id).await, light(true, 80), "{id}");
+        }
+    }
+
+    /// #72 review, finding 2: a toggle of a group of groups registered
+    /// before its inner group switches a lit room off. It used to start
+    /// from the stale "off" the group seeded as, and so switched it on at
+    /// 100: `a`, lit at 80, went up to 100, and `h` came on too.
+    #[tokio::test]
+    async fn a_toggle_of_a_group_of_groups_registered_first_switches_a_lit_room_off() {
+        let (manager, store, bus) = manager_over(&["a", "h"]).await;
+        store
+            .update_device_state(&"a".to_string(), light(true, 80))
+            .await
+            .expect("a");
+        register(&manager, group("downstairs", &["living", "h"], &store)).await;
+        register(&manager, group("living", &["a"], &store)).await;
+        let toggle = serde_json::json!(["toggle", "downstairs"]);
+        add_controller(&manager, &store, toggle, serde_json::json!([])).await;
+        let mut rx = bus.subscribe();
+
+        report(&bus, "btn", ButtonPressType::SinglePress).await;
+        pump(&manager, &mut rx).await;
+        for (id, state) in [
+            ("a", off()),
+            ("h", off()),
+            ("living", light(false, 80)),
+            ("downstairs", light(false, 80)),
+        ] {
+            assert_eq!(stored(&store, id).await, state, "{id}");
+        }
+    }
+
+    /// #72 review, nit 4: the queue's device set goes all the way down,
+    /// past two levels. Two writes that overlap only two levels below the
+    /// devices they're to (`m`, under `g1` under `o1`, and under `g2`
+    /// under `o2`) land in the order they asked. The first waits for a fade
+    /// of `l`, which it reaches two levels down too. An unrelated write
+    /// goes at once.
+    #[tokio::test(start_paused = true)]
+    async fn writes_that_overlap_two_levels_down_keep_their_order() {
+        let (manager, store, bus) = manager_over(&["l", "m", "n"]).await;
+        let fade = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        let sunset = scene_config("evening", &[("l", light(true, 80))], &fade);
+        register(&manager, scene_controller_named("fader", &store, [sunset])).await;
+        register(&manager, group("g1", &["l", "m"], &store)).await;
+        register(&manager, group("o1", &["g1"], &store)).await;
+        register(&manager, group("g2", &["m"], &store)).await;
+        register(&manager, group("o2", &["g2"], &store)).await;
+        register(&manager, group("o3", &["n"], &store)).await;
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let fade = spawn_write(&manager, "fader", evening());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let first = spawn_write(&manager, "o1", light(true, 30));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let second = spawn_write(&manager, "o2", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (result, landed) = spawn_write(&manager, "o3", light(true, 40))
+            .await
+            .expect("o3 task");
+        result.expect("o3");
+        assert_eq!(landed - started, Duration::from_millis(300), "o3 waited");
+        assert!(!first.is_finished(), "o1 went during the fade");
+        assert!(!second.is_finished(), "o2 went during the fade");
+        assert_eq!(stored(&store, "m").await, off(), "m moved during the fade");
+
+        let landed = tokio::time::timeout(Duration::from_secs(10), async {
+            [fade.await, first.await, second.await]
+        })
+        .await
+        .expect("deadlocked");
+        for (what, task) in ["the fade", "o1", "o2"].into_iter().zip(landed) {
+            let (result, at) = task.expect("write task");
+            result.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(at - started, Duration::from_secs(1), "{what} landed");
+        }
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "m"),
+            vec![light(true, 30), light(true, 60)],
+            "m: o1, then o2"
+        );
+        assert_eq!(
+            echoes(&events, "l"),
+            vec![light(true, 80), light(true, 30)],
+            "l: the fade, then o1"
+        );
+        assert_eq!(stored(&store, "m").await, light(true, 60), "the newest");
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #72 review, nit 4: #60's retry follows a group replaced three levels
+    /// below the device written. While a write to `o2` (over `o1`, over
+    /// `g`, over `a`) waits behind a fade of `g`, `g` is replaced (a real
+    /// `add_virtual_device`) by a group over `a` and `z`, and a 2 s fade of
+    /// `z` asks after it. The write joins again with `z`, waits for that
+    /// fade, and lands after it: `z` ends at 60, the newest. Queued on two
+    /// levels only, it missed `z`, landed at once and the fade then put the
+    /// older 90 over it. (The release build has no debug assert to catch
+    /// that.)
+    #[tokio::test(start_paused = true)]
+    async fn a_write_three_levels_above_a_replaced_group_joins_again_with_its_lights() {
+        let (manager, store, bus) = manager_over(&["a", "z"]).await;
+        let one_second = serde_json::json!({ "Fade": { "duration_ms": 1000 } });
+        let first = scene_config("evening", &[("g", light(true, 80))], &one_second);
+        register(&manager, scene_controller_named("fader1", &store, [first])).await;
+        let two_seconds = serde_json::json!({ "Fade": { "duration_ms": 2000 } });
+        let second = scene_config("evening", &[("z", light(true, 90))], &two_seconds);
+        register(&manager, scene_controller_named("fader2", &store, [second])).await;
+        register(&manager, group("g", &["a"], &store)).await;
+        register(&manager, group("o1", &["g"], &store)).await;
+        register(&manager, group("o2", &["o1"], &store)).await;
+        let mut rx = bus.subscribe();
+
+        let started = tokio::time::Instant::now();
+        let fade1 = spawn_write(&manager, "fader1", evening());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let replace = tokio::spawn({
+            let (manager, store) = (manager.clone(), store.clone());
+            async move {
+                manager
+                    .add_virtual_device(Box::new(group("g", &["a", "z"], &store)))
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let write_o2 = spawn_write(&manager, "o2", light(true, 60));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fade2 = spawn_write(&manager, "fader2", evening());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!replace.is_finished(), "the replacement went during fade1");
+        assert!(!write_o2.is_finished(), "o2 went during fade1");
+
+        let (result, landed) = tokio::time::timeout(Duration::from_secs(10), write_o2)
+            .await
+            .expect("deadlocked")
+            .expect("o2 task");
+        result.expect("o2");
+        fade1.await.expect("fade1 task").0.expect("fade1");
+        replace.await.expect("replacement task").expect("replace g");
+        let (result, fade2_landed) = fade2.await.expect("fade2 task");
+        result.expect("fade2");
+        assert_eq!(fade2_landed - started, Duration::from_millis(2300), "fade2");
+        assert_eq!(
+            landed - started,
+            Duration::from_millis(2300),
+            "o2 waited for fade2"
+        );
+        let events = pump(&manager, &mut rx).await;
+        assert_eq!(
+            echoes(&events, "z"),
+            vec![light(true, 90), light(true, 60)],
+            "z: fade2, then o2"
+        );
+        for id in ["a", "z"] {
+            assert_eq!(stored(&store, id).await, light(true, 60), "{id}");
+        }
+        assert_eq!(manager.write_queue.len(), 0, "writes left in the queue");
+    }
+
+    /// #72 review, nit 5: an inner group a write leaves as it is isn't
+    /// echoed, as a light it leaves as it is isn't. `inner`'s range in
+    /// `outer` is flat at 50, so `outer` at 60 and then at 70 puts it at 50
+    /// both times: the second write echoes `outer` and `c`, and nothing
+    /// under `inner`.
+    #[tokio::test]
+    async fn an_inner_group_the_write_leaves_as_it_is_is_not_echoed() {
+        let (manager, store, bus) = manager_over(&["a", "b", "c"]).await;
+        register(&manager, group("inner", &["a", "b"], &store)).await;
+        let ranges = [("inner", (50, 50)), ("c", (0, 100))];
+        register(&manager, linear_group_over("outer", &ranges, &store)).await;
+        let mut rx = bus.subscribe();
+
+        write(&manager, "outer", light(true, 60)).await.expect("60");
+        let events = pump(&manager, &mut rx).await;
+        for (id, level) in [
+            ("a", 50),
+            ("b", 50),
+            ("inner", 50),
+            ("c", 60),
+            ("outer", 60),
+        ] {
+            assert_eq!(echoes(&events, id), vec![light(true, level)], "60: {id}");
+        }
+
+        write(&manager, "outer", light(true, 70)).await.expect("70");
+        let events = pump(&manager, &mut rx).await;
+        for (id, level) in [("c", 70), ("outer", 70)] {
+            assert_eq!(echoes(&events, id), vec![light(true, level)], "70: {id}");
+        }
+        for id in ["a", "b", "inner"] {
+            assert!(
+                echoes(&events, id).is_empty(),
+                "70: {id} echoed: {events:?}"
+            );
+        }
+    }
+
+    /// #72 review, nit 6: a scene aimed at another scene controller as if
+    /// it were a light loads (its target may load after it), but `start`
+    /// warns about it, once everything is in: every activation of it fails.
+    /// A scene aimed at a light group is fine, and isn't flagged.
+    #[tokio::test]
+    async fn start_warns_about_a_virtual_target_that_cant_be_set_like_a_light() {
+        let (manager, store, _bus) = manager_over(&["a"]).await;
+        register(&manager, group("g", &["a"], &store)).await;
+        let x = scene_config(
+            "x",
+            &[("a", light(true, 10))],
+            &serde_json::json!("Instant"),
+        );
+        register(&manager, scene_controller_named("other", &store, [x])).await;
+        let targets = [("g", light(true, 30)), ("other", light(true, 30))];
+        register(
+            &manager,
+            scene(&store, &targets, &serde_json::json!("Instant")),
+        )
+        .await;
+        assert_eq!(
+            manager.unsupported_targets().await,
+            vec![("scene".to_string(), "other".to_string())]
+        );
+
+        let logs = CapturedLogs::default();
+        {
+            let _default = tracing::subscriber::set_default(logs.subscriber());
+            manager.start().await.expect("start");
+        }
+        let logs = logs.text();
+        assert!(
+            logs.contains(
+                "Virtual device scene sets other, a virtual device that can't be set like a light"
+            ),
+            "start must warn about other: {logs:?}"
+        );
+        assert!(!logs.contains("sets g,"), "g is a light group: {logs:?}");
+    }
 }
